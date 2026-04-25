@@ -135,7 +135,7 @@ conda activate podcast-transcribe
 pip install -r podcast_transcribe_requirements.txt
 ```
 
-If you prefer a different environment name or a plain virtual environment, that is fine, but you will need to update `Convert MP3 to TXT diarized.ps1` so it does not assume `conda activate podcast-transcribe`.
+If you prefer a different environment name or a plain virtual environment, you will need to update `Convert MP3 to TXT diarized.ps1` and adjust the `conda activate podcast-transcribe` command accordingly.
 
 ### 3. Get a Hugging Face token
 
@@ -172,7 +172,7 @@ Recommended first-pass config:
 
 ```json
 {
-  "default_source_dir": "D:/Speech_to_text/audio",
+  "default_source_dir": "C:/Speech_to_text/audio",
   "hf_token": "",
   "ffmpeg_bin_dir": "C:/ffmpeg/bin",
   "known_speakers_dir": "speaker_reference_samples",
@@ -271,7 +271,6 @@ The script ends with an overall `PASS` or `FAIL` summary and pauses so you can r
 This is the easiest way to run the project on Windows.
 
 ```powershell
-conda activate podcast-transcribe
 .\Convert MP3 to TXT diarized.ps1
 ```
 
