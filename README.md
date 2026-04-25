@@ -2,42 +2,6 @@
 
 This project batch-processes podcast audio files into speaker-labeled transcripts, host-only extracts, JSON metadata, and review CSVs. Its larger purpose is to generate structured, reviewable source material for downstream insertion into a RAG pipeline and vector database. It combines speech-to-text, speaker diarization, speaker-embedding matching, and terminology normalization so episodes can be transcribed in a way that is more useful for editorial review and retrieval-oriented content workflows.
 
-
-## 🧠 System Overview
-
-```mermaid
-flowchart TD
-
-    A[Start] --> B[Setup + Initialization]
-    B --> C{Audio Files Found?}
-
-    C -->|No| Z[Exit]
-    C -->|Yes| D[Process Each File]
-
-    D --> E[Transcribe + Diarize]
-    E --> F[Identify Speakers + Host]
-    F --> G[Normalize + QA]
-    G --> H[Generate Outputs]
-
-    H --> I{Update Host Profile?}
-    I -->|Yes| J[Update Profile]
-    I -->|No| K[Skip]
-
-    J --> D
-    K --> D
-
-    D --> L[Write Batch Summary]
-    L --> M[End]
-```
-
-The repository is designed for shows where identifying the host matters. In addition to generic speaker diarization, it can:
-
-- label the host from a one-time reference clip
-- maintain a persistent host voice profile across episodes
-- identify recurring named speakers from a reference-sample directory
-- create a host-only transcript for faster review
-- flag episodes and transcript segments that likely need manual verification
-
 ## What The Project Does
 
 For each supported audio file in an input folder, the pipeline:
@@ -243,6 +207,34 @@ Best practices:
 - avoid overlap, music beds, and heavy background noise
 - provide more than one clip per recurring speaker when possible
 
+### 6. Run the environment debug script
+
+Before your first full transcription run, use the diagnostic launcher to confirm that the environment, token access, FFmpeg path, CUDA visibility, and model prerequisites are all aligned.
+
+Run:
+
+```powershell
+conda activate podcast-transcribe
+.\Debug podcast transcribe environment.ps1
+```
+
+What it checks:
+
+- config resolution from `podcast_transcribe_config.json`
+- Hugging Face token discovery and access to both `pyannote/speaker-diarization-community-1` and `pyannote/segmentation-3.0`
+- `ffmpeg_bin_dir` and `ffmpeg.exe` launchability
+- the active `podcast-transcribe` conda environment
+- required Python packages and CUDA availability
+- pyannote and SpeechBrain runtime compatibility
+
+Use this script when:
+
+- you are setting the project up for the first time
+- you changed Python, Conda, CUDA, FFmpeg, or package versions
+- the main launcher starts failing and you want a focused prerequisite check first
+
+The script ends with an overall `PASS` or `FAIL` summary and pauses so you can review the results before closing the window.
+
 ## Running The Project
 
 ### Option 1: Use the PowerShell launcher
@@ -302,6 +294,41 @@ For the best initial results:
 6. Run the launcher
 7. Review outputs in the sibling `output` folder:
    `*_speaker_transcript.txt`, `*_host_only.txt`, `*_review.csv`, `*_speaker_transcript.json`, `_episode_review_summary.csv`
+
+## System Overview
+
+```mermaid
+flowchart TD
+
+    A[Start] --> B[Setup + Initialization]
+    B --> C{Audio Files Found?}
+
+    C -->|No| Z[Exit]
+    C -->|Yes| D[Process Each File]
+
+    D --> E[Transcribe + Diarize]
+    E --> F[Identify Speakers + Host]
+    F --> G[Normalize + QA]
+    G --> H[Generate Outputs]
+
+    H --> I{Update Host Profile?}
+    I -->|Yes| J[Update Profile]
+    I -->|No| K[Skip]
+
+    J --> D
+    K --> D
+
+    D --> L[Write Batch Summary]
+    L --> M[End]
+```
+
+The repository is designed for shows where identifying the host matters. In addition to generic speaker diarization, it can:
+
+- label the host from a one-time reference clip
+- maintain a persistent host voice profile across episodes
+- identify recurring named speakers from a reference-sample directory
+- create a host-only transcript for faster review
+- flag episodes and transcript segments that likely need manual verification
 
 ## Troubleshooting
 
