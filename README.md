@@ -2,6 +2,14 @@
 
 This project batch-processes podcast audio files into speaker-labeled transcripts, host-only extracts, JSON metadata, and review CSVs. Its larger purpose is to generate structured, reviewable source material for downstream insertion into a RAG pipeline and vector database. It combines speech-to-text, speaker diarization, speaker-embedding matching, and terminology normalization so episodes can be transcribed in a way that is more useful for editorial review and retrieval-oriented content workflows.
 
+The pipeline is designed for shows where identifying the host matters. In addition to generic speaker diarization, it can:
+
+- label the host from a one-time reference clip
+- maintain a persistent host voice profile across episodes
+- identify recurring named speakers from a reference-sample directory
+- create a host-only transcript for faster review
+- flag episodes and transcript segments that likely need manual verification
+
 ## What The Project Does
 
 For each supported audio file in an input folder, the pipeline:
@@ -14,7 +22,7 @@ For each supported audio file in an input folder, the pipeline:
    - a saved `host_profile.json`
    - a known speaker marked as the host
    - or, optionally, the dominant speaker as a bootstrap fallback
-5. Renames diarized speakers to `HOST`, known names, or `SPEAKER_01`, `SPEAKER_02`, and so on
+5. Renames diarized speakers to known names, or `HOST`, `SPEAKER_01`, `SPEAKER_02`, and so on
 6. Applies preferred-term biasing and post-transcription replacement cleanup
 7. Writes transcript, JSON, and review outputs back to disk
 
@@ -37,7 +45,7 @@ The pipeline is centered around three model-driven stages:
 - Diarization: `pyannote/speaker-diarization-community-1` assigns speaker turns across the episode.
 - Speaker matching: `speechbrain/spkrec-ecapa-voxceleb` generates embeddings used to match diarized speakers against the host profile or known speaker references.
 
-Important implementation details:
+Key implementation details:
 
 - Audio is normalized to mono 16 kHz before speaker embedding extraction.
 - Diarization audio is preloaded in memory before being passed to `pyannote.audio`, which avoids depending on `torchcodec` for file decoding during diarization.
@@ -46,6 +54,25 @@ Important implementation details:
 - The host profile can be updated over time from matched host speech to improve stability across episodes.
 - A review-priority score is generated per episode so the riskiest outputs can be checked first.
 - The console now shows batch progress, per-file transcription progress, and diarization progress so long runs are easier to monitor.
+
+## Observed Performance
+
+Accuracy has been favored over speed in this pipeline.  Processing time is largely determined by the GPU speed, and will regularly stay at near 100% for most of the operating time.  CPU speed does not appear to be a significant factor.
+
+Measured run:
+
+- Podcast duration processed: `2:34:00`
+- Total processing time: `15:26`
+- Effective processing rate: about `6` minutes of processing time per hour of podcast audio
+- Peak observed VRAM usage: `8082 MiB`, where non-script components (e.g. Windows display usage) accounted for `2460 MiB` of that peak value.
+
+Observed on:
+
+- NVIDIA GeForce RTX 5070 Ti
+- NVIDIA driver version `596.21`
+- CUDA version `13.2`
+
+This is a practical reference point for estimating batch runs on a similar Windows GPU setup.
 
 Supported audio formats:
 
@@ -72,12 +99,13 @@ This project currently assumes a Windows workflow because the included launcher 
 
 You will need:
 
-- Python installed and available on `PATH`
-- Conda if you want to use the launcher exactly as written
+- Miniconda, Conda, or another Conda-compatible distribution installed and available on `PATH`
 - A Hugging Face account and access token
 - Access approval for `pyannote/speaker-diarization-community-1` on Hugging Face
+- Access approval for `pyannote/segmentation-3.0` on Hugging Face
 - A Windows FFmpeg build with shared DLLs available, such as `C:\ffmpeg\bin`
 - Enough local compute for Whisper, pyannote, and PyTorch-based audio processing
+- An NVIDIA GPU is recommended if you want practical performance with the current CUDA-oriented setup
 
 Python dependencies:
 
@@ -117,6 +145,7 @@ First:
 
 - Sign in to Hugging Face
 - Request and accept access to `pyannote/speaker-diarization-community-1`
+- Request and accept access to `pyannote/segmentation-3.0`
 - Create an access token
 
 Then provide the token in one of these ways:
@@ -153,7 +182,7 @@ Recommended first-pass config:
   "model": "large-v3",
   "language": "en",
   "device": "auto",
-  "compute_type": "auto",
+  "compute_type": "float16",
   "beam_size": 5,
   "batch_size": 8,
   "assume_dominant_speaker_is_host": true,
@@ -173,7 +202,7 @@ Configuration notes:
 - `model`: Whisper model name
 - `language`: language code passed to Whisper
 - `device`: Whisper runtime device such as `auto`, `cpu`, or `cuda`
-- `compute_type`: Whisper compute setting such as `auto`, `float16`, or `int8`
+- `compute_type`: Whisper compute setting such as `float16` or `int8`; the current launcher defaults to `float16`
 - `beam_size`: decode beam size
 - `batch_size`: transcription batch size
 - `assume_dominant_speaker_is_host`: fallback host bootstrap if no better match exists
@@ -265,8 +294,8 @@ Example:
 
 ```powershell
 python .\podcast_transcribe_host.py `
-  --input-dir "D:\Speech_to_text\audio" `
-  --output-dir "D:\Speech_to_text\output" `
+  --input-dir "C:\Speech_to_text\audio" `
+  --output-dir "C:\Speech_to_text\output" `
   --model large-v3 `
   --language en `
   --device auto `
@@ -295,7 +324,7 @@ For the best initial results:
 7. Review outputs in the sibling `output` folder:
    `*_speaker_transcript.txt`, `*_host_only.txt`, `*_review.csv`, `*_speaker_transcript.json`, `_episode_review_summary.csv`
 
-## System Overview
+## System Diagram
 
 ```mermaid
 flowchart TD
@@ -321,14 +350,6 @@ flowchart TD
     D --> L[Write Batch Summary]
     L --> M[End]
 ```
-
-The repository is designed for shows where identifying the host matters. In addition to generic speaker diarization, it can:
-
-- label the host from a one-time reference clip
-- maintain a persistent host voice profile across episodes
-- identify recurring named speakers from a reference-sample directory
-- create a host-only transcript for faster review
-- flag episodes and transcript segments that likely need manual verification
 
 ## Troubleshooting
 
