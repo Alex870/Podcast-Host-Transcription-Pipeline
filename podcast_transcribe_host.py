@@ -1,9 +1,15 @@
 import argparse
 import csv
+import gc
+import ctypes
+from ctypes import wintypes
 import inspect
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
 import time
 import warnings
 from collections import defaultdict
@@ -90,10 +96,129 @@ _patch_huggingface_hub_auth_compat()
 
 import pyannote.audio as pyannote_audio
 from pyannote.audio import Pipeline
-from pyannote.audio.pipelines.utils.hook import ProgressHook
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+
+from podcast_transcribe_outputs import (
+    write_json_output as output_write_json_output,
+    write_review_csv as output_write_review_csv,
+    write_text_transcript as output_write_text_transcript,
+)
+from podcast_transcribe_state import (
+    CHECKPOINT_DIRNAME,
+    RESUME_STATE_FILENAME,
+    SUMMARY_FILENAME,
+    audio_file_fingerprint,
+    expected_output_paths as state_expected_output_paths,
+    is_file_already_processed as state_is_file_already_processed,
+    load_episode_summary_rows as state_load_episode_summary_rows,
+    load_processed_files as state_load_processed_files,
+    save_processed_files as state_save_processed_files,
+)
+from podcast_transcribe_speakers import (
+    average_embeddings as speaker_average_embeddings,
+    cosine_similarity as speaker_cosine_similarity,
+    final_host_profile_update,
+    merge_profile as speaker_merge_profile,
+)
 
 
 SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
+LONG_FILE_WARNING_HOURS = 4.0
+
+
+class ProgressHook:
+    def __init__(self, transient: bool = False, hidden: bool = False):
+        self.transient = transient
+        self.hidden = hidden
+        self._current_task_name = None
+        self._current_task_id = None
+        self._current_task_is_indeterminate = False
+
+    def __enter__(self):
+        if self.hidden:
+            return self
+
+        self.progress = create_stage_progress(transient=self.transient)
+        self.progress.start()
+        return self
+
+    def __exit__(self, *args):
+        if self.hidden:
+            return
+
+        self._finish_current_task()
+        self.progress.stop()
+        return
+
+    def _finish_current_task(self):
+        if self._current_task_id is None:
+            return
+
+        if self._current_task_is_indeterminate:
+            self.progress.update(self._current_task_id, total=1, completed=1)
+        self.progress.refresh()
+
+    def __call__(
+        self,
+        step_name,
+        step_artifact,
+        file: Optional[Dict[str, object]] = None,
+        total: Optional[int] = None,
+        completed: Optional[int] = None,
+    ):
+        if self.hidden:
+            return
+
+        is_indeterminate = total is None and completed is None
+
+        if self._current_task_name != step_name:
+            self._finish_current_task()
+            self._current_task_name = step_name
+            self._current_task_is_indeterminate = is_indeterminate
+            if is_indeterminate:
+                self._current_task_id = self.progress.add_task(step_name, total=None)
+            else:
+                if completed is None:
+                    completed = 0
+                if total is None:
+                    total = max(completed, 1)
+                self._current_task_id = self.progress.add_task(step_name, total=total, completed=completed)
+            return
+
+        if is_indeterminate:
+            self.progress.refresh()
+            return
+
+        if completed is None:
+            completed = 0
+        if total is None:
+            total = max(completed, 1)
+
+        self._current_task_is_indeterminate = False
+        self.progress.update(self._current_task_id, completed=completed, total=total)
+
+        if completed >= total:
+            self.progress.refresh()
+
+
+def create_stage_progress(transient: bool = False) -> Progress:
+    return Progress(
+        TextColumn("[progress.description]{task.description}"),
+        SpinnerColumn(),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(elapsed_when_finished=True),
+        TimeElapsedColumn(),
+        transient=transient,
+    )
 
 
 @dataclass
@@ -119,6 +244,7 @@ class SegmentItem:
 def parse_args():
     parser = argparse.ArgumentParser(description="Transcribe podcasts with diarization and host labeling.")
     parser.add_argument("--input-dir", required=True, help="Directory containing audio files to process.")
+    parser.add_argument("--input-file", help="Optional single audio file to process from input-dir.")
     parser.add_argument("--output-dir", help="Output directory. Defaults to input directory.")
     parser.add_argument("--model", default="large-v3", help="faster-whisper model name.")
     parser.add_argument("--language", default="en", help="Language code.")
@@ -188,6 +314,19 @@ def parse_args():
         type=int,
         help="Optional fixed speaker count for pyannote diarization.",
     )
+    parser.add_argument(
+        "--isolate-files",
+        dest="isolate_files",
+        action="store_true",
+        help="Process each episode in a separate Python child process so native memory is released between files.",
+    )
+    parser.add_argument(
+        "--no-isolate-files",
+        dest="isolate_files",
+        action="store_false",
+        help="Process all episodes in the current Python process.",
+    )
+    parser.set_defaults(isolate_files=False)
     return parser.parse_args()
 
 
@@ -211,6 +350,155 @@ def format_timestamp(seconds: Optional[float]) -> str:
     minutes = (total % 3600) // 60
     secs = total % 60
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def resolve_ffprobe_path() -> Optional[str]:
+    ffmpeg_bin_dir = os.getenv("PODCAST_TRANSCRIBE_FFMPEG_BIN_DIR") or os.getenv("FFMPEG_BIN_DIR")
+    if ffmpeg_bin_dir:
+        candidate = Path(ffmpeg_bin_dir) / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
+        if candidate.exists():
+            return str(candidate)
+
+    return shutil.which("ffprobe")
+
+
+def get_audio_metadata(path: str) -> Tuple[Optional[int], Optional[int], Optional[float]]:
+    ffprobe_path = resolve_ffprobe_path()
+    if ffprobe_path:
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe_path,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=sample_rate,duration",
+                    "-of",
+                    "json",
+                    path,
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            payload = json.loads(result.stdout)
+            streams = payload.get("streams", [])
+            if streams:
+                stream = streams[0]
+                sample_rate_text = stream.get("sample_rate")
+                duration_text = stream.get("duration")
+                sample_rate = int(sample_rate_text) if sample_rate_text else None
+                duration_seconds = float(duration_text) if duration_text else None
+                num_frames = (
+                    int(round(duration_seconds * sample_rate))
+                    if duration_seconds is not None and sample_rate is not None and sample_rate > 0
+                    else None
+                )
+                return sample_rate, num_frames, duration_seconds
+        except Exception:
+            pass
+
+    try:
+        metadata = torchaudio.info(path)
+        sample_rate = metadata.sample_rate if metadata.sample_rate > 0 else None
+        num_frames = metadata.num_frames if metadata.num_frames > 0 else None
+        duration_seconds = (
+            float(num_frames) / float(sample_rate)
+            if sample_rate is not None and num_frames is not None
+            else None
+        )
+        return sample_rate, num_frames, duration_seconds
+    except Exception:
+        return None, None, None
+
+
+def get_audio_duration_seconds(path: str) -> Optional[float]:
+    _, _, duration_seconds = get_audio_metadata(path)
+    return duration_seconds
+
+
+def get_process_memory_mb() -> Optional[float]:
+    if os.name != "nt":
+        return None
+
+    class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+        _fields_ = [
+            ("cb", ctypes.c_ulong),
+            ("PageFaultCount", ctypes.c_ulong),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+            ("PrivateUsage", ctypes.c_size_t),
+        ]
+
+    try:
+        counters = PROCESS_MEMORY_COUNTERS_EX()
+        counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS_EX)
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX),
+            wintypes.DWORD,
+        ]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+
+        process_handle = kernel32.GetCurrentProcess()
+        success = psapi.GetProcessMemoryInfo(
+            process_handle,
+            ctypes.byref(counters),
+            counters.cb,
+        )
+        if success:
+            return counters.WorkingSetSize / (1024 * 1024)
+    except Exception:
+        pass
+
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "$p = Get-Process -Id $PID; [math]::Round($p.WorkingSet64 / 1MB, 2)",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        value = result.stdout.strip()
+        return float(value) if value else None
+    except Exception:
+        return None
+
+
+def format_memory_mb(memory_mb: Optional[float]) -> str:
+    if memory_mb is None:
+        return "unknown"
+    return f"{memory_mb:.0f} MiB"
+
+
+def log_memory_usage(stage_label: str):
+    process_memory = get_process_memory_mb()
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024 * 1024)
+        reserved = torch.cuda.memory_reserved() / (1024 * 1024)
+        print(
+            f"  memory [{stage_label}]: cpu_working_set={format_memory_mb(process_memory)}, "
+            f"gpu_allocated={allocated:.0f} MiB, gpu_reserved={reserved:.0f} MiB"
+        )
+    else:
+        print(f"  memory [{stage_label}]: cpu_working_set={format_memory_mb(process_memory)}")
 
 
 def load_preferred_terms(path: Optional[str]) -> List[str]:
@@ -276,13 +564,73 @@ def detect_replacement_hits(text: str, replacement_map: Dict[str, List[str]]) ->
     return hits
 
 
-def load_audio_mono_16k(path: str) -> torch.Tensor:
-    waveform, sample_rate = torchaudio.load(path)
+def load_audio_mono_16k(path: str, chunk_seconds: float = 300.0) -> torch.Tensor:
+    sample_rate, num_frames, _ = get_audio_metadata(path)
+
+    if sample_rate is None or sample_rate <= 0 or num_frames is None or num_frames <= 0:
+        waveform, sample_rate = torchaudio.load(path)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sample_rate != 16000:
+            waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
+        return waveform.squeeze(0)
+
+    frames_per_chunk = max(sample_rate, int(sample_rate * chunk_seconds))
+    resampler = (
+        torchaudio.transforms.Resample(sample_rate, 16000)
+        if sample_rate != 16000
+        else None
+    )
+    chunks = []
+
+    for frame_offset in range(0, num_frames, frames_per_chunk):
+        frames_to_read = min(frames_per_chunk, num_frames - frame_offset)
+        waveform, _ = torchaudio.load(path, frame_offset=frame_offset, num_frames=frames_to_read)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if resampler is not None:
+            waveform = resampler(waveform)
+        chunks.append(waveform.squeeze(0).contiguous())
+        del waveform
+
+    if not chunks:
+        return torch.empty(0, dtype=torch.float32)
+
+    if len(chunks) == 1:
+        return chunks[0]
+
+    return torch.cat(chunks, dim=0)
+
+
+def load_audio_span_mono_16k(
+    path: str,
+    start_seconds: float,
+    end_seconds: float,
+    sample_rate: Optional[int] = None,
+    resampler: Optional[torchaudio.transforms.Resample] = None,
+) -> torch.Tensor:
+    if sample_rate is None:
+        sample_rate, _, _ = get_audio_metadata(path)
+    if sample_rate is None or sample_rate <= 0:
+        waveform = load_audio_mono_16k(path)
+        start_frame = max(0, int(start_seconds * 16000))
+        end_frame = max(start_frame, int(end_seconds * 16000))
+        return waveform[start_frame:end_frame].contiguous()
+
+    start_frame = max(0, int(start_seconds * sample_rate))
+    end_frame = max(start_frame, int(end_seconds * sample_rate))
+    num_frames = max(0, end_frame - start_frame)
+    if num_frames == 0:
+        return torch.empty(0, dtype=torch.float32)
+
+    waveform, _ = torchaudio.load(path, frame_offset=start_frame, num_frames=num_frames)
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
-    if sample_rate != 16000:
+    if resampler is not None:
+        waveform = resampler(waveform)
+    elif sample_rate != 16000:
         waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
-    return waveform.squeeze(0)
+    return waveform.squeeze(0).contiguous()
 
 
 def load_host_profile(path: Optional[str]) -> Optional[np.ndarray]:
@@ -329,31 +677,15 @@ def save_host_profile(path: Optional[str], embedding: Optional[np.ndarray], sour
 
 
 def average_embeddings(embeddings: List[np.ndarray]) -> Optional[np.ndarray]:
-    if not embeddings:
-        return None
-    merged = np.mean(np.stack(embeddings), axis=0)
-    norm = np.linalg.norm(merged)
-    if norm == 0:
-        return None
-    return merged / norm
+    return speaker_average_embeddings(embeddings)
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    denom = np.linalg.norm(a) * np.linalg.norm(b)
-    if denom == 0:
-        return -1.0
-    return float(np.dot(a, b) / denom)
+    return speaker_cosine_similarity(a, b)
 
 
 def merge_profile(existing: Optional[np.ndarray], new_embedding: np.ndarray) -> np.ndarray:
-    if existing is None:
-        merged = new_embedding
-    else:
-        merged = (existing + new_embedding) / 2.0
-    norm = np.linalg.norm(merged)
-    if norm == 0:
-        return new_embedding
-    return merged / norm
+    return speaker_merge_profile(existing, new_embedding)
 
 
 def transcribe_audio(
@@ -383,63 +715,46 @@ def transcribe_audio(
 
     results = []
     total_duration = getattr(info, "duration", None)
-    transcription_started = time.perf_counter()
-    last_progress_update = 0.0
-    for idx, segment in enumerate(segments):
-        if total_duration and total_duration > 0:
-            progress_ratio = min(1.0, float(segment.end) / float(total_duration))
-            progress = min(100, int(progress_ratio * 100))
-            elapsed_seconds = time.perf_counter() - transcription_started
-            should_print_progress = (
-                last_progress_update == 0.0
-                or elapsed_seconds - last_progress_update >= 5.0
-                or progress >= 100
-            )
-            if should_print_progress:
-                estimated_total_seconds = (
-                    elapsed_seconds / progress_ratio if progress_ratio > 0 else None
-                )
-                bar_width = 40
-                filled = min(bar_width, int((progress / 100) * bar_width))
-                bar = "━" * filled + " " * (bar_width - filled)
-                eta_text = (
-                    format_timestamp(estimated_total_seconds)
-                    if estimated_total_seconds is not None
-                    else "unknown"
-                )
-                print(
-                    f"\r  transcription         {bar} {progress:3d}% "
-                    f"{format_timestamp(elapsed_seconds)} / {eta_text}",
-                    end="",
-                    flush=True,
-                )
-                last_progress_update = elapsed_seconds
-        words = []
-        if segment.words:
-            for word in segment.words:
-                words.append(
-                    WordItem(
-                        start=getattr(word, "start", None),
-                        end=getattr(word, "end", None),
-                        word=getattr(word, "word", ""),
-                        speaker=None,
-                    )
-                )
+    progress_total = float(total_duration) if total_duration and total_duration > 0 else None
 
-        results.append(
-            SegmentItem(
-                id=idx,
-                start=float(segment.start),
-                end=float(segment.end),
-                text=segment.text.strip(),
-                speaker=None,
-                avg_logprob=getattr(segment, "avg_logprob", None),
-                no_speech_prob=getattr(segment, "no_speech_prob", None),
-                words=words,
+    progress = create_stage_progress()
+    progress.start()
+    task_id = progress.add_task("transcription", total=progress_total)
+    try:
+        for idx, segment in enumerate(segments):
+            if progress_total is not None:
+                progress.update(task_id, completed=min(float(segment.end), progress_total))
+            else:
+                progress.refresh()
+
+            words = []
+            if segment.words:
+                for word in segment.words:
+                    words.append(
+                        WordItem(
+                            start=getattr(word, "start", None),
+                            end=getattr(word, "end", None),
+                            word=getattr(word, "word", ""),
+                            speaker=None,
+                        )
+                    )
+
+            results.append(
+                SegmentItem(
+                    id=idx,
+                    start=float(segment.start),
+                    end=float(segment.end),
+                    text=segment.text.strip(),
+                    speaker=None,
+                    avg_logprob=getattr(segment, "avg_logprob", None),
+                    no_speech_prob=getattr(segment, "no_speech_prob", None),
+                    words=words,
+                )
             )
-        )
-    if total_duration and total_duration > 0:
-        print()
+    finally:
+        if progress_total is not None:
+            progress.update(task_id, completed=progress_total)
+        progress.stop()
 
     info_payload = {
         "language": getattr(info, "language", None),
@@ -450,20 +765,44 @@ def transcribe_audio(
     return results, info_payload
 
 
+def pyannote_path_input_available() -> bool:
+    try:
+        import pyannote.audio.core.io as pyannote_io
+    except Exception:
+        return False
+
+    return hasattr(pyannote_io, "AudioDecoder")
+
+
 def diarize_audio(pipeline: Pipeline, audio_path: str, num_speakers: Optional[int]) -> List[Dict[str, object]]:
     kwargs = {}
     if num_speakers:
         kwargs["num_speakers"] = num_speakers
+
+    if pyannote_path_input_available():
+        try:
+            with ProgressHook() as hook:
+                diarization = pipeline(audio_path, hook=hook, **kwargs)
+        except Exception as path_exc:
+            print(
+                "  diarization path input failed unexpectedly; falling back to preloaded audio. "
+                f"Path-input error: {path_exc}"
+            )
+        else:
+            return diarization_to_turns(diarization)
 
     waveform, sample_rate = torchaudio.load(audio_path)
     diarization_input = {
         "waveform": waveform,
         "sample_rate": sample_rate,
     }
-
     with ProgressHook() as hook:
         diarization = pipeline(diarization_input, hook=hook, **kwargs)
 
+    return diarization_to_turns(diarization)
+
+
+def diarization_to_turns(diarization) -> List[Dict[str, object]]:
     diarization_annotation = (
         diarization.speaker_diarization
         if hasattr(diarization, "speaker_diarization")
@@ -563,27 +902,37 @@ def speaker_durations(diarized_turns: List[Dict[str, object]]) -> Dict[str, floa
 
 
 def build_speaker_audio_samples(
-    waveform_16k: torch.Tensor,
+    audio_path: str,
     diarized_turns: List[Dict[str, object]],
     max_seconds: float,
 ) -> Dict[str, torch.Tensor]:
     clips = defaultdict(list)
     durations = defaultdict(float)
-
-    total_samples = waveform_16k.shape[0]
+    sample_rate, _, _ = get_audio_metadata(audio_path)
+    if sample_rate is None or sample_rate <= 0:
+        sample_rate = 16000
+    resampler = (
+        torchaudio.transforms.Resample(sample_rate, 16000)
+        if sample_rate != 16000
+        else None
+    )
     for turn in diarized_turns:
         speaker = turn["speaker"]
         if durations[speaker] >= max_seconds:
             continue
 
-        start = max(0, int(turn["start"] * 16000))
-        end = min(total_samples, int(turn["end"] * 16000))
-        if end <= start:
+        remaining = max_seconds - durations[speaker]
+        clipped_end = min(float(turn["end"]), float(turn["start"]) + remaining)
+        if clipped_end <= float(turn["start"]):
             continue
 
-        remaining = max_seconds - durations[speaker]
-        clip_samples = int(remaining * 16000)
-        segment = waveform_16k[start : min(end, start + clip_samples)]
+        segment = load_audio_span_mono_16k(
+            audio_path,
+            start_seconds=float(turn["start"]),
+            end_seconds=clipped_end,
+            sample_rate=sample_rate,
+            resampler=resampler,
+        )
         if segment.numel() == 0:
             continue
 
@@ -653,7 +1002,7 @@ def load_known_speaker_profiles(
 
 def choose_host_speaker(
     verifier: Any,
-    waveform_16k: torch.Tensor,
+    audio_path: str,
     diarized_turns: List[Dict[str, object]],
     host_reference_path: Optional[str],
     existing_profile: Optional[np.ndarray],
@@ -666,16 +1015,21 @@ def choose_host_speaker(
     if not durations:
         return None, {}, existing_profile, {}, {}
 
-    speaker_audio = build_speaker_audio_samples(waveform_16k, diarized_turns, max_embedding_seconds)
+    speaker_audio = build_speaker_audio_samples(audio_path, diarized_turns, max_embedding_seconds)
     speaker_embeddings = {}
     for speaker, clip in speaker_audio.items():
         if durations.get(speaker, 0.0) >= min_host_seconds:
             speaker_embeddings[speaker] = compute_embedding(verifier, clip)
+        del clip
+    speaker_audio.clear()
+    gc.collect()
 
     reference_embedding = existing_profile
     if host_reference_path:
         ref_waveform = load_audio_mono_16k(host_reference_path)
         reference_embedding = compute_embedding(verifier, ref_waveform)
+        del ref_waveform
+        gc.collect()
 
     best_match = None
     best_score = -1.0
@@ -813,8 +1167,10 @@ def collect_review_rows(
     durations: Dict[str, float],
     similarity_scores: Dict[str, float],
     speaker_mapping: Dict[str, str],
+    host_output_labels: Optional[set[str]] = None,
 ) -> List[Dict[str, object]]:
     rows = []
+    host_output_labels = host_output_labels or {"HOST"}
 
     if host_speaker is None:
         rows.append(
@@ -882,7 +1238,7 @@ def collect_review_rows(
         rows.append({**event, "source_file": source_file})
 
     for segment in segments:
-        if segment.speaker == "HOST" and similarity_scores:
+        if segment.speaker in host_output_labels and similarity_scores:
             top_score = max(similarity_scores.values())
             if top_score < host_threshold + 0.05:
                 rows.append(
@@ -1007,7 +1363,7 @@ def build_episode_summary_row(
 
 
 def write_episode_summary_csv(path: Path, rows: List[Dict[str, object]]):
-    sorted_rows = sorted(rows, key=lambda row: row.get("review_priority_score", 0), reverse=True)
+    sorted_rows = sorted(rows, key=lambda row: coerce_float(row.get("review_priority_score"), 0.0), reverse=True)
     fieldnames = [
         "episode",
         "review_priority_score",
@@ -1035,6 +1391,148 @@ def write_episode_summary_csv(path: Path, rows: List[Dict[str, object]]):
         writer.writeheader()
         for row in sorted_rows:
             writer.writerow(row)
+
+
+def coerce_float(value: object, default: float = 0.0) -> float:
+    if value in ("", None):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def coerce_int(value: object, default: int = 0) -> int:
+    if value in ("", None):
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def coerce_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in ("", None):
+        return default
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return default
+
+
+def normalize_episode_summary_row(row: Dict[str, object]) -> Dict[str, object]:
+    float_fields = {
+        "review_priority_score",
+        "host_duration_seconds",
+        "host_share_of_speech",
+        "top_host_similarity",
+        "second_host_similarity",
+        "host_similarity_margin",
+    }
+    int_fields = {
+        "speaker_count",
+        "transcript_segments",
+        "review_row_count",
+        "host_match_near_threshold_count",
+        "host_match_ambiguous_count",
+        "host_low_coverage_count",
+        "host_segment_review_count",
+        "glossary_replacement_candidate_count",
+        "host_not_detected_count",
+    }
+    bool_fields = {
+        "host_detected",
+    }
+
+    normalized = dict(row)
+    for field in float_fields:
+        if field in normalized:
+            if normalized[field] in ("", None):
+                normalized[field] = ""
+            else:
+                normalized[field] = coerce_float(normalized[field], 0.0)
+
+    for field in int_fields:
+        if field in normalized:
+            normalized[field] = coerce_int(normalized[field], 0)
+
+    for field in bool_fields:
+        if field in normalized:
+            normalized[field] = coerce_bool(normalized[field], False)
+
+    return normalized
+
+
+def checkpoint_path(output_dir: Path, audio_path: Path) -> Path:
+    return output_dir / CHECKPOINT_DIRNAME / f"{audio_path.stem}.json"
+
+
+def write_processing_checkpoint(
+    output_dir: Path,
+    audio_path: Path,
+    stage: str,
+    details: Optional[Dict[str, object]] = None,
+):
+    checkpoint_file = checkpoint_path(output_dir, audio_path)
+    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "audio_file": audio_path.name,
+        "stage": stage,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if details:
+        payload["details"] = details
+    checkpoint_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def clear_processing_checkpoint(output_dir: Path, audio_path: Path):
+    checkpoint_file = checkpoint_path(output_dir, audio_path)
+    if checkpoint_file.exists():
+        checkpoint_file.unlink()
+
+
+def load_episode_summary_rows(path: Path) -> Dict[str, Dict[str, object]]:
+    if not path.exists():
+        return {}
+
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = {}
+        for row in reader:
+            episode = row.get("episode")
+            if episode:
+                rows[episode] = normalize_episode_summary_row(row)
+        return rows
+
+
+def load_processed_files(path: Path) -> Dict[str, Dict[str, object]]:
+    return state_load_processed_files(path)
+
+
+def save_processed_files(path: Path, processed_files: Dict[str, Dict[str, object]]):
+    state_save_processed_files(path, processed_files)
+
+
+def expected_output_paths(audio_path: Path, output_dir: Path) -> List[Path]:
+    return state_expected_output_paths(audio_path, output_dir)
+
+
+def is_file_already_processed(
+    audio_path: Path,
+    output_dir: Path,
+    processed_files: Dict[str, Dict[str, object]],
+    existing_summary_rows: Dict[str, Dict[str, object]],
+) -> bool:
+    return state_is_file_already_processed(
+        audio_path,
+        output_dir,
+        processed_files,
+        existing_summary_rows,
+    )
 
 
 def write_text_transcript(
@@ -1113,6 +1611,8 @@ def process_file(
 ) -> Dict[str, object]:
     print(f"Processing {audio_path.name}")
     output_dir.mkdir(parents=True, exist_ok=True)
+    clear_processing_checkpoint(output_dir, audio_path)
+    log_memory_usage("before_transcription")
 
     print("  stage: transcription")
     transcription_started = time.perf_counter()
@@ -1129,6 +1629,16 @@ def process_file(
         f"  transcription complete: {len(segments)} raw segments "
         f"in {time.perf_counter() - transcription_started:.1f}s"
     )
+    write_processing_checkpoint(
+        output_dir,
+        audio_path,
+        "transcription_complete",
+        {
+            "segment_count": len(segments),
+            "duration_seconds": info_payload.get("duration"),
+        },
+    )
+    log_memory_usage("after_transcription")
 
     print("  stage: diarization")
     diarization_started = time.perf_counter()
@@ -1138,14 +1648,23 @@ def process_file(
         f"  diarization complete: {len(diarized_turns)} turns "
         f"in {time.perf_counter() - diarization_started:.1f}s"
     )
+    write_processing_checkpoint(
+        output_dir,
+        audio_path,
+        "diarization_complete",
+        {
+            "turn_count": len(diarized_turns),
+            "segment_count": len(segments),
+        },
+    )
+    log_memory_usage("after_diarization")
 
     print("  stage: speaker matching")
     matching_started = time.perf_counter()
-    waveform_16k = load_audio_mono_16k(str(audio_path))
     existing_profile = load_host_profile(host_profile_path)
     host_speaker, speaker_embeddings, updated_profile, durations, similarity_scores = choose_host_speaker(
         verifier=verifier,
-        waveform_16k=waveform_16k,
+        audio_path=str(audio_path),
         diarized_turns=diarized_turns,
         host_reference_path=host_reference,
         existing_profile=existing_profile,
@@ -1166,6 +1685,12 @@ def process_file(
     )
     if known_host_speaker:
         host_speaker = known_host_speaker
+    updated_profile = final_host_profile_update(
+        existing_profile,
+        speaker_embeddings,
+        host_speaker,
+        updated_profile,
+    )
 
     speaker_mapping = rename_speakers(
         segments,
@@ -1175,6 +1700,8 @@ def process_file(
         known_assignments=known_assignments,
     )
     normalized_segments, replacement_events = coalesce_segments(segments, replacement_map)
+    resolved_host_label = speaker_mapping.get(host_speaker, "HOST") if host_speaker else "HOST"
+    host_output_labels = {resolved_host_label, "HOST"}
     review_rows = collect_review_rows(
         source_file=str(audio_path),
         segments=normalized_segments,
@@ -1184,26 +1711,41 @@ def process_file(
         durations=durations,
         similarity_scores=similarity_scores,
         speaker_mapping=speaker_mapping,
+        host_output_labels=host_output_labels,
     )
     print(
         f"  speaker matching complete: {len(speaker_mapping)} labeled speakers, "
         f"{len(review_rows)} review rows in {time.perf_counter() - matching_started:.1f}s"
     )
+    write_processing_checkpoint(
+        output_dir,
+        audio_path,
+        "speaker_matching_complete",
+        {
+            "labeled_speakers": len(speaker_mapping),
+            "review_rows": len(review_rows),
+        },
+    )
+    log_memory_usage("after_speaker_matching")
 
     print("  stage: writing outputs")
     writing_started = time.perf_counter()
     base_name = audio_path.stem
-    resolved_host_label = speaker_mapping.get(host_speaker, "HOST") if host_speaker else "HOST"
-    host_output_labels = {resolved_host_label, "HOST"}
-    write_text_transcript(output_dir / f"{base_name}_speaker_transcript.txt", normalized_segments, host_only=False)
-    write_text_transcript(
+    output_write_text_transcript(
+        output_dir / f"{base_name}_speaker_transcript.txt",
+        normalized_segments,
+        format_timestamp,
+        host_only=False,
+    )
+    output_write_text_transcript(
         output_dir / f"{base_name}_host_only.txt",
         normalized_segments,
+        format_timestamp,
         host_only=True,
         host_labels=host_output_labels,
     )
-    write_review_csv(output_dir / f"{base_name}_review.csv", review_rows)
-    write_json_output(
+    output_write_review_csv(output_dir / f"{base_name}_review.csv", review_rows)
+    output_write_json_output(
         output_dir / f"{base_name}_speaker_transcript.json",
         source_file=str(audio_path),
         info_payload=info_payload,
@@ -1218,9 +1760,11 @@ def process_file(
     if updated_profile is not None and host_speaker is not None:
         save_host_profile(host_profile_path, updated_profile, str(audio_path))
     print(f"  writing complete in {time.perf_counter() - writing_started:.1f}s")
+    clear_processing_checkpoint(output_dir, audio_path)
+    log_memory_usage("after_writing")
 
     total_segments = len(normalized_segments)
-    host_segments = sum(1 for segment in normalized_segments if segment.speaker == "HOST")
+    host_segments = sum(1 for segment in normalized_segments if segment.speaker in host_output_labels)
     print(f"  review rows: {len(review_rows)}")
     print(f"  speaker segments: {total_segments}")
     print(f"  host segments: {host_segments}")
@@ -1237,26 +1781,126 @@ def process_file(
     )
 
 
-def main():
-    args = parse_args()
+def discover_audio_files(input_dir: Path, input_file: Optional[str]) -> List[Path]:
+    if input_file:
+        candidate = Path(input_file)
+        if not candidate.is_absolute():
+            candidate = input_dir / candidate
+        candidate = candidate.resolve()
+        if not candidate.exists():
+            raise FileNotFoundError(f"Input file not found: {candidate}")
+        if not candidate.is_file() or candidate.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
+            raise RuntimeError(f"Input file is not a supported audio file: {candidate}")
+        return [candidate]
 
-    input_dir = Path(args.input_dir)
-    output_dir = Path(args.output_dir) if args.output_dir else input_dir
+    return sorted(
+        file_path
+        for file_path in input_dir.iterdir()
+        if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
+    )
 
-    if not input_dir.exists():
-        raise FileNotFoundError(f"Input directory not found: {input_dir}")
-    if not args.hf_token:
-        raise RuntimeError(
-            "A Hugging Face token is required for pyannote diarization. "
-            "Set HF_TOKEN or pass --hf-token."
-        )
 
-    preferred_terms = load_preferred_terms(args.preferred_terms_file)
-    initial_prompt, hotwords = build_prompt_bias(preferred_terms)
-    replacement_map = load_replacement_map(args.replacement_map_json)
+def build_child_process_command(args, audio_path: Path, output_dir: Path) -> List[str]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--input-dir",
+        str(Path(args.input_dir).resolve()),
+        "--input-file",
+        str(audio_path.resolve()),
+        "--output-dir",
+        str(output_dir.resolve()),
+        "--model",
+        args.model,
+        "--language",
+        args.language,
+        "--device",
+        args.device,
+        "--compute-type",
+        args.compute_type,
+        "--beam-size",
+        str(args.beam_size),
+        "--batch-size",
+        str(args.batch_size),
+        "--diarization-model",
+        args.diarization_model,
+        "--speaker-model",
+        args.speaker_model,
+        "--host-profile-json",
+        args.host_profile_json,
+        "--host-threshold",
+        str(args.host_threshold),
+        "--min-host-seconds",
+        str(args.min_host_seconds),
+        "--max-embedding-seconds",
+        str(args.max_embedding_seconds),
+        "--no-isolate-files",
+    ]
 
-    device = get_device(args.device)
-    print(f"Using device: {device}")
+    if args.hf_token:
+        command.extend(["--hf-token", args.hf_token])
+    if args.host_reference:
+        command.extend(["--host-reference", args.host_reference])
+    if args.known_speakers_dir:
+        command.extend(["--known-speakers-dir", args.known_speakers_dir])
+    if args.preferred_terms_file:
+        command.extend(["--preferred-terms-file", args.preferred_terms_file])
+    if args.replacement_map_json:
+        command.extend(["--replacement-map-json", args.replacement_map_json])
+    if args.assume_dominant_speaker_is_host:
+        command.append("--assume-dominant-speaker-is-host")
+    if args.num_speakers:
+        command.extend(["--num-speakers", str(args.num_speakers)])
+
+    return command
+
+
+def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: List[Path]):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = output_dir / SUMMARY_FILENAME
+    resume_state_path = output_dir / RESUME_STATE_FILENAME
+    existing_summary_rows = state_load_episode_summary_rows(summary_path, normalize_episode_summary_row)
+    processed_files = state_load_processed_files(resume_state_path)
+    total_files = len(audio_files)
+    batch_started = time.perf_counter()
+
+    print("Using isolated per-file processing to release native memory between episodes.")
+    for index, audio_path in enumerate(audio_files, start=1):
+        duration_seconds = get_audio_duration_seconds(str(audio_path))
+        if duration_seconds is not None and duration_seconds >= LONG_FILE_WARNING_HOURS * 3600:
+            print(
+                f"Long file notice: {audio_path.name} is {format_timestamp(duration_seconds)} long. "
+                "This file will run in its own Python process so memory is reclaimed before the next episode."
+            )
+
+        elapsed = time.perf_counter() - batch_started
+        average_seconds = elapsed / (index - 1) if index > 1 else None
+        remaining_files = total_files - index + 1
+        eta_seconds = average_seconds * remaining_files if average_seconds is not None else None
+        if eta_seconds is not None:
+            print(
+                f"Batch progress: file {index} of {total_files} "
+                f"(estimated remaining {format_timestamp(eta_seconds)})"
+            )
+        else:
+            print(f"Batch progress: file {index} of {total_files}")
+
+        if state_is_file_already_processed(audio_path, output_dir, processed_files, existing_summary_rows):
+            print(f"Skipping completed file: {audio_path.name}")
+            continue
+
+        command = build_child_process_command(args, audio_path, output_dir)
+        result = subprocess.run(command)
+        if result.returncode != 0:
+            raise RuntimeError(f"Child process failed for {audio_path.name} with exit code {result.returncode}.")
+
+        existing_summary_rows = state_load_episode_summary_rows(summary_path, normalize_episode_summary_row)
+        processed_files = state_load_processed_files(resume_state_path)
+
+    print(f"Wrote folder summary: {summary_path}")
+
+
+def load_models(args, device: str):
     whisper_model = WhisperModel(args.model, device=device, compute_type=args.compute_type)
 
     try:
@@ -1287,6 +1931,7 @@ def main():
         raise RuntimeError(
             f"Failed to load diarization model '{args.diarization_model}'. Original error: {exc}"
         ) from exc
+
     print(f"Using diarization model: {resolved_diarization_model}")
     if device == "cuda":
         diarization_pipeline.to(torch.device(normalize_runtime_device(device)))
@@ -1296,20 +1941,34 @@ def main():
         verifier=verifier,
         known_speakers_dir=args.known_speakers_dir,
     )
+    return whisper_model, diarization_pipeline, verifier, known_speaker_profiles
 
-    audio_files = sorted(
-        file_path
-        for file_path in input_dir.iterdir()
-        if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
-    )
 
-    if not audio_files:
-        raise RuntimeError(f"No supported audio files found in {input_dir}")
+def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: List[Path]):
+    preferred_terms = load_preferred_terms(args.preferred_terms_file)
+    initial_prompt, hotwords = build_prompt_bias(preferred_terms)
+    replacement_map = load_replacement_map(args.replacement_map_json)
 
-    episode_summary_rows = []
+    device = get_device(args.device)
+    print(f"Using device: {device}")
+    whisper_model, diarization_pipeline, verifier, known_speaker_profiles = load_models(args, device)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = output_dir / SUMMARY_FILENAME
+    resume_state_path = output_dir / RESUME_STATE_FILENAME
+    existing_summary_rows = state_load_episode_summary_rows(summary_path, normalize_episode_summary_row)
+    processed_files = state_load_processed_files(resume_state_path)
+    episode_summary_rows_by_name = dict(existing_summary_rows)
     total_files = len(audio_files)
     batch_started = time.perf_counter()
     for index, audio_path in enumerate(audio_files, start=1):
+        duration_seconds = get_audio_duration_seconds(str(audio_path))
+        if duration_seconds is not None and duration_seconds >= LONG_FILE_WARNING_HOURS * 3600:
+            print(
+                f"Long file notice: {audio_path.name} is {format_timestamp(duration_seconds)} long. "
+                "Speaker matching streams diarized spans, but diarization may still preload the full file (requiring significant system RAM) "
+                "when pyannote's path decoder is unavailable in the local environment."
+            )
         elapsed = time.perf_counter() - batch_started
         average_seconds = elapsed / (index - 1) if index > 1 else None
         remaining_files = total_files - index + 1
@@ -1321,8 +1980,11 @@ def main():
             )
         else:
             print(f"Batch progress: file {index} of {total_files}")
-        episode_summary_rows.append(
-            process_file(
+        if is_file_already_processed(audio_path, output_dir, processed_files, episode_summary_rows_by_name):
+            print(f"Skipping completed file: {audio_path.name}")
+            continue
+
+        episode_summary = process_file(
             audio_path=audio_path,
             output_dir=output_dir,
             whisper_model=whisper_model,
@@ -1343,10 +2005,41 @@ def main():
             min_host_seconds=args.min_host_seconds,
             num_speakers=args.num_speakers,
         )
+        episode_summary_rows_by_name[audio_path.name] = episode_summary
+        processed_files[audio_path.name] = audio_file_fingerprint(audio_path)
+        write_episode_summary_csv(summary_path, list(episode_summary_rows_by_name.values()))
+        state_save_processed_files(resume_state_path, processed_files)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    write_episode_summary_csv(summary_path, list(episode_summary_rows_by_name.values()))
+    state_save_processed_files(resume_state_path, processed_files)
+    print(f"Wrote folder summary: {summary_path}")
+
+
+def main():
+    args = parse_args()
+
+    input_dir = Path(args.input_dir)
+    output_dir = Path(args.output_dir) if args.output_dir else input_dir
+
+    if not input_dir.exists():
+        raise FileNotFoundError(f"Input directory not found: {input_dir}")
+    if not args.hf_token:
+        raise RuntimeError(
+            "A Hugging Face token is required for pyannote diarization. "
+            "Set HF_TOKEN or pass --hf-token."
         )
 
-    write_episode_summary_csv(output_dir / "_episode_review_summary.csv", episode_summary_rows)
-    print(f"Wrote folder summary: {output_dir / '_episode_review_summary.csv'}")
+    audio_files = discover_audio_files(input_dir, args.input_file)
+    if not audio_files:
+        raise RuntimeError(f"No supported audio files found in {input_dir}")
+
+    if args.isolate_files and args.input_file is None:
+        run_isolated_batch(args, input_dir, output_dir, audio_files)
+    else:
+        process_audio_batch(args, input_dir, output_dir, audio_files)
 
 
 if __name__ == "__main__":

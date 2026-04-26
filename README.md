@@ -29,13 +29,15 @@ For each supported audio file in an input folder, the pipeline:
 ## Repository Contents
 
 - `podcast_transcribe_host.py`: main Python pipeline
-- `Convert MP3 to TXT diarized.ps1`: Windows PowerShell launcher that auto-loads `.env`, validates the Hugging Face token early, and uses persisted config values before prompting
+- `podcast_transcribe_state.py`: resumable batch state and output-existence checks
+- `podcast_transcribe_speakers.py`: speaker/profile math that can be unit-tested without loading ML models
+- `podcast_transcribe_outputs.py`: transcript, review CSV, and JSON writers
+- `Convert Audio to TXT diarized.ps1`: Windows PowerShell launcher that auto-loads `.env`, validates the Hugging Face token early, and uses persisted config values before prompting
 - `podcast_transcribe_config.example.json`: example runtime configuration file
 - `podcast_transcribe_requirements.txt`: Python package list
 - `preferred_terms.txt`: optional glossary for domain-specific spellings
 - `preferred_replacements.json`: optional post-processing replacements for common mistranscriptions
 - `speaker_reference_samples/speakers.json`: sample configuration for recurring known speakers
-- `podcast_transcribe_README.md`: legacy project notes and feature details
 
 ## Technical Details
 
@@ -48,7 +50,8 @@ The pipeline is centered around three model-driven stages:
 Key implementation details:
 
 - Audio is normalized to mono 16 kHz before speaker embedding extraction.
-- Diarization audio is preloaded in memory before being passed to `pyannote.audio`, which avoids depending on `torchcodec` for file decoding during diarization.
+- Batch runs default to isolated per-file child processes so native allocations from Whisper, pyannote, SpeechBrain, NumPy, and PyTorch are released by the OS between episodes.
+- Diarization audio is preloaded in memory before being passed to `pyannote.audio` when pyannote's path decoder is unavailable, which avoids depending on `torchcodec` for file decoding during diarization.
 - Host matching uses cosine similarity against a host reference embedding or saved host profile.
 - Known speakers are matched one-to-one against diarized speakers when similarity clears the configured threshold.
 - The host profile can be updated over time from matched host speech to improve stability across episodes.
@@ -135,7 +138,7 @@ conda activate podcast-transcribe
 pip install -r podcast_transcribe_requirements.txt
 ```
 
-If you prefer a different environment name or a plain virtual environment, you will need to update `Convert MP3 to TXT diarized.ps1` and adjust the `conda activate podcast-transcribe` command accordingly.
+If you prefer a different environment name or a plain virtual environment, you will need to update `Convert Audio to TXT diarized.ps1` and adjust the `conda activate podcast-transcribe` command accordingly.
 
 ### 3. Get a Hugging Face token
 
@@ -271,7 +274,7 @@ The script ends with an overall `PASS` or `FAIL` summary and pauses so you can r
 This is the easiest way to run the project on Windows.
 
 ```powershell
-.\Convert MP3 to TXT diarized.ps1
+.\Convert Audio to TXT diarized.ps1
 ```
 
 The launcher will:

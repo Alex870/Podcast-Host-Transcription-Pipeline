@@ -7,6 +7,7 @@ $SecondaryDiarizationModel = "pyannote/segmentation-3.0"
 $CondaEnvironmentName = "podcast-transcribe"
 $script:TotalChecks = 0
 $script:FailedChecks = 0
+$script:WarningChecks = 0
 
 function Resolve-ConfigPathValue {
     param(
@@ -144,11 +145,29 @@ function Write-CheckResult {
     Write-Host (" {0}{1}" -f $Label, $detailText)
 }
 
+function Write-WarningResult {
+    param(
+        [string]$Label,
+        [string]$Detail
+    )
+
+    $script:TotalChecks += 1
+    $script:WarningChecks += 1
+
+    $detailText = if ([string]::IsNullOrWhiteSpace($Detail)) { "" } else { ": $Detail" }
+    Write-Host -NoNewline "[WARN]" -ForegroundColor Yellow
+    Write-Host (" {0}{1}" -f $Label, $detailText)
+}
+
 function Write-FinalSummary {
     $passedAll = $script:FailedChecks -eq 0
     $summaryColor = if ($passedAll) { "Green" } else { "Red" }
     $summaryText = if ($passedAll) {
-        "[PASS] All tests passed"
+        if ($script:WarningChecks -gt 0) {
+            "[PASS] All required tests passed ({0} warning-level checks)" -f $script:WarningChecks
+        } else {
+            "[PASS] All tests passed"
+        }
     } else {
         "[FAIL] {0} of {1} tests failed" -f $script:FailedChecks, $script:TotalChecks
     }
@@ -356,6 +375,7 @@ report = {
     "module_checks": {},
     "torch": {},
     "pyannote": {},
+    "pyannote_path_decoder": {},
     "speechbrain": {},
     "full_model_checks": {},
 }
@@ -425,13 +445,31 @@ except Exception as exc:
 try:
     from pyannote.audio import Pipeline
     import pyannote.audio
+    import pyannote.audio.core.io as pyannote_io
 
     report["pyannote"] = {
         "version": pyannote.audio.__version__,
         "from_pretrained_signature": str(inspect.signature(Pipeline.from_pretrained)),
     }
+    decoder_available = hasattr(pyannote_io, "AudioDecoder")
+    report["pyannote_path_decoder"] = {
+        "ok": decoder_available,
+        "audio_decoder_available": decoder_available,
+        "detail": (
+            "pyannote AudioDecoder is available; path-based diarization input can be attempted."
+            if decoder_available
+            else "pyannote AudioDecoder is unavailable; the main pipeline will preload audio with torchaudio for diarization.  This will prevent audio chunking for long podcasts and may require a lot of system RAM for processing."
+        ),
+    }
 except Exception as exc:
     report["pyannote"] = {
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    }
+    report["pyannote_path_decoder"] = {
+        "ok": False,
+        "audio_decoder_available": False,
+        "detail": "Could not inspect pyannote audio decoder.",
         "error_type": type(exc).__name__,
         "error": str(exc),
     }
@@ -553,6 +591,16 @@ if ($pythonReport.pyannote.version) {
     Write-CheckResult "pyannote.audio runtime" $false ("{0}: {1}" -f $pythonReport.pyannote.error_type, $pythonReport.pyannote.error)
 }
 
+if ($pythonReport.pyannote_path_decoder.audio_decoder_available) {
+    Write-CheckResult "pyannote path decoder" $true $pythonReport.pyannote_path_decoder.detail
+} else {
+    $decoderDetail = $pythonReport.pyannote_path_decoder.detail
+    if ($pythonReport.pyannote_path_decoder.error) {
+        $decoderDetail += " {0}: {1}" -f $pythonReport.pyannote_path_decoder.error_type, $pythonReport.pyannote_path_decoder.error
+    }
+    Write-WarningResult "pyannote path decoder" $decoderDetail
+}
+
 foreach ($property in $pythonReport.full_model_checks.PSObject.Properties) {
     $value = $property.Value
     if ($value.ok) {
@@ -577,7 +625,8 @@ if ($pythonReport.speechbrain.speaker_recognition_import_ok) {
 Write-Section "Notes"
 Write-Host "- If Hugging Face access fails with HTTP 403, accept terms for both $PrimaryDiarizationModel and $SecondaryDiarizationModel."
 Write-Host "- If Torch reports CUDA unavailable, install matching CUDA-enabled PyTorch wheels in the '$CondaEnvironmentName' environment."
-Write-Host "- If FFmpeg is detected but pyannote import still fails on Windows, verify the FFmpeg build is the full shared build and that ffmpeg_bin_dir points to its bin directory."
+Write-Host "- If the pyannote path decoder is only a warning, the main pipeline will still run by preloading audio with torchaudio."
+Write-Host "- To enable pyannote path decoding on Windows, verify torchcodec is installed for the active PyTorch version and can find a full shared FFmpeg build through ffmpeg_bin_dir/PATH."
 Write-Host "- If speechbrain or pyannote model loading fails only during full model checks, compare the installed versions against podcast_transcribe_requirements.txt and reinstall inside '$CondaEnvironmentName'."
 Write-FinalSummary
 pause

@@ -41,6 +41,30 @@ function Save-Config {
     $ConfigObject | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
 }
 
+function Select-WhisperModel {
+    param(
+        [string]$CurrentValue
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($CurrentValue)) {
+        return $CurrentValue
+    }
+
+    Write-Host ""
+    Write-Host "No transcription model is configured."
+    Write-Host "Choose a Whisper model for this machine:"
+    Write-Host "  1. distil-large-v3 (Recommended) - best speed/quality tradeoff for English podcast transcription"
+    Write-Host "  2. large-v3-turbo - very fast, strong general transcription choice"
+    Write-Host "  3. large-v3 - slowest, most conservative accuracy-first option"
+    $selection = Read-Host "Enter 1, 2, or 3 (default: 1)"
+
+    switch (($selection | ForEach-Object { $_.Trim() })) {
+        "2" { return "large-v3-turbo" }
+        "3" { return "large-v3" }
+        default { return "distil-large-v3" }
+    }
+}
+
 function Load-DotEnvFile {
     param(
         [string]$Path
@@ -342,7 +366,12 @@ $ReplacementMapJson = Resolve-ConfigPathValue $(if ($Config.replacement_map_json
 $HostProfileJson = Resolve-ConfigPathValue $(if ($Config.host_profile_json) { $Config.host_profile_json } else { "host_profile.json" })
 $ConfiguredHostReference = Resolve-ConfigPathValue $(if ($Config.host_reference) { $Config.host_reference } else { $null })
 
-$WhisperModel = if ($Config.model) { $Config.model } else { "large-v3" }
+$WhisperModel = Select-WhisperModel -CurrentValue $(if ($null -ne $Config.model) { [string]$Config.model } else { $null })
+if ([string]::IsNullOrWhiteSpace($(if ($null -ne $Config.model) { [string]$Config.model } else { $null }))) {
+    Set-ConfigValue -ConfigObject $Config -Name "model" -Value $WhisperModel
+    Save-Config -ConfigObject $Config
+    Write-Host "Saved model selection to $ConfigPath"
+}
 $Language = if ($Config.language) { $Config.language } else { "en" }
 $Device = if ($Config.device) { $Config.device } else { "auto" }
 $ComputeType = if ($Config.compute_type) { $Config.compute_type } else { "auto" }
@@ -350,11 +379,11 @@ $BeamSize = if ($null -ne $Config.beam_size) { [int]$Config.beam_size } else { 5
 $BatchSize = if ($null -ne $Config.batch_size) { [int]$Config.batch_size } else { 8 }
 $AssumeDominantSpeakerIsHost = if ($null -ne $Config.assume_dominant_speaker_is_host) { [bool]$Config.assume_dominant_speaker_is_host } else { $true }
 $HostThreshold = if ($null -ne $Config.host_threshold) { [double]$Config.host_threshold } else { 0.45 }
+$IsolateFiles = if ($null -ne $Config.isolate_files) { [bool]$Config.isolate_files } else { $true }
 
 conda activate podcast-transcribe
 $env:PYTHONNOUSERSITE = "1"
 $env:PODCAST_TRANSCRIBE_FFMPEG_BIN_DIR = $FfmpegBinDir
-cls
 
 $dependencyCheckOutput = Test-PythonDependencies 2>&1
 if ($LASTEXITCODE -ne 0) {
@@ -387,6 +416,7 @@ $startTime = Get-Date
 Write-Host "Processing Folder: $SourceFolder"
 Write-Host "Configured model: $WhisperModel"
 Write-Host "Configured device: $Device"
+Write-Host "Isolated per-file processing: $IsolateFiles"
 Write-Host "PYTHONNOUSERSITE: $env:PYTHONNOUSERSITE"
 Write-Host "ffmpeg bin directory: $FfmpegBinDir"
 $OutputRoot = Split-Path -Path $SourceFolder -Parent
@@ -419,6 +449,12 @@ $args = @(
 
 if ($AssumeDominantSpeakerIsHost) {
     $args += "--assume-dominant-speaker-is-host"
+}
+
+if ($IsolateFiles) {
+    $args += "--isolate-files"
+} else {
+    $args += "--no-isolate-files"
 }
 
 if ($ConfiguredHostReference -and (Test-Path -LiteralPath $ConfiguredHostReference)) {

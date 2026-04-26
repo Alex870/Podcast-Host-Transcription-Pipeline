@@ -9,5 +9,7 @@ torchvision==0.23.0
 
 numpy==2.2.6
 faster-whisper==1.2.1
+huggingface_hub
 pyannote.audio==4.0.4
+rich
 speechbrain==1.1.0
