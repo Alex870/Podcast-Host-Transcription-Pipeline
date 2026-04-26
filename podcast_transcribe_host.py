@@ -1891,11 +1891,16 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
 
         command = build_child_process_command(args, audio_path, output_dir)
         result = subprocess.run(command)
-        if result.returncode != 0:
-            raise RuntimeError(f"Child process failed for {audio_path.name} with exit code {result.returncode}.")
-
         existing_summary_rows = state_load_episode_summary_rows(summary_path, normalize_episode_summary_row)
         processed_files = state_load_processed_files(resume_state_path)
+        if result.returncode != 0:
+            if state_is_file_already_processed(audio_path, output_dir, processed_files, existing_summary_rows):
+                print(
+                    f"Child process for {audio_path.name} exited with code {result.returncode} "
+                    "after writing all expected outputs; continuing batch."
+                )
+                continue
+            raise RuntimeError(f"Child process failed for {audio_path.name} with exit code {result.returncode}.")
 
     print(f"Wrote folder summary: {summary_path}")
 
@@ -2040,6 +2045,11 @@ def main():
         run_isolated_batch(args, input_dir, output_dir, audio_files)
     else:
         process_audio_batch(args, input_dir, output_dir, audio_files)
+        if args.input_file:
+            # Isolated workers are short-lived by design; skip native-library teardown that can fault after outputs are complete.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
 
 
 if __name__ == "__main__":
