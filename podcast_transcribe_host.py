@@ -1075,6 +1075,8 @@ def match_known_speakers(
         if diarized_speaker in assignments:
             continue
         if any(match["known_name"] == known_name for match in assignments.values()):
+        elif not segment.speaker:
+            segment.speaker = "UNKNOWN"
             continue
         assignments[diarized_speaker] = {
             "known_name": known_name,
@@ -1090,6 +1092,8 @@ def rename_speakers(
     diarized_turns: List[Dict[str, object]],
     host_speaker: Optional[str],
     durations: Dict[str, float],
+            if not word.speaker:
+                word.speaker = "UNKNOWN"
     known_assignments: Optional[Dict[str, Dict[str, object]]] = None,
 ):
     ordered = sorted(durations.items(), key=lambda item: item[1], reverse=True)
