@@ -1,7 +1,16 @@
-$ScriptRoot = $PSScriptRoot
-$ConfigPath = Join-Path $ScriptRoot "podcast_transcribe_config.json"
-$ConfigExamplePath = Join-Path $ScriptRoot "podcast_transcribe_config.example.json"
-$EnvPath = Join-Path $ScriptRoot ".env"
+$CommonScript = Join-Path $PSScriptRoot "PodcastTranscribeLauncher.Common.ps1"
+. $CommonScript
+
+$LauncherContext = Get-PodcastTranscribeLauncherContext -ScriptRoot $PSScriptRoot
+$ProjectRoot = $LauncherContext.ProjectRoot
+$ScriptRoot = $ProjectRoot
+$ConfigPath = $LauncherContext.ConfigPath
+$ConfigExamplePath = $LauncherContext.ConfigExamplePath
+$EnvPath = $LauncherContext.EnvPath
+$Config = $LauncherContext.Config
+$ConfigSource = $LauncherContext.ConfigSource
+$ActiveConfigPath = $LauncherContext.ActiveConfigPath
+$HasProjectConfig = $LauncherContext.HasProjectConfig
 $PrimaryDiarizationModel = "pyannote/speaker-diarization-community-1"
 $SecondaryDiarizationModel = "pyannote/segmentation-3.0"
 $CondaEnvironmentName = "podcast-transcribe"
@@ -220,32 +229,50 @@ function Test-HfRepoAccess {
     }
 }
 
-$Config = $null
-if (Test-Path -LiteralPath $ConfigPath) {
-    $Config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
-} elseif (Test-Path -LiteralPath $ConfigExamplePath) {
-    $Config = Get-Content -LiteralPath $ConfigExamplePath -Raw | ConvertFrom-Json
-} else {
-    $Config = [pscustomobject]@{}
-}
-
 $SourceFolder = Resolve-ConfigPathValue $(if ($Config.default_source_dir) { $Config.default_source_dir } else { $null })
 $KnownSpeakersDir = Resolve-ConfigPathValue $(if ($Config.known_speakers_dir) { $Config.known_speakers_dir } else { "speaker_reference_samples" })
-$PreferredTermsFile = Resolve-ConfigPathValue $(if ($Config.preferred_terms_file) { $Config.preferred_terms_file } else { "preferred_terms.txt" })
-$ReplacementMapJson = Resolve-ConfigPathValue $(if ($Config.replacement_map_json) { $Config.replacement_map_json } else { "preferred_replacements.json" })
+$PreferredTermsFile = Resolve-ConfigPathValue $(if ($Config.preferred_terms_file) { $Config.preferred_terms_file } else { "examples\preferred_terms.txt" })
+$ReplacementMapJson = Resolve-ConfigPathValue $(if ($Config.replacement_map_json) { $Config.replacement_map_json } else { "examples\preferred_replacements.json" })
 $HostProfileJson = Resolve-ConfigPathValue $(if ($Config.host_profile_json) { $Config.host_profile_json } else { "host_profile.json" })
 $FfmpegBinDir = Resolve-ConfigPathValue $(if ($Config.ffmpeg_bin_dir) { $Config.ffmpeg_bin_dir } else { $null })
+$FilenameDateConfig = if ($Config.filename_date) { $Config.filename_date } else { $null }
+$FilenameDatePreset = if ($FilenameDateConfig -and $FilenameDateConfig.preset) { [string]$FilenameDateConfig.preset } else { "strict_iso" }
+$FilenameDatePosition = if ($FilenameDateConfig -and $FilenameDateConfig.position) { [string]$FilenameDateConfig.position } else { "last" }
+$FilenameDateFormats = if ($FilenameDateConfig -and $FilenameDateConfig.formats) { @($FilenameDateConfig.formats) } else { @() }
 $Device = if ($Config.device) { [string]$Config.device } else { "auto" }
 $Model = if ($Config.model) { [string]$Config.model } else { "large-v3" }
 $TokenResolution = Resolve-HfToken -ConfigObject $Config -EnvFilePath $EnvPath -ConfigFilePath $ConfigPath
 
 Write-Section "Config Resolution"
-Write-CheckResult "Config file" $true $ConfigPath
-Write-CheckResult "Source directory" (-not [string]::IsNullOrWhiteSpace($SourceFolder) -and (Test-Path -LiteralPath $SourceFolder)) $(if ($SourceFolder) { $SourceFolder } else { "Not configured." })
+if ($HasProjectConfig) {
+    Write-CheckResult "Config file" $true ("Using project config: {0}" -f $ConfigPath)
+} elseif ($ActiveConfigPath) {
+    Write-WarningResult "Config file" ("Project config not found; using example config at {0}" -f $ActiveConfigPath)
+} else {
+    Write-WarningResult "Config file" "No project config or example config was found. Script is using built-in defaults."
+}
+
+$sourceConfigured = -not [string]::IsNullOrWhiteSpace($SourceFolder)
+$sourceExists = $sourceConfigured -and (Test-Path -LiteralPath $SourceFolder)
+if ($sourceExists) {
+    Write-CheckResult "Source directory" $true $SourceFolder
+} elseif ($sourceConfigured -and $HasProjectConfig) {
+    Write-CheckResult "Source directory" $false $SourceFolder
+} elseif ($sourceConfigured) {
+    Write-WarningResult "Source directory" ("Configured path does not exist in this clone: {0}" -f $SourceFolder)
+} else {
+    Write-WarningResult "Source directory" "Not configured."
+}
+
 Write-CheckResult "Speaker reference directory" (Test-Path -LiteralPath $KnownSpeakersDir) $KnownSpeakersDir
 Write-CheckResult "Speaker reference config" (Test-Path -LiteralPath (Join-Path $KnownSpeakersDir "speakers.json")) (Join-Path $KnownSpeakersDir "speakers.json")
 Write-CheckResult "Preferred terms file" (Test-Path -LiteralPath $PreferredTermsFile) $PreferredTermsFile
 Write-CheckResult "Replacement map file" (Test-Path -LiteralPath $ReplacementMapJson) $ReplacementMapJson
+Write-CheckResult "Filename date preset" $true $FilenameDatePreset
+Write-CheckResult "Filename date position" $true $FilenameDatePosition
+if ($FilenameDateFormats.Count -gt 0) {
+    Write-CheckResult "Filename date formats" $true ($FilenameDateFormats -join ", ")
+}
 Write-CheckResult "Host profile path" $true $HostProfileJson
 Write-CheckResult "Configured device" $true $Device
 Write-CheckResult "Configured model" $true $Model
@@ -253,6 +280,11 @@ Write-CheckResult "Configured model" $true $Model
 Write-Section "Token Resolution"
 foreach ($attempt in $TokenResolution.Attempts) {
     Write-Host " - $attempt"
+}
+if ($ActiveConfigPath) {
+    Write-Host " - Active config source: $ConfigSource ($ActiveConfigPath)"
+} else {
+    Write-Host " - Active config source: $ConfigSource"
 }
 Write-CheckResult "Resolved HF token" (-not [string]::IsNullOrWhiteSpace($TokenResolution.Token)) $(if ($TokenResolution.Source) { $TokenResolution.Source } else { "No token found." })
 

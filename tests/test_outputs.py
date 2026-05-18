@@ -1,15 +1,83 @@
+import json
 import tempfile
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
-from podcast_transcribe_outputs import write_text_transcript
+from podcast_transcribe.outputs import (
+    TRANSCRIPT_SCHEMA_VERSION,
+    build_episode_metadata,
+    segment_confidence,
+    validate_transcript_payload,
+    write_batch_report_md,
+    write_json_output,
+    write_output_manifest,
+    write_speaker_identity_review_csv,
+    write_text_transcript,
+)
 
 
 TEST_TMP = Path(__file__).resolve().parents[1] / "test_tmp"
 
 
 class OutputTests(unittest.TestCase):
+    def test_episode_metadata_uses_last_valid_yyyymmdd_in_filename(self):
+        metadata = build_episode_metadata(r"D:\Podcasts\Podcast 20250101 final 20260204.mp3")
+
+        self.assertEqual(metadata["source_filename"], "Podcast 20250101 final 20260204.mp3")
+        self.assertEqual(metadata["episode_date"], "2026-02-04")
+        self.assertEqual(metadata["episode_date_compact"], "20260204")
+        self.assertEqual(metadata["episode_year"], 2026)
+        self.assertEqual(metadata["episode_month"], 2)
+        self.assertEqual(metadata["episode_day"], 4)
+        self.assertEqual(metadata["episode_sort_key"], 20260204)
+
+    def test_episode_metadata_supports_configured_dashed_iso_format(self):
+        metadata = build_episode_metadata(
+            "Podcast 2026-02-04.mp3",
+            {"formats": ["YYYY-MM-DD"]},
+        )
+
+        self.assertEqual(metadata["episode_date"], "2026-02-04")
+        self.assertEqual(metadata["episode_date_compact"], "20260204")
+        self.assertEqual(metadata["episode_sort_key"], 20260204)
+
+    def test_episode_metadata_respects_format_priority_for_ambiguous_dates(self):
+        metadata = build_episode_metadata(
+            "Episode 03-04-2026.mp3",
+            {"formats": ["DD-MM-YYYY", "MM-DD-YYYY"]},
+        )
+
+        self.assertEqual(metadata["episode_date"], "2026-04-03")
+        self.assertEqual(metadata["episode_date_compact"], "20260403")
+
+    def test_episode_metadata_can_use_first_match_when_configured(self):
+        metadata = build_episode_metadata(
+            "Podcast 20260101 final 20260204.mp3",
+            {"formats": ["YYYYMMDD"], "position": "first"},
+        )
+
+        self.assertEqual(metadata["episode_date"], "2026-01-01")
+        self.assertEqual(metadata["episode_sort_key"], 20260101)
+
+    def test_episode_metadata_can_be_disabled(self):
+        metadata = build_episode_metadata(
+            "Podcast 20260204.mp3",
+            {"enabled": False},
+        )
+
+        self.assertEqual(metadata["episode_date"], "")
+        self.assertEqual(metadata["episode_date_compact"], "")
+        self.assertEqual(metadata["episode_sort_key"], "")
+
+    def test_episode_metadata_ignores_invalid_dates(self):
+        metadata = build_episode_metadata("Podcast 20261340.mp3")
+
+        self.assertEqual(metadata["episode_date"], "")
+        self.assertEqual(metadata["episode_date_compact"], "")
+        self.assertEqual(metadata["episode_sort_key"], "")
+
     def test_host_only_transcript_accepts_named_host_label(self):
         TEST_TMP.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
@@ -29,6 +97,238 @@ class OutputTests(unittest.TestCase):
 
             self.assertEqual(output_path.read_text(encoding="utf-8"), "[00][Alex] host line")
 
+    def test_text_transcript_writes_episode_metadata_header(self):
+        TEST_TMP.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+            output_path = Path(tmp) / "speaker_transcript.txt"
+            segments = [SimpleNamespace(start=0, speaker="HOST", text="opening line")]
+            metadata = build_episode_metadata("Podcast 20260204.mp3")
+
+            write_text_transcript(
+                output_path,
+                segments,
+                lambda seconds: f"{int(seconds):02d}",
+                metadata=metadata,
+            )
+
+            self.assertEqual(
+                output_path.read_text(encoding="utf-8"),
+                "\n".join(
+                    [
+                        "# source_file: Podcast 20260204.mp3",
+                        "# source_filename: Podcast 20260204.mp3",
+                        "# episode_date: 2026-02-04",
+                        "# episode_date_compact: 20260204",
+                        "# episode_sort_key: 20260204",
+                        "",
+                        "[00][HOST] opening line",
+                    ]
+                ),
+            )
+
+    def test_json_output_repeats_episode_metadata_on_segments_for_vector_ingest(self):
+        @dataclass
+        class Word:
+            start: float
+            end: float
+            word: str
+            speaker: str
+
+        TEST_TMP.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+            output_path = Path(tmp) / "speaker_transcript.json"
+            segment = SimpleNamespace(
+                id=1,
+                start=12.0,
+                end=14.0,
+                speaker="HOST",
+                text="host viewpoint",
+                avg_logprob=-0.1,
+                no_speech_prob=0.01,
+                words=[Word(12.0, 12.5, "host", "HOST")],
+            )
+
+            write_json_output(
+                output_path,
+                source_file="Podcast 20260204.mp3",
+                info_payload={"duration": 120.0},
+                diarized_turns=[],
+                segments=[segment],
+                speaker_mapping={"SPEAKER_00": "HOST"},
+                host_speaker="SPEAKER_00",
+                durations={"SPEAKER_00": 60.0},
+                known_assignments={},
+            )
+
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema_version"], TRANSCRIPT_SCHEMA_VERSION)
+            self.assertEqual(payload["pipeline"], "podcast-host-transcription-pipeline")
+            self.assertEqual(payload["metadata"]["episode_date"], "2026-02-04")
+            self.assertEqual(payload["episode_date"], "2026-02-04")
+            self.assertEqual(payload["segments"][0]["episode_date"], "2026-02-04")
+            self.assertEqual(payload["segments"][0]["episode_sort_key"], 20260204)
+            self.assertEqual(payload["segments"][0]["transcription_confidence"]["quality"], "high")
+            self.assertIn("content_quality", payload["segments"][0])
+            self.assertEqual(payload["content_quality_summary"]["segment_count"], 1)
+            self.assertEqual(validate_transcript_payload(payload), [])
+
+    def test_unknown_segment_satisfies_json_contract(self):
+        @dataclass
+        class Word:
+            start: float
+            end: float
+            word: str
+            speaker: str = "UNKNOWN"
+
+        TEST_TMP.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+            output_path = Path(tmp) / "speaker_transcript.json"
+            segment = SimpleNamespace(
+                id=17,
+                start=12.0,
+                end=14.0,
+                speaker="UNKNOWN",
+                text="Gap between diarization turns.",
+                avg_logprob=-0.1,
+                no_speech_prob=0.01,
+                words=[Word(12.0, 12.5, "Gap")],
+            )
+
+            write_json_output(
+                output_path,
+                source_file="Podcast 20260204.mp3",
+                info_payload={"duration": 120.0},
+                diarized_turns=[],
+                segments=[segment],
+                speaker_mapping={},
+                host_speaker=None,
+                durations={},
+                known_assignments={},
+            )
+
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["segments"][0]["speaker"], "UNKNOWN")
+            self.assertEqual(payload["segments"][0]["words"][0]["speaker"], "UNKNOWN")
+            self.assertEqual(validate_transcript_payload(payload), [])
+
+    def test_cleaned_json_preserves_original_segment_text(self):
+        @dataclass
+        class Word:
+            start: float
+            end: float
+            word: str
+            speaker: str
+
+        TEST_TMP.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+            output_path = Path(tmp) / "cleaned_speaker_transcript.json"
+            segment = SimpleNamespace(
+                id=1,
+                start=12.0,
+                end=14.0,
+                speaker="HOST",
+                text="Otherwise, this changed.",
+                original_text="Otherwise, otherwise, this changed.",
+                cleanup_applied=True,
+                avg_logprob=-0.1,
+                no_speech_prob=0.01,
+                words=[Word(12.0, 12.5, "Otherwise", "HOST")],
+            )
+
+            write_json_output(
+                output_path,
+                source_file="Podcast 20260204.mp3",
+                info_payload={"duration": 120.0},
+                diarized_turns=[],
+                segments=[segment],
+                speaker_mapping={"SPEAKER_00": "HOST"},
+                host_speaker="SPEAKER_00",
+                durations={"SPEAKER_00": 60.0},
+                known_assignments={},
+                text_version="cleaned",
+            )
+
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["text_version"], "cleaned")
+            self.assertEqual(payload["segments"][0]["text"], "Otherwise, this changed.")
+            self.assertEqual(payload["segments"][0]["original_text"], "Otherwise, otherwise, this changed.")
+            self.assertTrue(payload["segments"][0]["cleanup_applied"])
+
+    def test_segment_confidence_flags_low_quality(self):
+        confidence = segment_confidence(avg_logprob=-1.2, no_speech_prob=0.7)
+
+        self.assertEqual(confidence["quality"], "low")
+        self.assertIn("low_avg_logprob", confidence["warnings"])
+        self.assertIn("high_no_speech_prob", confidence["warnings"])
+
+    def test_speaker_identity_review_csv_highlights_uncertain_speakers(self):
+        TEST_TMP.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+            output_path = Path(tmp) / "speaker_identity_review.csv"
+
+            write_speaker_identity_review_csv(
+                output_path,
+                speaker_mapping={"SPEAKER_00": "HOST", "SPEAKER_01": "Guest"},
+                durations={"SPEAKER_00": 120.0, "SPEAKER_01": 8.0},
+                similarity_scores={"SPEAKER_00": 0.62, "SPEAKER_01": 0.6},
+                known_assignments={},
+                host_speaker="SPEAKER_00",
+            )
+
+            text = output_path.read_text(encoding="utf-8")
+            self.assertIn("review_recommended", text)
+            self.assertIn("short speaker duration", text)
+
+    def test_output_manifest_records_outputs_and_config_fingerprint(self):
+        TEST_TMP.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+            tmp_path = Path(tmp)
+            output_file = tmp_path / "episode_speaker_transcript.json"
+            output_file.write_text("{}", encoding="utf-8")
+            manifest_path = tmp_path / "episode_manifest.json"
+
+            write_output_manifest(
+                manifest_path,
+                source_file="episode.mp3",
+                source_fingerprint={"size_bytes": 12, "mtime_ns": 34},
+                config={"model": "large-v3", "cleanup_level": "normal"},
+                outputs=[output_file],
+                timings={"total": 1.2},
+                summary={"episode": "episode.mp3", "review_priority_score": 0},
+            )
+
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["manifest_version"], 1)
+            self.assertEqual(payload["outputs"][0]["filename"], "episode_speaker_transcript.json")
+            self.assertTrue(payload["config_fingerprint"])
+
+    def test_batch_report_summarizes_rows(self):
+        TEST_TMP.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+            output_path = Path(tmp) / "_batch_report.md"
+
+            write_batch_report_md(
+                output_path,
+                [
+                    {
+                        "episode": "episode.mp3",
+                        "episode_date": "2026-01-01",
+                        "host_detected": True,
+                        "transcript_segments": 10,
+                        "review_row_count": 2,
+                        "review_priority_score": 12.5,
+                        "review_priority_reason": "needs review",
+                    }
+                ],
+                elapsed_seconds=90,
+            )
+
+            text = output_path.read_text(encoding="utf-8")
+            self.assertIn("# Podcast Transcription Batch Report", text)
+            self.assertIn("Episodes: 1", text)
+            self.assertIn("episode.mp3", text)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -3,11 +3,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from podcast_transcribe_state import (
+from podcast_transcribe.state import (
     audio_file_fingerprint,
+    clear_stage_artifacts,
     expected_output_paths,
     is_file_already_processed,
     load_processed_files,
+    load_stage_artifact,
+    save_stage_artifact,
     save_processed_files,
 )
 
@@ -52,6 +55,32 @@ class ResumeStateTests(unittest.TestCase):
             save_processed_files(state_path, records)
             self.assertEqual(load_processed_files(state_path), records)
 
+    def test_stage_artifact_round_trip_and_fingerprint_validation(self):
+        TEST_TMP.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+            root = Path(tmp)
+            audio = root / "episode.mp3"
+            audio.write_bytes(b"abc")
+
+            save_stage_artifact(root, audio, "transcription", {"value": 1})
+            self.assertEqual(load_stage_artifact(root, audio, "transcription"), {"value": 1})
+
+            audio.write_bytes(b"changed")
+            self.assertIsNone(load_stage_artifact(root, audio, "transcription"))
+
+    def test_clear_stage_artifacts_removes_episode_artifact_dir(self):
+        TEST_TMP.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+            root = Path(tmp)
+            audio = root / "episode.mp3"
+            audio.write_bytes(b"abc")
+
+            save_stage_artifact(root, audio, "diarization", {"turns": []})
+            clear_stage_artifacts(root, audio)
+
+            self.assertIsNone(load_stage_artifact(root, audio, "diarization"))
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -10,6 +10,8 @@ The pipeline is designed for shows where identifying the host matters. In additi
 - create a host-only transcript for faster review
 - flag episodes and transcript segments that likely need manual verification
 
+The shared transcript, processed-cache, Chroma metadata, and `podcast.json` expectations across the podcast toolchain are documented in [`docs/podcast_pipeline_contract.md`](docs/podcast_pipeline_contract.md).
+
 ## What The Project Does
 
 For each supported audio file in an input folder, the pipeline:
@@ -28,16 +30,30 @@ For each supported audio file in an input folder, the pipeline:
 
 ## Repository Contents
 
-- `podcast_transcribe_host.py`: main Python pipeline
-- `podcast_transcribe_state.py`: resumable batch state and output-existence checks
-- `podcast_transcribe_speakers.py`: speaker/profile math that can be unit-tested without loading ML models
-- `podcast_transcribe_outputs.py`: transcript, review CSV, and JSON writers
-- `Convert Audio to TXT diarized.ps1`: Windows PowerShell launcher that auto-loads `.env`, validates the Hugging Face token early, and uses persisted config values before prompting
-- `podcast_transcribe_config.example.json`: example runtime configuration file
+- `src/podcast_transcribe/`: importable Python package for the transcription framework
+- `podcast_transcribe_host.py`: thin compatibility wrapper for `python podcast_transcribe_host.py`
+- `Run Podcast Transcribe.ps1`: root bootstrap launcher that lets you choose between environment validation and the main processing pipeline
+- `scripts/Convert-AudioToDiarizedText.ps1`: Windows PowerShell launcher that auto-loads `.env`, validates the Hugging Face token early, and uses persisted config values before prompting
+- `scripts/Debug-PodcastTranscribeEnvironment.ps1`: focused environment and dependency diagnostic script
+- `examples/podcast_transcribe_config.example.json`: example runtime configuration file
+- `examples/preferred_terms.txt`: optional glossary for domain-specific spellings
+- `examples/preferred_replacements.json`: optional post-processing replacements for common mistranscriptions
+- `docs/`: architecture, roadmap, and cross-pipeline contract notes
 - `podcast_transcribe_requirements.txt`: Python package list
-- `preferred_terms.txt`: optional glossary for domain-specific spellings
-- `preferred_replacements.json`: optional post-processing replacements for common mistranscriptions
 - `speaker_reference_samples/speakers.json`: sample configuration for recurring known speakers
+
+## Launchers
+
+For normal use, start with the root bootstrap:
+
+```powershell
+.\Run Podcast Transcribe.ps1
+```
+
+It gives you a simple choice:
+
+1. Run environment validation
+2. Run the transcription pipeline
 
 ## Technical Details
 
@@ -90,11 +106,44 @@ Generated outputs per audio file:
 - `*_speaker_transcript.txt`
 - `*_host_only.txt`
 - `*_review.csv`
+- `*_speaker_identity_review.csv`
 - `*_speaker_transcript.json`
+- `*_cleaned_speaker_transcript.txt`
+- `*_cleaned_host_only.txt`
+- `*_cleaned_speaker_transcript.json`
+- `*_manifest.json`
+
+The regular transcript files preserve the post-diarization transcript text as produced by Whisper plus configured glossary replacements. The cleaned transcript files are companion outputs for easier reading and downstream retrieval. They apply conservative speech-cleanup rules for obvious repeated words, immediate restarts, and small dead-end fragments while keeping the original transcript available for comparison. Cleaned JSON segments include `original_text` and `cleanup_applied` when a segment was changed.
+
+Cleanup behavior is controlled by `cleanup_level`: `disabled`, `conservative`, `normal`, or `aggressive`. Manual correction CSVs can be supplied through `corrections_dir`; files named `<audio_stem>_corrections.csv` may use `segment_id`/`id`, `corrected_text`/`text`, and `speaker` columns to patch transcript text or speaker labels before cleaned outputs are generated.
+
+JSON outputs include `schema_version`, pipeline metadata, episode date fields, and per-segment `transcription_confidence` derived from Whisper `avg_logprob` and `no_speech_prob`. The per-episode manifest records source fingerprints, config fingerprints, stage timings, output file hashes, and the episode summary row.
+
+The executable transcript contract lives in `src/podcast_transcribe/contract.py`. It defines the current transcript schema version, required top-level fields, required segment fields, and validation rules used before JSON outputs are written. Downstream tools can import the same module or mirror its required fields when validating handoffs.
+
+Each segment also includes deterministic `content_quality` tags for likely sponsor blocks, music/transition text, boilerplate, repetition, and possible silence/non-speech. These tags are intentionally conservative hints for review and downstream filtering; they do not remove content from the transcript.
+
+Known-speaker reference samples are quality-checked for short duration, quiet audio, clipping risk, and silence/non-speech ratio while speaker profiles are loaded. Batch reports include speaker aggregates and recurring unnamed-speaker promotion candidates when enough summary data is available.
+
+The pipeline writes reusable intermediate artifacts under `_processing_artifacts` after transcription and diarization complete. If a later stage fails, the next run can resume inside the episode and avoid repeating completed heavy work. Use `--no-resume-intermediates` to disable this behavior, or `--archive-debug-artifacts` to keep artifacts after a successful episode for debugging. Isolated child workers can be guarded with `--child-timeout-seconds`; timeout failures leave artifacts in place for the next run.
+
+Before model loading, the launcher performs a disk-space preflight and can print a dry benchmark plan with `--benchmark-only`. Batch progress now includes an audio-duration-aware ETA when file durations can be read.
 
 Generated output per batch:
 
 - `_episode_review_summary.csv`
+- `_batch_report.md`
+
+Episode dates are extracted from the last valid `YYYYMMDD` token in each source filename, such as `Podcast 20260204.mp3`. The pipeline writes that date as structured metadata for RAG ingestion:
+
+- `episode_date`: ISO date, for example `2026-02-04`
+- `episode_date_compact`: original compact date, for example `20260204`
+- `episode_year`, `episode_month`, `episode_day`
+- `episode_sort_key`: numeric `YYYYMMDD` value for chronological sorting and filtering
+
+Filename date parsing is configurable. By default the parser uses the `strict_iso` preset and prefers the last valid match in the filename. Additional presets and explicit ordered format lists can be configured through `filename_date` in `podcast_transcribe_config.json`, so common styles like `YYYY-MM-DD` and `MM-DD-YYYY` can be supported without writing custom regex.
+
+The structured JSON includes these fields at the top level, inside `metadata`, and on each transcript segment so vector-database chunking can preserve time context. The text transcripts include a small metadata header, and `_episode_review_summary.csv` includes the date columns for later trend and viewpoint-evolution summarization.
 
 ## Requirements
 
@@ -122,8 +171,8 @@ Python dependencies:
 ### 1. Clone the repository
 
 ```powershell
-git clone https://github.com/Alex870/podcast-host-transcription-pipeline.git
-cd podcast-host-transcription-pipeline
+git clone https://github.com/Alex870/Podcast-Host-Transcription-Pipeline.git
+cd Podcast-Host-Transcription-Pipeline
 ```
 
 ### 2. Create a Python environment
@@ -138,7 +187,7 @@ conda activate podcast-transcribe
 pip install -r podcast_transcribe_requirements.txt
 ```
 
-If you prefer a different environment name or a plain virtual environment, you will need to update `Convert Audio to TXT diarized.ps1` and adjust the `conda activate podcast-transcribe` command accordingly.
+If you prefer a different environment name or a plain virtual environment, you will need to update `scripts/Convert-AudioToDiarizedText.ps1` and adjust the `conda activate podcast-transcribe` command accordingly.
 
 ### 3. Get a Hugging Face token
 
@@ -168,7 +217,7 @@ $env:HF_TOKEN = "your_token_here"
 Copy the example file to a working config:
 
 ```powershell
-Copy-Item .\podcast_transcribe_config.example.json .\podcast_transcribe_config.json
+Copy-Item .\examples\podcast_transcribe_config.example.json .\podcast_transcribe_config.json
 ```
 
 Recommended first-pass config:
@@ -179,8 +228,12 @@ Recommended first-pass config:
   "hf_token": "",
   "ffmpeg_bin_dir": "C:/ffmpeg/bin",
   "known_speakers_dir": "speaker_reference_samples",
-  "preferred_terms_file": "preferred_terms.txt",
-  "replacement_map_json": "preferred_replacements.json",
+  "preferred_terms_file": "examples/preferred_terms.txt",
+  "replacement_map_json": "examples/preferred_replacements.json",
+  "filename_date": {
+    "preset": "strict_iso",
+    "position": "last"
+  },
   "host_profile_json": "host_profile.json",
   "model": "large-v3",
   "language": "en",
@@ -201,6 +254,10 @@ Configuration notes:
 - `known_speakers_dir`: folder containing `speakers.json` and reference clips
 - `preferred_terms_file`: glossary terms to bias transcription
 - `replacement_map_json`: preferred replacements for cleanup after transcription
+- `filename_date`: optional filename date parser settings
+  - `preset`: built-in parser preset such as `strict_iso`, `american_podcast`, or `mixed_common`
+  - `position`: whether to use the `first` or `last` valid date match in the filename
+  - `formats`: optional ordered list of explicit formats that overrides the preset
 - `host_profile_json`: persistent host voice profile created over time
 - `model`: Whisper model name
 - `language`: language code passed to Whisper
@@ -239,7 +296,48 @@ Best practices:
 - avoid overlap, music beds, and heavy background noise
 - provide more than one clip per recurring speaker when possible
 
-### 6. Run the environment debug script
+### 6. Optional: customize preferred terms and replacements
+
+If the show uses recurring names, jargon, or phrases that Whisper often misspells, set up the glossary and replacement helpers before large transcription runs.
+
+Start from the example files:
+
+```powershell
+Copy-Item .\examples\preferred_terms.txt .\preferred_terms.txt
+Copy-Item .\examples\preferred_replacements.json .\preferred_replacements.json
+```
+
+Then update `podcast_transcribe_config.json` so the pipeline points at your working copies:
+
+```json
+{
+  "preferred_terms_file": "preferred_terms.txt",
+  "replacement_map_json": "preferred_replacements.json"
+}
+```
+
+Use them like this:
+
+- `preferred_terms.txt`: one term or phrase per line for names, acronyms, product names, and domain vocabulary you want the transcription stage to bias toward
+- `preferred_replacements.json`: post-processing cleanup for consistent mistranscriptions or cleanup rules you want applied after transcription
+
+Keep these files small and intentional at first. It is usually better to add a few high-value corrections after reviewing real outputs than to start with a huge speculative list.
+
+If your audio filenames encode episode dates in a format other than a trailing `YYYYMMDD`, this is also a good time to update the `filename_date` section in `podcast_transcribe_config.json`. For example:
+
+```json
+{
+  "filename_date": {
+    "preset": "american_podcast",
+    "position": "last",
+    "formats": ["YYYY-MM-DD", "MM-DD-YYYY"]
+  }
+}
+```
+
+The parser tries formats in the order you provide them, which gives you a simple way to resolve ambiguous names like `03-04-2026` without having to write regular expressions.
+
+### 7. Run the environment debug script
 
 Before your first full transcription run, use the diagnostic launcher to confirm that the environment, token access, FFmpeg path, CUDA visibility, and model prerequisites are all aligned.
 
@@ -247,8 +345,10 @@ Run:
 
 ```powershell
 conda activate podcast-transcribe
-.\Debug podcast transcribe environment.ps1
+.\Run Podcast Transcribe.ps1
 ```
+
+Choose `1` for environment validation.
 
 What it checks:
 
@@ -274,7 +374,7 @@ The script ends with an overall `PASS` or `FAIL` summary and pauses so you can r
 This is the easiest way to run the project on Windows.
 
 ```powershell
-.\Convert Audio to TXT diarized.ps1
+.\scripts\Convert-AudioToDiarizedText.ps1
 ```
 
 The launcher will:
@@ -304,8 +404,8 @@ python .\podcast_transcribe_host.py `
   --compute-type auto `
   --beam-size 5 `
   --batch-size 8 `
-  --preferred-terms-file .\preferred_terms.txt `
-  --replacement-map-json .\preferred_replacements.json `
+  --preferred-terms-file .\examples\preferred_terms.txt `
+  --replacement-map-json .\examples\preferred_replacements.json `
   --host-profile-json .\host_profile.json `
   --known-speakers-dir .\speaker_reference_samples `
   --assume-dominant-speaker-is-host `

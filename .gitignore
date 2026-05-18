@@ -13,9 +13,13 @@ pretrained_speaker_model_diagnostic/
 
 _processed_files.json
 _episode_review_summary.csv
+_batch_report.md
 _processing_checkpoints/
+_processing_artifacts/
 
 *_speaker_transcript.txt
 *_speaker_transcript.json
 *_host_only.txt
+*_speaker_identity_review.csv
+*_manifest.json
 *_review.csv

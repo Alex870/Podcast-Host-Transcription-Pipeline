@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "podcast-host-transcription-pipeline"
+version = "0.1.0"
+description = "Speaker-aware podcast transcription framework with host extraction and RAG-ready outputs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+podcast-transcribe-host = "podcast_transcribe.cli:main"

@@ -1,7 +1,15 @@
-$PythonScript = Join-Path $PSScriptRoot "podcast_transcribe_host.py"
-$ConfigPath = Join-Path $PSScriptRoot "podcast_transcribe_config.json"
-$ConfigExamplePath = Join-Path $PSScriptRoot "podcast_transcribe_config.example.json"
-$EnvPath = Join-Path $PSScriptRoot ".env"
+$CommonScript = Join-Path $PSScriptRoot "PodcastTranscribeLauncher.Common.ps1"
+. $CommonScript
+
+$LauncherContext = Get-PodcastTranscribeLauncherContext -ScriptRoot $PSScriptRoot
+$ProjectRoot = $LauncherContext.ProjectRoot
+$PythonScript = Join-Path $ProjectRoot "podcast_transcribe_host.py"
+$ConfigPath = $LauncherContext.ConfigPath
+$ConfigExamplePath = $LauncherContext.ConfigExamplePath
+$EnvPath = $LauncherContext.EnvPath
+$Config = $LauncherContext.Config
+$ConfigSource = $LauncherContext.ConfigSource
+$ActiveConfigPath = $LauncherContext.ActiveConfigPath
 
 function Resolve-ConfigPathValue {
     param(
@@ -16,7 +24,7 @@ function Resolve-ConfigPathValue {
         return $Value
     }
 
-    return Join-Path $PSScriptRoot $Value
+    return Join-Path $ProjectRoot $Value
 }
 
 function Set-ConfigValue {
@@ -242,15 +250,6 @@ if missing:
     return $LASTEXITCODE
 }
 
-$Config = $null
-if (Test-Path -LiteralPath $ConfigPath) {
-    $Config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
-} elseif (Test-Path -LiteralPath $ConfigExamplePath) {
-    $Config = Get-Content -LiteralPath $ConfigExamplePath -Raw | ConvertFrom-Json
-} else {
-    $Config = [pscustomobject]@{}
-}
-
 if (-not (Test-Path -LiteralPath $PythonScript)) {
     Write-Error "Python helper script not found: $PythonScript"
     pause
@@ -263,6 +262,11 @@ $tokenResolution = Resolve-HfToken -ConfigObject $Config -EnvFilePath $EnvPath -
 Write-Host "HF_TOKEN lookup details:"
 foreach ($attempt in $tokenResolution.Attempts) {
     Write-Host " - $attempt"
+}
+if ($ActiveConfigPath) {
+    Write-Host "Resolved config source: $ConfigSource ($ActiveConfigPath)"
+} else {
+    Write-Host "Resolved config source: $ConfigSource"
 }
 
 if (-not $tokenResolution.Token) {
@@ -291,7 +295,11 @@ if ($ConfiguredSourceFolder -and (Test-Path -LiteralPath $ConfiguredSourceFolder
     if ($ConfiguredSourceFolder) {
         Write-Host "Configured source folder was not found: $ConfiguredSourceFolder"
     } else {
-        Write-Host "No source folder configured."
+        if ($ConfigSource -eq "example config") {
+            Write-Host "No project config file was found; the example config does not define a valid local source folder for this machine."
+        } else {
+            Write-Host "No source folder configured."
+        }
     }
 
     $SelectedFolder = Select-Folder -Description "Select a source folder for podcast audio files." -InitialFolder $null
@@ -332,7 +340,7 @@ if ($ConfiguredFfmpegBinDir -and (Test-Path -LiteralPath $ConfiguredFfmpegBinDir
     $PersistFfmpegBinDir = $true
 }
 
-$DefaultKnownSpeakersDir = Join-Path $PSScriptRoot "speaker_reference_samples"
+$DefaultKnownSpeakersDir = Join-Path $ProjectRoot "speaker_reference_samples"
 $ConfiguredKnownSpeakersDir = Resolve-ConfigPathValue $(if ($Config.known_speakers_dir) { $Config.known_speakers_dir } else { $null })
 $KnownSpeakersDir = $null
 
@@ -361,8 +369,8 @@ if ($ConfiguredKnownSpeakersDir -and (Test-Path -LiteralPath $ConfiguredKnownSpe
     }
 }
 
-$PreferredTermsFile = Resolve-ConfigPathValue $(if ($Config.preferred_terms_file) { $Config.preferred_terms_file } else { "preferred_terms.txt" })
-$ReplacementMapJson = Resolve-ConfigPathValue $(if ($Config.replacement_map_json) { $Config.replacement_map_json } else { "preferred_replacements.json" })
+$PreferredTermsFile = Resolve-ConfigPathValue $(if ($Config.preferred_terms_file) { $Config.preferred_terms_file } else { "examples\preferred_terms.txt" })
+$ReplacementMapJson = Resolve-ConfigPathValue $(if ($Config.replacement_map_json) { $Config.replacement_map_json } else { "examples\preferred_replacements.json" })
 $HostProfileJson = Resolve-ConfigPathValue $(if ($Config.host_profile_json) { $Config.host_profile_json } else { "host_profile.json" })
 $ConfiguredHostReference = Resolve-ConfigPathValue $(if ($Config.host_reference) { $Config.host_reference } else { $null })
 
@@ -380,6 +388,23 @@ $BatchSize = if ($null -ne $Config.batch_size) { [int]$Config.batch_size } else 
 $AssumeDominantSpeakerIsHost = if ($null -ne $Config.assume_dominant_speaker_is_host) { [bool]$Config.assume_dominant_speaker_is_host } else { $true }
 $HostThreshold = if ($null -ne $Config.host_threshold) { [double]$Config.host_threshold } else { 0.45 }
 $IsolateFiles = if ($null -ne $Config.isolate_files) { [bool]$Config.isolate_files } else { $true }
+$CleanupLevel = if ($Config.cleanup_level) { [string]$Config.cleanup_level } else { "conservative" }
+$FilenameDateConfig = if ($Config.filename_date) { $Config.filename_date } else { $null }
+$FilenameDatePreset = if ($FilenameDateConfig -and $FilenameDateConfig.preset) { [string]$FilenameDateConfig.preset } else { "strict_iso" }
+$FilenameDatePosition = if ($FilenameDateConfig -and $FilenameDateConfig.position) { [string]$FilenameDateConfig.position } else { "last" }
+$FilenameDateFormats = @()
+if ($FilenameDateConfig -and $FilenameDateConfig.formats) {
+    foreach ($item in $FilenameDateConfig.formats) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$item)) {
+            $FilenameDateFormats += [string]$item
+        }
+    }
+}
+$ConfiguredCorrectionsDir = Resolve-ConfigPathValue $(if ($Config.corrections_dir) { $Config.corrections_dir } else { "corrections" })
+$ResumeIntermediates = if ($null -ne $Config.resume_intermediates) { [bool]$Config.resume_intermediates } else { $true }
+$ArchiveDebugArtifacts = if ($null -ne $Config.archive_debug_artifacts) { [bool]$Config.archive_debug_artifacts } else { $false }
+$ChildTimeoutSeconds = if ($null -ne $Config.child_timeout_seconds) { [int]$Config.child_timeout_seconds } else { 0 }
+$BenchmarkOnly = if ($null -ne $Config.benchmark_only) { [bool]$Config.benchmark_only } else { $false }
 
 conda activate podcast-transcribe
 $env:PYTHONNOUSERSITE = "1"
@@ -417,6 +442,11 @@ Write-Host "Processing Folder: $SourceFolder"
 Write-Host "Configured model: $WhisperModel"
 Write-Host "Configured device: $Device"
 Write-Host "Isolated per-file processing: $IsolateFiles"
+Write-Host "Intermediate resume: $ResumeIntermediates"
+Write-Host "Cleanup level: $CleanupLevel"
+if ($BenchmarkOnly) {
+    Write-Host "Benchmark-only mode: enabled"
+}
 Write-Host "PYTHONNOUSERSITE: $env:PYTHONNOUSERSITE"
 Write-Host "ffmpeg bin directory: $FfmpegBinDir"
 $OutputRoot = Split-Path -Path $SourceFolder -Parent
@@ -442,7 +472,11 @@ $args = @(
     "--batch-size", "$BatchSize"
     "--preferred-terms-file", $PreferredTermsFile
     "--replacement-map-json", $ReplacementMapJson
+    "--filename-date-preset", $FilenameDatePreset
+    "--filename-date-position", $FilenameDatePosition
     "--host-profile-json", $HostProfileJson
+    "--cleanup-level", $CleanupLevel
+    "--corrections-dir", $ConfiguredCorrectionsDir
     "--host-threshold", "$HostThreshold"
     "--hf-token", $tokenResolution.Token
 )
@@ -457,8 +491,29 @@ if ($IsolateFiles) {
     $args += "--no-isolate-files"
 }
 
+if (-not $ResumeIntermediates) {
+    $args += "--no-resume-intermediates"
+}
+
+if ($ArchiveDebugArtifacts) {
+    $args += "--archive-debug-artifacts"
+}
+
+if ($ChildTimeoutSeconds -gt 0) {
+    $args += @("--child-timeout-seconds", "$ChildTimeoutSeconds")
+}
+
+if ($BenchmarkOnly) {
+    $args += "--benchmark-only"
+}
+
 if ($ConfiguredHostReference -and (Test-Path -LiteralPath $ConfiguredHostReference)) {
     $args += @("--host-reference", $ConfiguredHostReference)
+}
+
+if ($FilenameDateFormats.Count -gt 0) {
+    $args += @("--filename-date-formats")
+    $args += $FilenameDateFormats
 }
 
 if ($KnownSpeakersDir) {
