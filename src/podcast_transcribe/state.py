@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 
 RESUME_STATE_FILENAME = "_processed_files.json"
 SUMMARY_FILENAME = "_episode_review_summary.csv"
+REVIEW_CALIBRATION_FILENAME = "_review_calibration_state.json"
 CHECKPOINT_DIRNAME = "_processing_checkpoints"
 ARTIFACT_DIRNAME = "_processing_artifacts"
 
@@ -106,6 +107,20 @@ def save_processed_files(path: Path, processed_files: Dict[str, Dict[str, object
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def load_review_calibration_state(path: Path) -> Dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_review_calibration_state(path: Path, payload: Dict[str, object]):
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def load_episode_summary_rows(path: Path, normalize_row) -> Dict[str, Dict[str, object]]:
     if not path.exists():
         return {}
@@ -139,4 +154,3 @@ def is_file_already_processed(
         return record == audio_file_fingerprint(audio_path)
 
     return audio_path.name in existing_summary_rows
-

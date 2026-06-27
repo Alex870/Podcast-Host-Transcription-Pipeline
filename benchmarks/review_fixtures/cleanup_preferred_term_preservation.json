@@ -1,0 +1,62 @@
+{
+  "name": "cleanup_preferred_term_preservation",
+  "focus_stage": "transcript_cleanup_review",
+  "description": "A protected preferred term is already correct and must not be normalized away during cleanup review.",
+  "preferred_terms": ["ChromaDB"],
+  "cleaned_payload": {
+    "schema_version": 2,
+    "pipeline": "podcast-host-transcription-pipeline",
+    "source_file": "Preferred Term Preservation 20260603.mp3",
+    "metadata": {
+      "source_file": "Preferred Term Preservation 20260603.mp3",
+      "source_filename": "Preferred Term Preservation 20260603.mp3",
+      "episode_date": "2026-06-03",
+      "episode_date_compact": "20260603",
+      "episode_year": 2026,
+      "episode_month": 6,
+      "episode_day": 3,
+      "episode_sort_key": 20260603
+    },
+    "episode_date": "2026-06-03",
+    "episode_date_compact": "20260603",
+    "episode_sort_key": 20260603,
+    "transcription": {
+      "duration": 10.0
+    },
+    "host_detected": true,
+    "host_original_speaker_id": "SPEAKER_00",
+    "speaker_mapping": {
+      "SPEAKER_00": "HOST"
+    },
+    "known_speaker_assignments": {},
+    "speaker_durations_seconds": {
+      "SPEAKER_00": 10.0
+    },
+    "diarization_turns": [],
+    "segments": [
+      {
+        "id": 1,
+        "start": 0.0,
+        "end": 4.0,
+        "speaker": "HOST",
+        "text": "ChromaDB remains the storage layer for this workflow.",
+        "avg_logprob": -0.1,
+        "no_speech_prob": 0.01,
+        "episode_date": "2026-06-03",
+        "episode_sort_key": 20260603,
+        "transcription_confidence": {
+          "quality": "high",
+          "avg_logprob": -0.1,
+          "no_speech_prob": 0.01,
+          "warnings": []
+        },
+        "words": []
+      }
+    ]
+  },
+  "expected": {
+    "changed_segment_ids": [],
+    "text_by_id": {},
+    "speaker_by_id": {}
+  }
+}

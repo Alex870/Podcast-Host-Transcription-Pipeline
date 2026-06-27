@@ -1,13 +1,20 @@
 import csv
 import datetime as dt
 import hashlib
+from dataclasses import is_dataclass
 import json
 import re
 from dataclasses import asdict
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, List, Optional, Set
 
-from podcast_transcribe.contract import PIPELINE_NAME, TRANSCRIPT_SCHEMA_VERSION, validate_transcript_payload
+from podcast_transcribe.contract import (
+    PIPELINE_NAME,
+    REVIEWED_TRANSCRIPT_SCHEMA_VERSION,
+    TRANSCRIPT_SCHEMA_VERSION,
+    validate_reviewed_transcript_payload,
+    validate_transcript_payload,
+)
 from podcast_transcribe.quality import classify_segment_text, summarize_content_quality
 
 DATE_FORMAT_SPECS = {
@@ -50,6 +57,24 @@ DATE_FORMAT_PRESETS = {
 
 DEFAULT_FILENAME_DATE_PRESET = "strict_iso"
 DEFAULT_FILENAME_DATE_POSITION = "last"
+
+
+def _word_to_payload(word: object) -> Dict[str, object]:
+    if is_dataclass(word):
+        return asdict(word)
+    if isinstance(word, dict):
+        return {
+            "start": word.get("start"),
+            "end": word.get("end"),
+            "word": str(word.get("word", "")),
+            "speaker": word.get("speaker"),
+        }
+    return {
+        "start": getattr(word, "start", None),
+        "end": getattr(word, "end", None),
+        "word": str(getattr(word, "word", "")),
+        "speaker": getattr(word, "speaker", None),
+    }
 
 
 def stable_json_fingerprint(payload: Any) -> str:
@@ -248,6 +273,7 @@ def write_json_output(
     metadata: Optional[Dict[str, object]] = None,
     text_version: str = "original",
     pipeline_version: str = PIPELINE_NAME,
+    review_metadata: Optional[Dict[str, object]] = None,
 ):
     """Write the RAG-ready transcript JSON payload after schema validation."""
 
@@ -320,16 +346,30 @@ def write_json_output(
                     segment.text,
                     duration_seconds=max(0.0, float(segment.end or 0.0) - float(segment.start or 0.0)),
                 ),
+                **(
+                    {
+                        "llm_reviewed_text": segment.llm_reviewed_text,
+                        "review_runtime_profile": segment.review_runtime_profile,
+                        "review_backend": segment.review_backend,
+                        "review_model_name": segment.review_model_name,
+                        "review_stage_flags": segment.review_stage_flags or {},
+                    }
+                    if getattr(segment, "llm_reviewed_text", None) is not None
+                    else {}
+                ),
                 **segment_metadata,
-                "words": [asdict(word) for word in segment.words],
+                "words": [_word_to_payload(word) for word in segment.words],
             }
             for segment in segments
         ],
     }
+    if review_metadata:
+        payload["review_schema_version"] = REVIEWED_TRANSCRIPT_SCHEMA_VERSION
+        payload["review_metadata"] = review_metadata
     payload["content_quality_summary"] = summarize_content_quality(
         segment.get("content_quality", {}) for segment in payload["segments"]
     )
-    errors = validate_transcript_payload(payload)
+    errors = validate_reviewed_transcript_payload(payload) if review_metadata else validate_transcript_payload(payload)
     if errors:
         raise ValueError(f"Transcript JSON schema validation failed for {path}: {'; '.join(errors[:10])}")
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -432,6 +472,13 @@ def write_batch_report_md(path: Path, rows: List[Dict[str, object]], elapsed_sec
     total_episodes = len(rows)
     total_segments = sum(int(row.get("transcript_segments") or 0) for row in rows)
     total_review_rows = sum(int(row.get("review_row_count") or 0) for row in rows)
+    review_attempted = sum(1 for row in rows if str(row.get("review_attempted")).lower() in {"true", "1", "yes"})
+    review_outputs = sum(1 for row in rows if str(row.get("reviewed_output_written")).lower() in {"true", "1", "yes"})
+    review_corrections = sum(int(row.get("review_corrected_segment_count") or 0) for row in rows)
+    cleanup_review_corrections = sum(int(row.get("cleanup_review_corrected_count") or 0) for row in rows)
+    glossary_review_corrections = sum(int(row.get("glossary_review_corrected_count") or 0) for row in rows)
+    speaker_review_corrections = sum(int(row.get("speaker_consistency_review_corrected_count") or 0) for row in rows)
+    episode_qa_review_corrections = sum(int(row.get("episode_qa_review_corrected_count") or 0) for row in rows)
     detected_hosts = sum(1 for row in rows if str(row.get("host_detected")).lower() in {"true", "1", "yes"})
     average_priority = (
         sum(float(row.get("review_priority_score") or 0.0) for row in rows) / total_episodes
@@ -447,6 +494,13 @@ def write_batch_report_md(path: Path, rows: List[Dict[str, object]], elapsed_sec
         f"- Hosts detected: {detected_hosts}/{total_episodes}",
         f"- Transcript segments: {total_segments}",
         f"- Review rows: {total_review_rows}",
+        f"- Review attempted: {review_attempted}/{total_episodes}",
+        f"- Reviewed output bundles written: {review_outputs}/{total_episodes}",
+        f"- Review-corrected segments: {review_corrections}",
+        f"- Cleanup-review corrections: {cleanup_review_corrections}",
+        f"- Glossary-review corrections: {glossary_review_corrections}",
+        f"- Speaker-consistency corrections: {speaker_review_corrections}",
+        f"- Episode-QA corrections: {episode_qa_review_corrections}",
         f"- Average review priority score: {average_priority:.2f}",
     ]
     if elapsed_seconds is not None:
@@ -526,4 +580,3 @@ def _promotion_candidates_for_report(rows: List[Dict[str, object]]) -> List[Dict
                 }
             )
     return candidates
-

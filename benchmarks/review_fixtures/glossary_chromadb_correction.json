@@ -1,0 +1,64 @@
+{
+  "name": "glossary_chromadb_correction",
+  "focus_stage": "glossary_correction_review",
+  "description": "Tests correction of a recurring product name to the preferred ChromaDB spelling.",
+  "preferred_terms": ["ChromaDB"],
+  "cleaned_payload": {
+    "schema_version": 2,
+    "pipeline": "podcast-host-transcription-pipeline",
+    "source_file": "Glossary ChromaDB 20260602.mp3",
+    "metadata": {
+      "source_file": "Glossary ChromaDB 20260602.mp3",
+      "source_filename": "Glossary ChromaDB 20260602.mp3",
+      "episode_date": "2026-06-02",
+      "episode_date_compact": "20260602",
+      "episode_year": 2026,
+      "episode_month": 6,
+      "episode_day": 2,
+      "episode_sort_key": 20260602
+    },
+    "episode_date": "2026-06-02",
+    "episode_date_compact": "20260602",
+    "episode_sort_key": 20260602,
+    "transcription": {
+      "duration": 16.0
+    },
+    "host_detected": true,
+    "host_original_speaker_id": "SPEAKER_00",
+    "speaker_mapping": {
+      "SPEAKER_00": "HOST"
+    },
+    "known_speaker_assignments": {},
+    "speaker_durations_seconds": {
+      "SPEAKER_00": 16.0
+    },
+    "diarization_turns": [],
+    "segments": [
+      {
+        "id": 1,
+        "start": 0.0,
+        "end": 5.0,
+        "speaker": "HOST",
+        "text": "Today we are talking about chroma db import performance.",
+        "avg_logprob": -0.1,
+        "no_speech_prob": 0.01,
+        "episode_date": "2026-06-02",
+        "episode_sort_key": 20260602,
+        "transcription_confidence": {
+          "quality": "high",
+          "avg_logprob": -0.1,
+          "no_speech_prob": 0.01,
+          "warnings": []
+        },
+        "words": []
+      }
+    ]
+  },
+  "expected": {
+    "changed_segment_ids": [1],
+    "text_by_id": {
+      "1": "Today we are talking about ChromaDB import performance."
+    },
+    "speaker_by_id": {}
+  }
+}

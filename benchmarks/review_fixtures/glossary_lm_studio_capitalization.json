@@ -1,0 +1,63 @@
+{
+  "name": "glossary_lm_studio_capitalization",
+  "focus_stage": "glossary_correction_review",
+  "description": "Checks recurring capitalization consistency for LM Studio.",
+  "cleaned_payload": {
+    "schema_version": 2,
+    "pipeline": "podcast-host-transcription-pipeline",
+    "source_file": "Glossary LM Studio 20260603.mp3",
+    "metadata": {
+      "source_file": "Glossary LM Studio 20260603.mp3",
+      "source_filename": "Glossary LM Studio 20260603.mp3",
+      "episode_date": "2026-06-03",
+      "episode_date_compact": "20260603",
+      "episode_year": 2026,
+      "episode_month": 6,
+      "episode_day": 3,
+      "episode_sort_key": 20260603
+    },
+    "episode_date": "2026-06-03",
+    "episode_date_compact": "20260603",
+    "episode_sort_key": 20260603,
+    "transcription": {
+      "duration": 14.0
+    },
+    "host_detected": true,
+    "host_original_speaker_id": "SPEAKER_00",
+    "speaker_mapping": {
+      "SPEAKER_00": "HOST"
+    },
+    "known_speaker_assignments": {},
+    "speaker_durations_seconds": {
+      "SPEAKER_00": 14.0
+    },
+    "diarization_turns": [],
+    "segments": [
+      {
+        "id": 1,
+        "start": 0.0,
+        "end": 4.0,
+        "speaker": "HOST",
+        "text": "We benchmarked lm studio on the desktop box.",
+        "avg_logprob": -0.1,
+        "no_speech_prob": 0.01,
+        "episode_date": "2026-06-03",
+        "episode_sort_key": 20260603,
+        "transcription_confidence": {
+          "quality": "high",
+          "avg_logprob": -0.1,
+          "no_speech_prob": 0.01,
+          "warnings": []
+        },
+        "words": []
+      }
+    ]
+  },
+  "expected": {
+    "changed_segment_ids": [1],
+    "text_by_id": {
+      "1": "We benchmarked LM Studio on the desktop box."
+    },
+    "speaker_by_id": {}
+  }
+}

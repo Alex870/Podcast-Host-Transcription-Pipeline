@@ -1,0 +1,47 @@
+{
+  "name": "episode_qa_longer_consistency",
+  "focus_stage": "episode_qa_review",
+  "description": "A longer episode-level context should preserve the preferred term and fix a later inconsistent alias without rewriting the rest.",
+  "preferred_terms": ["ChromaDB"],
+  "expected_unchanged_segment_ids": [1, 2, 4],
+  "max_allowed_changed_segment_count": 1,
+  "benchmark_tags": ["episode_qa", "long_context_focus"],
+  "cleaned_payload": {
+    "schema_version": 2,
+    "pipeline": "podcast-host-transcription-pipeline",
+    "source_file": "Episode QA Long 20260609.mp3",
+    "metadata": {
+      "source_file": "Episode QA Long 20260609.mp3",
+      "source_filename": "Episode QA Long 20260609.mp3",
+      "episode_date": "2026-06-09",
+      "episode_date_compact": "20260609",
+      "episode_year": 2026,
+      "episode_month": 6,
+      "episode_day": 9,
+      "episode_sort_key": 20260609
+    },
+    "episode_date": "2026-06-09",
+    "episode_date_compact": "20260609",
+    "episode_sort_key": 20260609,
+    "transcription": {"duration": 42.0},
+    "host_detected": true,
+    "host_original_speaker_id": "SPEAKER_00",
+    "speaker_mapping": {"SPEAKER_00": "HOST"},
+    "known_speaker_assignments": {},
+    "speaker_durations_seconds": {"SPEAKER_00": 42.0},
+    "diarization_turns": [],
+    "segments": [
+      {"id": 1, "start": 0.0, "end": 5.0, "speaker": "HOST", "text": "Today the migration focuses on ChromaDB export and retrieval.", "avg_logprob": -0.1, "no_speech_prob": 0.01, "episode_date": "2026-06-09", "episode_sort_key": 20260609, "transcription_confidence": {"quality": "high", "avg_logprob": -0.1, "no_speech_prob": 0.01, "warnings": []}, "words": []},
+      {"id": 2, "start": 5.0, "end": 10.0, "speaker": "HOST", "text": "The earlier results were stable enough to keep moving.", "avg_logprob": -0.1, "no_speech_prob": 0.01, "episode_date": "2026-06-09", "episode_sort_key": 20260609, "transcription_confidence": {"quality": "high", "avg_logprob": -0.1, "no_speech_prob": 0.01, "warnings": []}, "words": []},
+      {"id": 3, "start": 10.0, "end": 16.0, "speaker": "HOST", "text": "Much later I lazily shorten that to chroma db during the recap.", "avg_logprob": -0.1, "no_speech_prob": 0.01, "episode_date": "2026-06-09", "episode_sort_key": 20260609, "transcription_confidence": {"quality": "high", "avg_logprob": -0.1, "no_speech_prob": 0.01, "warnings": []}, "words": []},
+      {"id": 4, "start": 16.0, "end": 21.0, "speaker": "HOST", "text": "Nothing else in the summary needs to be rewritten.", "avg_logprob": -0.1, "no_speech_prob": 0.01, "episode_date": "2026-06-09", "episode_sort_key": 20260609, "transcription_confidence": {"quality": "high", "avg_logprob": -0.1, "no_speech_prob": 0.01, "warnings": []}, "words": []}
+    ]
+  },
+  "expected": {
+    "changed_segment_ids": [3],
+    "text_by_id": {
+      "3": "Much later I lazily shorten that to ChromaDB during the recap."
+    },
+    "speaker_by_id": {}
+  }
+}

@@ -40,6 +40,26 @@ Recommended episode date fields:
 
 The executable contract for this repository lives in `src/podcast_transcribe/contract.py`. It defines the current transcript schema version and required fields and is used before transcript JSON outputs are written.
 
+Optional reviewed transcript variants are additive siblings to the baseline transcript JSON. When enabled and successfully generated, reviewed files add:
+
+- `review_schema_version`: reviewed-payload schema marker. Current version: `1`.
+- `review_metadata`: episode-level review provenance, including runtime profile, backend, model, stage flags, status, skip reason, and reviewed/corrected segment counts.
+- `review_metadata.review_pipeline_version`: reviewed-pipeline marker for staged review behavior.
+- `review_metadata.review_stage_results`: per-stage review status, skip reason, edit scope, and corrected counts.
+- `review_metadata.review_input_source`: whether review ran from inline cleaned segments or cleaned-JSON backfill.
+- `review_metadata.episode_qa_mode`: `disabled`, `full_episode`, `chunked`, or `skipped`.
+- reviewed per-segment fields:
+  - `original_text`
+  - `llm_reviewed_text`
+  - `review_runtime_profile`
+  - `review_backend`
+  - `review_model_name`
+  - `review_stage_flags`
+
+Reviewed payloads keep the existing required raw transcript fields intact and use `text_version` values such as `reviewed_llm` and `reviewed_llm_high_context`.
+
+Preferred glossary terms from `preferred_terms.txt` are treated as reserved spellings during optional LLM review. Cleanup, glossary, speaker-consistency, and episode-QA review may correct text toward the configured preferred term, but should not rewrite an already-correct preferred spelling away from that configured form. Benchmark and debug outputs are expected to surface protected-term regressions as glossary-safety failures.
+
 ## Processed RAG Cache
 
 Produced by `Podcast-RAG-pipeline` and consumed by `Chroma DB Import`.

@@ -5,6 +5,18 @@
   "known_speakers_dir": "speaker_reference_samples",
   "preferred_terms_file": "examples/preferred_terms.txt",
   "replacement_map_json": "examples/preferred_replacements.json",
+  "runtime_profile": "baseline_16gb",
+  "backend": "none",
+  "review_base_url": "",
+  "review_model_name": "",
+  "review_debug": false,
+  "review_debug_dir": "",
+  "review_auto_calibrate": true,
+  "review_auto_adapt_upward": true,
+  "transcript_cleanup_review": false,
+  "glossary_correction_review": false,
+  "speaker_consistency_review": false,
+  "episode_qa_review": false,
   "filename_date": {
     "preset": "strict_iso",
     "position": "last"

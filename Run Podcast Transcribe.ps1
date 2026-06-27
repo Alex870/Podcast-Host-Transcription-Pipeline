@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("Prompt", "Run", "Debug", "Migrate")]
+    [ValidateSet("Prompt", "Run", "Debug", "Migrate", "Benchmark")]
     [string]$Action = "Prompt"
 )
 
@@ -10,14 +10,19 @@ $MigrateScript = Join-Path $ScriptRoot "scripts\Migrate-LegacyPodcastTranscribeS
 
 function Invoke-LauncherScript {
     param(
-        [string]$Path
+        [string]$Path,
+        [switch]$ReviewBenchmark
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "Launcher script not found: $Path"
     }
 
-    & $Path
+    if ($ReviewBenchmark) {
+        & $Path -ReviewBenchmark
+    } else {
+        & $Path
+    }
 }
 
 if ($Action -eq "Prompt") {
@@ -27,13 +32,15 @@ if ($Action -eq "Prompt") {
     Write-Host "  1. Run environment validation (debug)"
     Write-Host "  2. Run transcription pipeline"
     Write-Host "  3. Migrate settings and state from a legacy directory"
+    Write-Host "  4. Run review benchmark"
     Write-Host "  Q. Quit"
-    $selection = (Read-Host "Enter 1, 2, 3, or Q").Trim()
+    $selection = (Read-Host "Enter 1, 2, 3, 4, or Q").Trim()
 
     switch ($selection.ToUpperInvariant()) {
         "1" { $Action = "Debug" }
         "2" { $Action = "Run" }
         "3" { $Action = "Migrate" }
+        "4" { $Action = "Benchmark" }
         "Q" { return }
         default {
             Write-Host "Unrecognized selection. Exiting."
@@ -46,4 +53,5 @@ switch ($Action) {
     "Debug" { Invoke-LauncherScript -Path $DebugScript }
     "Run" { Invoke-LauncherScript -Path $RunScript }
     "Migrate" { Invoke-LauncherScript -Path $MigrateScript }
+    "Benchmark" { Invoke-LauncherScript -Path $RunScript -ReviewBenchmark }
 }

@@ -56,6 +56,7 @@ It gives you a simple choice:
 1. Run environment validation
 2. Run the transcription pipeline
 3. Migrate settings and state from a legacy directory
+4. Run review benchmark
 
 ## Technical Details
 
@@ -113,15 +114,26 @@ Generated outputs per audio file:
 - `*_cleaned_speaker_transcript.txt`
 - `*_cleaned_host_only.txt`
 - `*_cleaned_speaker_transcript.json`
+- `*_reviewed_speaker_transcript.txt` when optional LLM review succeeds
+- `*_reviewed_host_only.txt` when optional LLM review succeeds
+- `*_reviewed_speaker_transcript.json` when optional LLM review succeeds
 - `*_manifest.json`
 
 The regular transcript files preserve the post-diarization transcript text as produced by Whisper plus configured glossary replacements. The cleaned transcript files are companion outputs for easier reading and downstream retrieval. They apply conservative speech-cleanup rules for obvious repeated words, immediate restarts, and small dead-end fragments while keeping the original transcript available for comparison. Cleaned JSON segments include `original_text` and `cleanup_applied` when a segment was changed.
+
+Reviewed transcript files are additive companions to the cleaned outputs. They are only emitted when optional review is enabled and a configured local backend actually returns reviewed content. The baseline raw and deterministically cleaned outputs remain the source of truth and are still written exactly as before when review is disabled, unavailable, or fails.
+
+When review is enabled, the normal batch run is now smart about legacy work. If an episode already has a valid `*_cleaned_speaker_transcript.json` from an earlier tier-1 run, the pipeline can skip Whisper, diarization, and speaker matching and backfill only the reviewed outputs from that cleaned JSON. New episodes still run tier 1 and then tier 2 in the same pass.
 
 Cleanup behavior is controlled by `cleanup_level`: `disabled`, `conservative`, `normal`, or `aggressive`. Manual correction CSVs can be supplied through `corrections_dir`; files named `<audio_stem>_corrections.csv` may use `segment_id`/`id`, `corrected_text`/`text`, and `speaker` columns to patch transcript text or speaker labels before cleaned outputs are generated.
 
 JSON outputs include `schema_version`, pipeline metadata, episode date fields, and per-segment `transcription_confidence` derived from Whisper `avg_logprob` and `no_speech_prob`. The per-episode manifest records source fingerprints, config fingerprints, stage timings, output file hashes, and the episode summary row.
 
 The executable transcript contract lives in `src/podcast_transcribe/contract.py`. It defines the current transcript schema version, required top-level fields, required segment fields, and validation rules used before JSON outputs are written. Downstream tools can import the same module or mirror its required fields when validating handoffs.
+
+Reviewed JSON outputs use a parallel additive contract. They keep the current transcript schema intact and add `review_schema_version`, `review_metadata`, and per-segment review fields such as `llm_reviewed_text`, `review_runtime_profile`, `review_backend`, `review_model_name`, and `review_stage_flags`. Reviewed payloads use `text_version` values such as `reviewed_llm` or `reviewed_llm_high_context`.
+
+The review layer now runs as explicit stages rather than one undifferentiated pass. `review_metadata` records the review pipeline version, the input source (`inline_cleaned_segments` or `cleaned_json_backfill`), stage-by-stage results, and whether episode QA ran as `full_episode`, `chunked`, `disabled`, or `skipped`.
 
 Each segment also includes deterministic `content_quality` tags for likely sponsor blocks, music/transition text, boilerplate, repetition, and possible silence/non-speech. These tags are intentionally conservative hints for review and downstream filtering; they do not remove content from the transcript.
 
@@ -269,6 +281,23 @@ Configuration notes:
 - `batch_size`: transcription batch size
 - `assume_dominant_speaker_is_host`: fallback host bootstrap if no better match exists
 - `host_threshold`: speaker similarity threshold for host and known-speaker matching
+- `runtime_profile`: optional post-processing capability preset, one of `baseline_16gb`, `high_context_5090`, or `custom`
+- `backend`: optional additive review backend, one of `none`, `lm_studio`, or `vllm`
+- `review_base_url`: OpenAI-compatible local backend URL, for example `http://127.0.0.1:1234`
+- `review_model_name`: local review model identifier exposed by LM Studio or vLLM
+- `review_debug`: when `true`, write per-stage review request/response debug artifacts for backend troubleshooting
+- `review_debug_dir`: optional override directory for review debug artifacts; default is `<output>\_processing_artifacts\<episode>\review_debug`
+- `transcript_cleanup_review`: optional LLM review pass for conservative transcript cleanup validation
+- `glossary_correction_review`: optional LLM review pass for missed or inconsistent preferred-term usage
+- `speaker_consistency_review`: optional LLM review pass for likely speaker-name drift
+- `episode_qa_review`: optional episode-wide QA pass for larger-context local runtimes
+
+Review-profile notes:
+
+- `baseline_16gb` keeps all optional review stages off by default.
+- `high_context_5090` enables the review stages by default, but still requires a working local backend to actually run them.
+- `custom` respects the explicit review flags and advanced review-capability settings in the config.
+- These runtime profiles do not change the baseline Whisper, diarization, or speaker-identification path.
 
 ### 5. Optional: set up known speaker samples
 
@@ -365,11 +394,13 @@ Choose `1` for environment validation.
 What it checks:
 
 - config resolution from `podcast_transcribe_config.json`
+- effective optional review profile resolution
 - Hugging Face token discovery and access to both `pyannote/speaker-diarization-community-1` and `pyannote/segmentation-3.0`
 - `ffmpeg_bin_dir` and `ffmpeg.exe` launchability
 - the active `podcast-transcribe` conda environment
 - required Python packages and CUDA availability
 - pyannote and SpeechBrain runtime compatibility
+- selected review backend reachability when optional review is enabled
 
 Use this script when:
 
@@ -398,6 +429,7 @@ The bootstrap and underlying launcher will:
 - use `default_source_dir` from `podcast_transcribe_config.json` without prompting when it is already valid
 - use `ffmpeg_bin_dir` from config, or prompt for it when missing, and only save it after import checks succeed
 - use `known_speakers_dir` from config, or auto-discover the local `speaker_reference_samples` folder, before prompting
+- surface the configured `runtime_profile` and optional review backend before the Python run starts
 - only open a folder picker when required information is missing
 - immediately write prompted values back into `podcast_transcribe_config.json`
 
@@ -430,8 +462,60 @@ python .\podcast_transcribe_host.py `
   --known-speakers-dir .\speaker_reference_samples `
   --assume-dominant-speaker-is-host `
   --host-threshold 0.45 `
+  --runtime-profile baseline_16gb `
+  --backend none `
   --hf-token $env:HF_TOKEN
 ```
+
+To opt into additive local LLM review on a stronger workstation, point the CLI at a local OpenAI-compatible endpoint and enable the stages you want. Example:
+
+```powershell
+python .\podcast_transcribe_host.py `
+  --input-dir "C:\Speech_to_text\audio" `
+  --output-dir "C:\Speech_to_text\output" `
+  --runtime-profile high_context_5090 `
+  --backend vllm `
+  --review-base-url "http://127.0.0.1:8000" `
+  --review-model-name "mistral-small-3.2-24b-instruct-2506" `
+  --review-auto-calibrate `
+  --review-auto-adapt-upward `
+  --transcript-cleanup-review `
+  --glossary-correction-review `
+  --speaker-consistency-review `
+  --episode-qa-review `
+  --hf-token $env:HF_TOKEN
+```
+
+If the review backend is unavailable or errors out, the run still completes with the normal baseline outputs and records the skipped review status in the manifest and episode summary.
+
+This same run path also handles mixed batches. Episodes that are already tier-1 complete but missing reviewed outputs are treated as `tier2-only backfill`, while brand-new episodes run `tier1+tier2`.
+
+When additive review is enabled, the pipeline now calibrates a safe starting review-window budget from the first real transcript that reaches tier 2, then reuses that budget for the rest of the run. If truncation still occurs, the budget shrinks immediately; if many windows succeed cleanly, local review stages can drift upward conservatively.
+
+Calibration is now run-scoped. Each new run performs a fresh calibration when the first reviewable episode reaches tier 2, while the previous run's saved budgets are reused only as warm-start hints. The calibration fingerprint now includes richer backend identity when the review backend exposes it, which makes vLLM model swaps safer and more predictable.
+
+To benchmark review models without rerunning Whisper or diarization, use the dedicated review benchmark mode:
+
+```powershell
+python .\podcast_transcribe_host.py `
+  --review-benchmark `
+  --output-dir ".\output" `
+  --runtime-profile high_context_5090 `
+  --backend vllm `
+  --review-base-url "http://127.0.0.1:8000" `
+  --review-model-name "mistral-small-3.2-24b-instruct-2506" `
+  --transcript-cleanup-review `
+  --glossary-correction-review `
+  --speaker-consistency-review `
+  --episode-qa-review
+```
+
+This benchmark mode runs the staged review pipeline against the checked-in cleaned-transcript fixture corpus and writes:
+
+- `review_benchmark_report.json`
+- `review_benchmark_report.md`
+
+The reports separate speed, stability, and quality metrics so different vLLM-served models can be compared without guessing from anecdotal runs. They also include a usable-capacity profile for cleanup, glossary, speaker-consistency, and episode-QA review, plus glossary-safety reporting for protected preferred terms from `preferred_terms.txt`. The benchmark now scores patch compactness, no-change discipline, overproduction ratio, and boundary stability so models that make unnecessary edits or get sloppy near their usable limit are easier to spot.
 
 ## Basic Workflow
 
@@ -444,7 +528,7 @@ For the best initial results:
 5. Configure `speaker_reference_samples` or point `known_speakers_dir` at an existing sample folder
 6. Run the launcher
 7. Review outputs in the sibling `output` folder:
-   `*_speaker_transcript.txt`, `*_host_only.txt`, `*_review.csv`, `*_speaker_transcript.json`, `_episode_review_summary.csv`
+   `*_speaker_transcript.txt`, `*_cleaned_speaker_transcript.txt`, optional `*_reviewed_speaker_transcript.txt`, `*_review.csv`, `*_speaker_transcript.json`, optional `*_reviewed_speaker_transcript.json`, `_episode_review_summary.csv`
 
 ## System Diagram
 

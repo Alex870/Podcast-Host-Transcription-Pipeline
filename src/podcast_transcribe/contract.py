@@ -3,6 +3,7 @@ from typing import Dict, List
 
 
 TRANSCRIPT_SCHEMA_VERSION = 2
+REVIEWED_TRANSCRIPT_SCHEMA_VERSION = 1
 PIPELINE_NAME = "podcast-host-transcription-pipeline"
 REQUIRED_TOP_LEVEL_FIELDS = {
     "schema_version",
@@ -20,6 +21,23 @@ REQUIRED_SEGMENT_FIELDS = {
     "episode_date",
     "episode_sort_key",
     "transcription_confidence",
+}
+REQUIRED_REVIEW_TOP_LEVEL_FIELDS = {
+    "review_schema_version",
+    "review_metadata",
+}
+REQUIRED_REVIEW_METADATA_FIELDS = {
+    "review_pipeline_version",
+    "review_stage_results",
+    "review_input_source",
+}
+REQUIRED_REVIEW_SEGMENT_FIELDS = {
+    "original_text",
+    "llm_reviewed_text",
+    "review_runtime_profile",
+    "review_backend",
+    "review_model_name",
+    "review_stage_flags",
 }
 
 
@@ -94,7 +112,43 @@ def transcript_contract_summary() -> Dict[str, object]:
     return {
         "pipeline": PIPELINE_NAME,
         "schema_version": TRANSCRIPT_SCHEMA_VERSION,
+        "reviewed_schema_version": REVIEWED_TRANSCRIPT_SCHEMA_VERSION,
         "required_top_level_fields": sorted(REQUIRED_TOP_LEVEL_FIELDS),
         "required_segment_fields": sorted(REQUIRED_SEGMENT_FIELDS),
     }
 
+
+def validate_reviewed_transcript_payload(payload: Dict[str, object]) -> List[str]:
+    errors = validate_transcript_payload(payload)
+    missing_top = sorted(field for field in REQUIRED_REVIEW_TOP_LEVEL_FIELDS if field not in payload)
+    if missing_top:
+        errors.append(f"missing reviewed top-level fields: {', '.join(missing_top)}")
+
+    if payload.get("review_schema_version") != REVIEWED_TRANSCRIPT_SCHEMA_VERSION:
+        errors.append("missing or unsupported review_schema_version")
+    if payload.get("text_version") not in {"reviewed_llm", "reviewed_llm_high_context"}:
+        errors.append("reviewed payload must use a reviewed text_version")
+
+    review_metadata = payload.get("review_metadata")
+    if not isinstance(review_metadata, dict):
+        errors.append("missing review_metadata object")
+    else:
+        missing_metadata = sorted(field for field in REQUIRED_REVIEW_METADATA_FIELDS if field not in review_metadata)
+        if missing_metadata:
+            errors.append(f"review_metadata missing fields: {', '.join(missing_metadata)}")
+
+    if not isinstance(payload.get("segments"), list):
+        return errors
+
+    for index, segment in enumerate(payload["segments"]):
+        if not isinstance(segment, dict):
+            continue
+        missing_segment = sorted(field for field in REQUIRED_REVIEW_SEGMENT_FIELDS if field not in segment)
+        if missing_segment:
+            errors.append(f"reviewed segment {index} missing fields: {', '.join(missing_segment)}")
+        if segment.get("original_text") in ("", None):
+            errors.append(f"reviewed segment {index} missing original_text")
+        if segment.get("llm_reviewed_text") in ("", None):
+            errors.append(f"reviewed segment {index} missing llm_reviewed_text")
+
+    return errors

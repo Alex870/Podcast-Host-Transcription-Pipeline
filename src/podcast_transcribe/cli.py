@@ -107,6 +107,18 @@ from rich.progress import (
 )
 
 from podcast_transcribe.cleanup import build_cleaned_segments
+from podcast_transcribe.config import (
+    DEFAULT_REVIEW_BACKEND,
+    DEFAULT_RUNTIME_PROFILE,
+    REVIEW_BACKENDS,
+    RUNTIME_PROFILES,
+    load_replacement_map as config_load_replacement_map,
+    resolve_review_runtime_config,
+)
+from podcast_transcribe.contract import (
+    validate_reviewed_transcript_payload,
+    validate_transcript_payload,
+)
 from podcast_transcribe.outputs import (
     build_episode_metadata,
     write_batch_report_md as output_write_batch_report_md,
@@ -116,21 +128,31 @@ from podcast_transcribe.outputs import (
     write_speaker_identity_review_csv as output_write_speaker_identity_review_csv,
     write_text_transcript as output_write_text_transcript,
 )
-from podcast_transcribe.config import load_replacement_map as config_load_replacement_map
 from podcast_transcribe.models import SegmentItem, WordItem
 from podcast_transcribe.quality import language_model_warnings
+from podcast_transcribe.review import (
+    ReviewCalibrationSession,
+    enrich_backend_capabilities_with_identity,
+    resolve_backend_capabilities,
+    review_debug_directory,
+    review_segments,
+)
+from podcast_transcribe.review_benchmark import run_review_benchmark, write_review_benchmark_reports
 from podcast_transcribe.state import (
     ARTIFACT_DIRNAME,
     CHECKPOINT_DIRNAME,
     RESUME_STATE_FILENAME,
+    REVIEW_CALIBRATION_FILENAME,
     SUMMARY_FILENAME,
     audio_file_fingerprint,
     clear_stage_artifacts as state_clear_stage_artifacts,
     expected_output_paths as state_expected_output_paths,
     is_file_already_processed as state_is_file_already_processed,
+    load_review_calibration_state as state_load_review_calibration_state,
     load_stage_artifact as state_load_stage_artifact,
     load_episode_summary_rows as state_load_episode_summary_rows,
     load_processed_files as state_load_processed_files,
+    save_review_calibration_state as state_save_review_calibration_state,
     save_stage_artifact as state_save_stage_artifact,
     save_processed_files as state_save_processed_files,
 )
@@ -237,11 +259,80 @@ def create_stage_progress(transient: bool = False) -> Progress:
     )
 
 
+def print_episode_mode(mode: str):
+    print(f"Episode mode: {mode}")
+
+
+def print_episode_stage(current: int, total: int, label: str):
+    print(f"Episode stage {current}/{total}: {label}")
+
+
+def make_review_progress_callback():
+    state = {"current_stage": None, "stage_index": None, "stage_total": None}
+
+    def callback(event: Dict[str, object]):
+        event_type = str(event.get("event") or "")
+        stage_label = str(event.get("stage_label") or event.get("stage_name") or "review")
+        pretty_label = stage_label.replace("_", " ")
+        if event_type == "stage_index":
+            state["current_stage"] = str(event.get("stage_name") or "")
+            state["stage_index"] = int(event.get("current") or 0)
+            state["stage_total"] = int(event.get("total") or 0)
+            print(f"  Review stage {state['stage_index']}/{state['stage_total']}: {pretty_label}")
+        elif event_type == "stage_window_progress":
+            mode = str(event.get("mode") or "")
+            current = int(event.get("current") or 0)
+            total = int(event.get("total") or 0)
+            if mode == "chunked":
+                print(f"    {pretty_label} chunk {current}/{total}")
+            elif total > 1:
+                print(f"    {pretty_label} window {current}/{total}")
+        elif event_type == "stage_skipped":
+            reason = str(event.get("reason") or "skipped")
+            print(f"  {pretty_label} skipped: {reason}")
+        elif event_type == "calibration_complete":
+            print(f"  {str(event.get('summary') or 'Review calibration complete.')}")
+        elif event_type == "budget_reduced":
+            family_name = str(event.get("family_name") or "review")
+            old_budget = int(event.get("old_budget") or 0)
+            new_budget = int(event.get("new_budget") or 0)
+            family_label = family_name.replace("_review", "").replace("_", " ")
+            print(f"  Review budget reduced for {family_label}: {old_budget} -> {new_budget}")
+        elif event_type == "budget_increased":
+            family_name = str(event.get("family_name") or "review")
+            old_budget = int(event.get("old_budget") or 0)
+            new_budget = int(event.get("new_budget") or 0)
+            family_label = family_name.replace("_review", "").replace("_", " ")
+            print(f"  Review budget increased for {family_label}: {old_budget} -> {new_budget}")
+
+    return callback
+
+
+def review_calibration_state_path(output_dir: Path) -> Path:
+    return output_dir / REVIEW_CALIBRATION_FILENAME
+
+
+def load_review_calibration_session(
+    output_dir: Path,
+    backend_capabilities: Dict[str, object],
+) -> ReviewCalibrationSession:
+    return ReviewCalibrationSession(
+        backend_capabilities,
+        state_load_review_calibration_state(review_calibration_state_path(output_dir)),
+    )
+
+
+def save_review_calibration_session(output_dir: Path, session: Optional[ReviewCalibrationSession]):
+    if session is None:
+        return
+    state_save_review_calibration_state(review_calibration_state_path(output_dir), session.serialize())
+
+
 def parse_args():
     """Parse CLI options for parent batch runs and isolated child workers."""
 
     parser = argparse.ArgumentParser(description="Transcribe podcasts with diarization and host labeling.")
-    parser.add_argument("--input-dir", required=True, help="Directory containing audio files to process.")
+    parser.add_argument("--input-dir", help="Directory containing audio files to process.")
     parser.add_argument("--input-file", help="Optional single audio file to process from input-dir.")
     parser.add_argument("--output-dir", help="Output directory. Defaults to input directory.")
     parser.add_argument("--model", default="large-v3", help="faster-whisper model name.")
@@ -327,6 +418,110 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--runtime-profile",
+        choices=sorted(RUNTIME_PROFILES),
+        default=DEFAULT_RUNTIME_PROFILE,
+        help="Optional post-processing runtime profile for additive transcript review.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=sorted(REVIEW_BACKENDS),
+        default=DEFAULT_REVIEW_BACKEND,
+        help="Optional review backend for additive transcript review.",
+    )
+    parser.add_argument(
+        "--review-base-url",
+        default="",
+        help="OpenAI-compatible base URL for optional transcript review backends.",
+    )
+    parser.add_argument(
+        "--review-model-name",
+        default="",
+        help="Model name used for optional transcript review calls.",
+    )
+    parser.add_argument(
+        "--review-debug",
+        action="store_true",
+        help="Write per-stage review request/response debug artifacts for backend troubleshooting.",
+    )
+    parser.add_argument(
+        "--review-debug-dir",
+        default="",
+        help="Optional directory override for review debug artifacts. Defaults to the episode artifact folder in output.",
+    )
+    parser.add_argument(
+        "--review-auto-calibrate",
+        dest="review_auto_calibrate",
+        action="store_true",
+        help="Probe the active review backend at the first review step and reuse calibrated batching budgets for the rest of the run.",
+    )
+    parser.add_argument(
+        "--no-review-auto-calibrate",
+        dest="review_auto_calibrate",
+        action="store_false",
+        help="Disable review-budget calibration and use fixed review batching defaults.",
+    )
+    parser.add_argument(
+        "--review-auto-adapt-upward",
+        dest="review_auto_adapt_upward",
+        action="store_true",
+        help="Allow conservative upward drift of local review batching budgets after long stable success streaks.",
+    )
+    parser.add_argument(
+        "--no-review-auto-adapt-upward",
+        dest="review_auto_adapt_upward",
+        action="store_false",
+        help="Disable upward drift for calibrated local review batching budgets.",
+    )
+    parser.add_argument(
+        "--transcript-cleanup-review",
+        dest="transcript_cleanup_review",
+        action="store_true",
+        help="Enable additive LLM transcript cleanup review.",
+    )
+    parser.add_argument(
+        "--no-transcript-cleanup-review",
+        dest="transcript_cleanup_review",
+        action="store_false",
+        help="Disable additive LLM transcript cleanup review.",
+    )
+    parser.add_argument(
+        "--glossary-correction-review",
+        dest="glossary_correction_review",
+        action="store_true",
+        help="Enable additive LLM glossary correction review.",
+    )
+    parser.add_argument(
+        "--no-glossary-correction-review",
+        dest="glossary_correction_review",
+        action="store_false",
+        help="Disable additive LLM glossary correction review.",
+    )
+    parser.add_argument(
+        "--speaker-consistency-review",
+        dest="speaker_consistency_review",
+        action="store_true",
+        help="Enable additive LLM speaker consistency review.",
+    )
+    parser.add_argument(
+        "--no-speaker-consistency-review",
+        dest="speaker_consistency_review",
+        action="store_false",
+        help="Disable additive LLM speaker consistency review.",
+    )
+    parser.add_argument(
+        "--episode-qa-review",
+        dest="episode_qa_review",
+        action="store_true",
+        help="Enable additive long-context episode QA review when supported by the active runtime profile.",
+    )
+    parser.add_argument(
+        "--no-episode-qa-review",
+        dest="episode_qa_review",
+        action="store_false",
+        help="Disable additive long-context episode QA review.",
+    )
+    parser.add_argument(
         "--no-resume-intermediates",
         dest="resume_intermediates",
         action="store_false",
@@ -347,6 +542,11 @@ def parse_args():
         "--benchmark-only",
         action="store_true",
         help="Run preflight and print a benchmark plan without loading ML models or processing audio.",
+    )
+    parser.add_argument(
+        "--review-benchmark",
+        action="store_true",
+        help="Run the dedicated tier-2 review benchmark suite against the checked-in cleaned-transcript fixtures.",
     )
     parser.add_argument(
         "--assume-dominant-speaker-is-host",
@@ -387,6 +587,14 @@ def parse_args():
         dest="isolate_files",
         action="store_false",
         help="Process all episodes in the current Python process.",
+    )
+    parser.set_defaults(
+        transcript_cleanup_review=None,
+        glossary_correction_review=None,
+        speaker_consistency_review=None,
+        episode_qa_review=None,
+        review_auto_calibrate=None,
+        review_auto_adapt_upward=None,
     )
     parser.set_defaults(isolate_files=False)
     parser.set_defaults(resume_intermediates=True)
@@ -1631,6 +1839,32 @@ def build_episode_summary_row(
         "language_model_warnings": "",
         "transcription_artifact_reused": "",
         "diarization_artifact_reused": "",
+        "review_attempted": False,
+        "review_status": "",
+        "review_skip_reason": "",
+        "review_runtime_profile": "",
+        "review_backend": "",
+        "review_model_name": "",
+        "reviewed_segment_count": 0,
+        "review_corrected_segment_count": 0,
+        "reviewed_output_written": False,
+        "review_pipeline_version": "",
+        "review_enabled_stages": "",
+        "review_completed_stages": "",
+        "review_skipped_stages": "",
+        "review_input_source": "",
+        "review_episode_qa_mode": "",
+        "review_calibration_source": "",
+        "review_local_text_budget": "",
+        "review_local_speaker_budget": "",
+        "review_long_context_budget": "",
+        "cleanup_review_corrected_count": 0,
+        "glossary_review_corrected_count": 0,
+        "speaker_consistency_review_corrected_count": 0,
+        "episode_qa_review_corrected_count": 0,
+        "processing_mode": "",
+        "tier1_reused_from_existing": False,
+        "review_backfilled_from_cleaned_json": False,
     }
 
 
@@ -1671,6 +1905,32 @@ def write_episode_summary_csv(path: Path, rows: List[Dict[str, object]]):
         "language_model_warnings",
         "transcription_artifact_reused",
         "diarization_artifact_reused",
+        "review_attempted",
+        "review_status",
+        "review_skip_reason",
+        "review_runtime_profile",
+        "review_backend",
+        "review_model_name",
+        "reviewed_segment_count",
+        "review_corrected_segment_count",
+        "reviewed_output_written",
+        "review_pipeline_version",
+        "review_enabled_stages",
+        "review_completed_stages",
+        "review_skipped_stages",
+        "review_input_source",
+        "review_episode_qa_mode",
+        "review_calibration_source",
+        "review_local_text_budget",
+        "review_local_speaker_budget",
+        "review_long_context_budget",
+        "cleanup_review_corrected_count",
+        "glossary_review_corrected_count",
+        "speaker_consistency_review_corrected_count",
+        "episode_qa_review_corrected_count",
+        "processing_mode",
+        "tier1_reused_from_existing",
+        "review_backfilled_from_cleaned_json",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -1737,11 +1997,24 @@ def normalize_episode_summary_row(row: Dict[str, object]) -> Dict[str, object]:
         "speaker_similarity_drift_count",
         "cleanup_edit_count",
         "manual_correction_count",
+        "reviewed_segment_count",
+        "review_corrected_segment_count",
+        "review_local_text_budget",
+        "review_local_speaker_budget",
+        "review_long_context_budget",
+        "cleanup_review_corrected_count",
+        "glossary_review_corrected_count",
+        "speaker_consistency_review_corrected_count",
+        "episode_qa_review_corrected_count",
     }
     bool_fields = {
         "host_detected",
         "transcription_artifact_reused",
         "diarization_artifact_reused",
+        "review_attempted",
+        "reviewed_output_written",
+        "tier1_reused_from_existing",
+        "review_backfilled_from_cleaned_json",
     }
 
     normalized = dict(row)
@@ -1761,6 +2034,48 @@ def normalize_episode_summary_row(row: Dict[str, object]) -> Dict[str, object]:
             normalized[field] = coerce_bool(normalized[field], False)
 
     return normalized
+
+
+def apply_review_metadata_to_summary(summary_row: Dict[str, object], review_result: Dict[str, object]):
+    review_metadata = review_result["metadata"]
+    stage_results = review_metadata.get("review_stage_results") if isinstance(review_metadata.get("review_stage_results"), dict) else {}
+    summary_row["review_attempted"] = bool(review_result["attempted"])
+    summary_row["review_status"] = str(review_metadata.get("review_status") or "")
+    summary_row["review_skip_reason"] = str(review_metadata.get("review_skip_reason") or "")
+    summary_row["review_runtime_profile"] = str(review_metadata.get("review_runtime_profile") or "")
+    summary_row["review_backend"] = str(review_metadata.get("review_backend") or "")
+    summary_row["review_model_name"] = str(review_metadata.get("review_model_name") or "")
+    summary_row["reviewed_segment_count"] = int(review_metadata.get("reviewed_segment_count") or 0)
+    summary_row["review_corrected_segment_count"] = int(review_metadata.get("corrected_segment_count") or 0)
+    summary_row["reviewed_output_written"] = bool(review_result["segments"])
+    summary_row["review_pipeline_version"] = str(review_metadata.get("review_pipeline_version") or "")
+    summary_row["review_enabled_stages"] = ";".join(str(item) for item in review_metadata.get("review_enabled_stages") or [])
+    summary_row["review_completed_stages"] = ";".join(str(item) for item in review_metadata.get("review_completed_stages") or [])
+    summary_row["review_skipped_stages"] = ";".join(str(item) for item in review_metadata.get("review_skipped_stages") or [])
+    summary_row["review_input_source"] = str(review_metadata.get("review_input_source") or "")
+    summary_row["review_episode_qa_mode"] = str(review_metadata.get("episode_qa_mode") or "")
+    calibration = review_metadata.get("review_calibration") if isinstance(review_metadata.get("review_calibration"), dict) else {}
+    families = calibration.get("families") if isinstance(calibration.get("families"), dict) else {}
+    summary_row["review_calibration_source"] = (
+        str(families.get("local_text_review", {}).get("calibration_source") or "")
+        or str(families.get("local_speaker_review", {}).get("calibration_source") or "")
+        or str(families.get("long_context_review", {}).get("calibration_source") or "")
+    )
+    summary_row["review_local_text_budget"] = int(families.get("local_text_review", {}).get("current_budget") or 0)
+    summary_row["review_local_speaker_budget"] = int(families.get("local_speaker_review", {}).get("current_budget") or 0)
+    summary_row["review_long_context_budget"] = int(families.get("long_context_review", {}).get("current_budget") or 0)
+    summary_row["cleanup_review_corrected_count"] = int(
+        ((stage_results.get("transcript_cleanup_review") or {}).get("corrected_segment_count")) or 0
+    )
+    summary_row["glossary_review_corrected_count"] = int(
+        ((stage_results.get("glossary_correction_review") or {}).get("corrected_segment_count")) or 0
+    )
+    summary_row["speaker_consistency_review_corrected_count"] = int(
+        ((stage_results.get("speaker_consistency_review") or {}).get("corrected_segment_count")) or 0
+    )
+    summary_row["episode_qa_review_corrected_count"] = int(
+        ((stage_results.get("episode_qa_review") or {}).get("corrected_segment_count")) or 0
+    )
 
 
 def checkpoint_path(output_dir: Path, audio_path: Path) -> Path:
@@ -1817,18 +2132,576 @@ def expected_output_paths(audio_path: Path, output_dir: Path) -> List[Path]:
     return state_expected_output_paths(audio_path, output_dir)
 
 
-def is_file_already_processed(
+def expected_review_output_paths(audio_path: Path, output_dir: Path) -> List[Path]:
+    base_name = audio_path.stem
+    return [
+        output_dir / f"{base_name}_reviewed_speaker_transcript.txt",
+        output_dir / f"{base_name}_reviewed_host_only.txt",
+        output_dir / f"{base_name}_reviewed_speaker_transcript.json",
+    ]
+
+
+def expected_cleaned_output_paths(audio_path: Path, output_dir: Path) -> List[Path]:
+    base_name = audio_path.stem
+    return [
+        output_dir / f"{base_name}_cleaned_speaker_transcript.txt",
+        output_dir / f"{base_name}_cleaned_host_only.txt",
+        output_dir / f"{base_name}_cleaned_speaker_transcript.json",
+    ]
+
+
+def cleaned_json_output_path(audio_path: Path, output_dir: Path) -> Path:
+    return output_dir / f"{audio_path.stem}_cleaned_speaker_transcript.json"
+
+
+def reviewed_json_output_path(audio_path: Path, output_dir: Path) -> Path:
+    return output_dir / f"{audio_path.stem}_reviewed_speaker_transcript.json"
+
+
+def baseline_output_bundle_complete(audio_path: Path, output_dir: Path) -> bool:
+    expected_paths = expected_output_paths(audio_path, output_dir) + expected_cleaned_output_paths(audio_path, output_dir)
+    return all(path.exists() for path in expected_paths)
+
+
+def load_cleaned_transcript_payload(path: Path) -> Dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Cleaned transcript JSON not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Cleaned transcript JSON is invalid: {path} ({exc})") from exc
+
+    errors = validate_transcript_payload(payload)
+    if errors:
+        raise RuntimeError(f"Cleaned transcript JSON failed contract validation: {path} ({'; '.join(errors[:5])})")
+
+    if not isinstance(payload.get("segments"), list) or not payload["segments"]:
+        raise RuntimeError(f"Cleaned transcript JSON does not contain any usable segments: {path}")
+    return payload
+
+
+def load_reviewed_transcript_payload(path: Path) -> Dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Reviewed transcript JSON not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Reviewed transcript JSON is invalid: {path} ({exc})") from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Reviewed transcript JSON is not an object: {path}")
+    if payload.get("text_version") not in {"reviewed_llm", "reviewed_llm_high_context"}:
+        raise RuntimeError(f"Reviewed transcript JSON is not a reviewed text variant: {path}")
+    if not isinstance(payload.get("segments"), list) or not payload["segments"]:
+        raise RuntimeError(f"Reviewed transcript JSON does not contain any usable segments: {path}")
+    return payload
+
+
+def enabled_review_stage_names(runtime_review_config: Optional[Dict[str, object]]) -> List[str]:
+    resolved = resolve_review_runtime_config(runtime_review_config or {})
+    return [
+        stage_name
+        for stage_name in (
+            "transcript_cleanup_review",
+            "glossary_correction_review",
+            "speaker_consistency_review",
+            "episode_qa_review",
+        )
+        if resolved.get(stage_name)
+    ]
+
+
+def reviewed_payload_is_usable(payload: Dict[str, object]) -> None:
+    segments = payload.get("segments")
+    if not isinstance(segments, list) or not segments:
+        raise RuntimeError("Reviewed payload does not contain usable segments.")
+
+    transcript_errors = validate_transcript_payload(payload)
+    blocking_errors = [
+        error
+        for error in transcript_errors
+        if not error.startswith("missing top-level fields: review_")
+    ]
+    if blocking_errors:
+        raise RuntimeError(f"Reviewed payload failed transcript validation: {'; '.join(blocking_errors[:5])}")
+
+    for index, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            raise RuntimeError(f"Reviewed payload segment {index} is not an object.")
+        missing = [
+            field
+            for field in ("id", "start", "end", "speaker", "text", "original_text", "llm_reviewed_text")
+            if segment.get(field) in ("", None)
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Reviewed payload segment {index} is missing required legacy review fields: {', '.join(missing)}"
+            )
+
+ 
+def extract_completed_review_stage_names(payload: Dict[str, object]) -> List[str]:
+    review_metadata = payload.get("review_metadata")
+    if not isinstance(review_metadata, dict):
+        return []
+
+    completed = []
+    explicit_completed = review_metadata.get("review_completed_stages")
+    if isinstance(explicit_completed, list):
+        completed.extend(
+            str(stage_name)
+            for stage_name in explicit_completed
+            if isinstance(stage_name, str) and stage_name.strip()
+        )
+
+    stage_results = review_metadata.get("review_stage_results")
+    if isinstance(stage_results, dict):
+        for stage_name, stage_result in stage_results.items():
+            if (
+                isinstance(stage_name, str)
+                and isinstance(stage_result, dict)
+                and str(stage_result.get("status") or "").strip().lower() == "completed"
+            ):
+                completed.append(stage_name)
+
+    ordered = []
+    seen = set()
+    for stage_name in completed:
+        if stage_name not in seen:
+            seen.add(stage_name)
+            ordered.append(stage_name)
+    return ordered
+
+
+def classify_reviewed_payload_for_skip(
+    payload: Dict[str, object],
+    required_stages: List[str],
+) -> Dict[str, object]:
+    reviewed_payload_is_usable(payload)
+    current_errors = validate_reviewed_transcript_payload(payload)
+    completed_stages = extract_completed_review_stage_names(payload)
+    completed_stage_set = set(completed_stages)
+    missing_stages = [stage_name for stage_name in required_stages if stage_name not in completed_stage_set]
+
+    if not required_stages:
+        return {
+            "status": "current_review_complete" if not current_errors else "review_stage_shortfall",
+            "reason": "" if not current_errors else "review payload missing explicit stage-completion evidence",
+            "completed_stages": completed_stages,
+            "missing_stages": [],
+        }
+
+    if missing_stages:
+        if completed_stages:
+            return {
+                "status": "review_stage_shortfall",
+                "reason": f"reviewed output is missing required stages: {', '.join(missing_stages)}",
+                "completed_stages": completed_stages,
+                "missing_stages": missing_stages,
+            }
+        return {
+            "status": "review_stage_shortfall",
+            "reason": f"reviewed output does not prove completion of required stages: {', '.join(missing_stages)}",
+            "completed_stages": [],
+            "missing_stages": missing_stages,
+        }
+
+    return {
+        "status": "current_review_complete",
+        "reason": "",
+        "completed_stages": completed_stages,
+        "missing_stages": [],
+    }
+
+
+def reviewed_output_bundle_status(
+    audio_path: Path,
+    output_dir: Path,
+    runtime_review_config: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    expected_paths = expected_review_output_paths(audio_path, output_dir)
+    if not all(path.exists() for path in expected_paths):
+        return {
+            "status": "review_missing",
+            "reason": "missing reviewed output files",
+            "review_json_path": reviewed_json_output_path(audio_path, output_dir),
+            "required_stages": enabled_review_stage_names(runtime_review_config),
+            "completed_stages": [],
+            "missing_stages": enabled_review_stage_names(runtime_review_config),
+        }
+
+    review_json_path = reviewed_json_output_path(audio_path, output_dir)
+    required_stages = enabled_review_stage_names(runtime_review_config)
+    try:
+        payload = load_reviewed_transcript_payload(review_json_path)
+        review_state = classify_reviewed_payload_for_skip(payload, required_stages)
+        return {
+            "status": review_state["status"],
+            "reason": review_state["reason"],
+            "review_json_path": review_json_path,
+            "required_stages": required_stages,
+            "completed_stages": review_state["completed_stages"],
+            "missing_stages": review_state["missing_stages"],
+        }
+    except RuntimeError as exc:
+        return {
+            "status": "review_corrupt",
+            "reason": str(exc),
+            "review_json_path": review_json_path,
+            "required_stages": required_stages,
+            "completed_stages": [],
+            "missing_stages": required_stages,
+        }
+
+
+def segment_items_from_cleaned_payload(payload: Dict[str, object]) -> List[SegmentItem]:
+    rebuilt_segments: List[SegmentItem] = []
+    for index, raw_segment in enumerate(payload.get("segments") or []):
+        if not isinstance(raw_segment, dict):
+            raise RuntimeError(f"Segment {index} in cleaned transcript JSON is not an object.")
+        missing = [
+            field
+            for field in ("id", "start", "end", "speaker", "text")
+            if raw_segment.get(field) in ("", None)
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Segment {index} in cleaned transcript JSON is missing required fields: {', '.join(missing)}"
+            )
+        words_payload = raw_segment.get("words") or []
+        words = [
+            WordItem(
+                start=word.get("start") if isinstance(word, dict) else None,
+                end=word.get("end") if isinstance(word, dict) else None,
+                word=str(word.get("word") or "") if isinstance(word, dict) else "",
+                speaker=str(word.get("speaker") or raw_segment.get("speaker") or "") if isinstance(word, dict) else "",
+            )
+            for word in words_payload
+            if isinstance(word, dict)
+        ]
+        confidence = raw_segment.get("transcription_confidence") if isinstance(raw_segment.get("transcription_confidence"), dict) else {}
+        rebuilt_segments.append(
+            SegmentItem(
+                id=int(raw_segment["id"]),
+                start=float(raw_segment["start"]),
+                end=float(raw_segment["end"]),
+                text=str(raw_segment["text"]),
+                speaker=str(raw_segment.get("speaker") or ""),
+                avg_logprob=raw_segment.get("avg_logprob", confidence.get("avg_logprob")),
+                no_speech_prob=raw_segment.get("no_speech_prob", confidence.get("no_speech_prob")),
+                words=words,
+                original_text=raw_segment.get("original_text"),
+                cleanup_applied=coerce_bool(raw_segment.get("cleanup_applied"), False),
+                cleanup_level=str(raw_segment.get("cleanup_level") or ""),
+                manual_correction_applied=coerce_bool(raw_segment.get("manual_correction_applied"), False),
+                original_speaker=raw_segment.get("original_speaker"),
+            )
+        )
+    return rebuilt_segments
+
+
+def classify_episode_processing_state(
     audio_path: Path,
     output_dir: Path,
     processed_files: Dict[str, Dict[str, object]],
     existing_summary_rows: Dict[str, Dict[str, object]],
-) -> bool:
-    return state_is_file_already_processed(
+    runtime_config: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    resolved_review = resolve_review_runtime_config(runtime_config or {})
+    baseline_bundle_complete = baseline_output_bundle_complete(audio_path, output_dir)
+    baseline_resume_complete = state_is_file_already_processed(
         audio_path,
         output_dir,
         processed_files,
         existing_summary_rows,
     )
+    cleaned_json_path = cleaned_json_output_path(audio_path, output_dir)
+    cleaned_json_usable = False
+    cleaned_json_error = ""
+    if cleaned_json_path.exists():
+        try:
+            load_cleaned_transcript_payload(cleaned_json_path)
+            cleaned_json_usable = True
+        except RuntimeError as exc:
+            cleaned_json_error = str(exc)
+    reviewed_bundle = reviewed_output_bundle_status(audio_path, output_dir, resolved_review)
+    baseline_complete = baseline_resume_complete
+    if resolved_review["any_review_enabled"]:
+        baseline_complete = baseline_bundle_complete and cleaned_json_usable
+
+    if not resolved_review["any_review_enabled"]:
+        state = "complete" if baseline_resume_complete and baseline_bundle_complete else "needs_tier1"
+    elif baseline_complete and cleaned_json_usable:
+        if reviewed_bundle["status"] == "current_review_complete":
+            state = "complete"
+        else:
+            state = "needs_tier2_only"
+    else:
+        state = "needs_tier1"
+
+    return {
+        "state": state,
+        "baseline_complete": baseline_complete,
+        "baseline_bundle_complete": baseline_bundle_complete,
+        "baseline_resume_complete": baseline_resume_complete,
+        "cleaned_json_path": cleaned_json_path,
+        "cleaned_json_usable": cleaned_json_usable,
+        "cleaned_json_error": cleaned_json_error,
+        "review_bundle_status": reviewed_bundle["status"],
+        "review_bundle_reason": reviewed_bundle["reason"],
+        "required_review_stages": reviewed_bundle["required_stages"],
+        "completed_review_stages": reviewed_bundle["completed_stages"],
+        "missing_review_stages": reviewed_bundle["missing_stages"],
+        "review_enabled": bool(resolved_review["any_review_enabled"]),
+    }
+
+
+def is_file_already_processed(
+    audio_path: Path,
+    output_dir: Path,
+    processed_files: Dict[str, Dict[str, object]],
+    existing_summary_rows: Dict[str, Dict[str, object]],
+    runtime_config: Optional[Dict[str, object]] = None,
+) -> bool:
+    state = classify_episode_processing_state(
+        audio_path,
+        output_dir,
+        processed_files,
+        existing_summary_rows,
+        runtime_config,
+    )
+    return state["state"] == "complete"
+
+
+def reviewed_text_version_from_metadata(review_metadata: Dict[str, object]) -> str:
+    return (
+        "reviewed_llm_high_context"
+        if review_metadata.get("review_runtime_profile") == "high_context_5090"
+        else "reviewed_llm"
+    )
+
+
+def write_reviewed_output_bundle(
+    audio_path: Path,
+    output_dir: Path,
+    reviewed_segments: List[SegmentItem],
+    review_metadata: Dict[str, object],
+    host_output_labels: set[str],
+    episode_metadata: Dict[str, object],
+    info_payload: Dict[str, object],
+    diarized_turns: List[Dict[str, object]],
+    speaker_mapping: Dict[str, str],
+    host_speaker: Optional[str],
+    durations: Dict[str, float],
+    known_assignments: Dict[str, Dict[str, object]],
+    runtime_config: Optional[Dict[str, object]],
+) -> List[Path]:
+    if not reviewed_segments:
+        return []
+
+    reviewed_text_version = reviewed_text_version_from_metadata(review_metadata)
+    reviewed_metadata = {
+        **episode_metadata,
+        "text_version": reviewed_text_version,
+    }
+    base_name = audio_path.stem
+    reviewed_paths = [
+        output_dir / f"{base_name}_reviewed_speaker_transcript.txt",
+        output_dir / f"{base_name}_reviewed_host_only.txt",
+        output_dir / f"{base_name}_reviewed_speaker_transcript.json",
+    ]
+    output_write_text_transcript(
+        reviewed_paths[0],
+        reviewed_segments,
+        format_timestamp,
+        host_only=False,
+        metadata=reviewed_metadata,
+    )
+    output_write_text_transcript(
+        reviewed_paths[1],
+        reviewed_segments,
+        format_timestamp,
+        host_only=True,
+        host_labels=host_output_labels,
+        metadata=reviewed_metadata,
+    )
+    output_write_json_output(
+        reviewed_paths[2],
+        source_file=str(audio_path),
+        info_payload=info_payload,
+        diarized_turns=diarized_turns,
+        segments=reviewed_segments,
+        speaker_mapping=speaker_mapping,
+        host_speaker=host_speaker,
+        durations=durations,
+        known_assignments=known_assignments,
+        metadata=reviewed_metadata,
+        text_version=reviewed_text_version,
+        pipeline_version=runtime_config.get("model", "") if runtime_config else "",
+        review_metadata=review_metadata,
+    )
+    return reviewed_paths
+
+
+def build_review_backfill_summary_row(
+    audio_path: Path,
+    cleaned_payload: Dict[str, object],
+    cleaned_segments: List[SegmentItem],
+    review_result: Dict[str, object],
+    existing_summary_row: Optional[Dict[str, object]] = None,
+    processing_seconds: float = 0.0,
+) -> Dict[str, object]:
+    metadata = cleaned_payload.get("metadata") if isinstance(cleaned_payload.get("metadata"), dict) else {}
+    speaker_mapping = {
+        str(key): str(value)
+        for key, value in (cleaned_payload.get("speaker_mapping") or {}).items()
+        if value not in ("", None)
+    }
+    host_speaker = cleaned_payload.get("host_original_speaker_id")
+    host_label = speaker_mapping.get(str(host_speaker), "") if host_speaker not in ("", None) else ""
+    source_row = dict(existing_summary_row or {})
+    summary_row = build_episode_summary_row(
+        audio_path=audio_path,
+        normalized_segments=cleaned_segments,
+        review_rows=[],
+        host_speaker=None,
+        durations={},
+        similarity_scores={},
+        speaker_mapping={},
+        known_assignments={},
+        episode_metadata=metadata,
+    )
+    summary_row.update(source_row)
+    summary_row["episode"] = audio_path.name
+    summary_row["episode_date"] = metadata.get("episode_date", summary_row.get("episode_date", ""))
+    summary_row["episode_date_compact"] = metadata.get("episode_date_compact", summary_row.get("episode_date_compact", ""))
+    summary_row["episode_year"] = metadata.get("episode_year", summary_row.get("episode_year", ""))
+    summary_row["episode_month"] = metadata.get("episode_month", summary_row.get("episode_month", ""))
+    summary_row["episode_day"] = metadata.get("episode_day", summary_row.get("episode_day", ""))
+    summary_row["episode_sort_key"] = metadata.get("episode_sort_key", summary_row.get("episode_sort_key", ""))
+    summary_row["host_detected"] = source_row.get("host_detected", bool(cleaned_payload.get("host_detected")))
+    summary_row["host_label"] = source_row.get("host_label") or host_label
+    summary_row["transcript_segments"] = len(cleaned_segments)
+    summary_row["cleanup_level"] = str(source_row.get("cleanup_level") or "cleaned_json_reuse")
+    summary_row["cleanup_edit_count"] = coerce_int(source_row.get("cleanup_edit_count"), 0)
+    summary_row["manual_correction_count"] = coerce_int(source_row.get("manual_correction_count"), 0)
+    summary_row["processing_seconds"] = round(processing_seconds, 2)
+    summary_row["transcription_artifact_reused"] = True
+    summary_row["diarization_artifact_reused"] = True
+    apply_review_metadata_to_summary(summary_row, review_result)
+    summary_row["processing_mode"] = "tier2-only backfill"
+    summary_row["tier1_reused_from_existing"] = True
+    summary_row["review_backfilled_from_cleaned_json"] = True
+    return summary_row
+
+
+def process_review_backfill_from_cleaned_json(
+    audio_path: Path,
+    output_dir: Path,
+    runtime_config: Optional[Dict[str, object]] = None,
+    review_calibration_session: Optional[ReviewCalibrationSession] = None,
+    existing_summary_row: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    started = time.perf_counter()
+    print(f"Processing {audio_path.name}")
+    print_episode_mode("tier2-only backfill")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print_episode_stage(1, 3, "load cleaned transcript")
+    cleaned_path = cleaned_json_output_path(audio_path, output_dir)
+    cleaned_payload = load_cleaned_transcript_payload(cleaned_path)
+    cleaned_segments = segment_items_from_cleaned_payload(cleaned_payload)
+    runtime_review_config = resolve_review_runtime_config(runtime_config or {})
+    print_episode_stage(2, 3, "review")
+    review_debug_dir = review_debug_directory(
+        runtime_review_config,
+        {
+            "audio_path": str(audio_path),
+            "output_dir": str(output_dir),
+            "review_input_source": "cleaned_json_backfill",
+        },
+    )
+    if review_debug_dir is not None:
+        print(f"  review debug output: {review_debug_dir}")
+    review_result = review_segments(
+        cleaned_segments,
+        runtime_review_config,
+        review_input_source="cleaned_json_backfill",
+        calibration_session=review_calibration_session,
+        progress_callback=make_review_progress_callback(),
+        debug_context={
+            "audio_path": str(audio_path),
+            "output_dir": str(output_dir),
+            "review_input_source": "cleaned_json_backfill",
+        },
+    )
+    review_metadata = review_result["metadata"]
+
+    host_speaker = cleaned_payload.get("host_original_speaker_id")
+    speaker_mapping = {
+        str(key): str(value)
+        for key, value in (cleaned_payload.get("speaker_mapping") or {}).items()
+        if value not in ("", None)
+    }
+    resolved_host_label = speaker_mapping.get(str(host_speaker), "HOST") if host_speaker else "HOST"
+    host_output_labels = {resolved_host_label, "HOST"}
+    episode_metadata = cleaned_payload.get("metadata") if isinstance(cleaned_payload.get("metadata"), dict) else {}
+    durations = {
+        str(key): float(value)
+        for key, value in (cleaned_payload.get("speaker_durations_seconds") or {}).items()
+        if value not in ("", None)
+    }
+    known_assignments = {
+        str(key): value
+        for key, value in (cleaned_payload.get("known_speaker_assignments") or {}).items()
+        if isinstance(value, dict)
+    }
+    diarized_turns = [
+        turn for turn in (cleaned_payload.get("diarization_turns") or []) if isinstance(turn, dict)
+    ]
+    info_payload = cleaned_payload.get("transcription") if isinstance(cleaned_payload.get("transcription"), dict) else {}
+    reviewed_paths = write_reviewed_output_bundle(
+        audio_path=audio_path,
+        output_dir=output_dir,
+        reviewed_segments=review_result["segments"],
+        review_metadata=review_metadata,
+        host_output_labels=host_output_labels,
+        episode_metadata=episode_metadata,
+        info_payload=info_payload,
+        diarized_turns=diarized_turns,
+        speaker_mapping=speaker_mapping,
+        host_speaker=str(host_speaker) if host_speaker not in ("", None) else None,
+        durations=durations,
+        known_assignments=known_assignments,
+        runtime_config=runtime_config,
+    )
+    print_episode_stage(3, 3, "writing reviewed outputs")
+    summary_row = build_review_backfill_summary_row(
+        audio_path,
+        cleaned_payload,
+        cleaned_segments,
+        review_result,
+        existing_summary_row=existing_summary_row,
+        processing_seconds=time.perf_counter() - started,
+    )
+    outputs = [
+        path
+        for path in (
+            expected_output_paths(audio_path, output_dir)
+            + expected_cleaned_output_paths(audio_path, output_dir)
+            + reviewed_paths
+        )
+        if path.exists()
+    ]
+    output_write_output_manifest(
+        output_dir / f"{audio_path.stem}_manifest.json",
+        source_file=str(audio_path),
+        source_fingerprint=audio_file_fingerprint(audio_path),
+        config=runtime_config or {},
+        outputs=outputs,
+        timings={"review_backfill": time.perf_counter() - started, "total": time.perf_counter() - started},
+        summary=summary_row,
+    )
+    print(f"  reviewed output written: {bool(reviewed_paths)}")
+    return summary_row
 
 
 def write_text_transcript(
@@ -1908,13 +2781,27 @@ def runtime_config_payload(args) -> Dict[str, object]:
         "filename_date_preset",
         "filename_date_position",
         "filename_date_formats",
+        "runtime_profile",
+        "backend",
+        "review_base_url",
+        "review_model_name",
+        "review_debug",
+        "review_debug_dir",
+        "review_auto_calibrate",
+        "review_auto_adapt_upward",
+        "transcript_cleanup_review",
+        "glossary_correction_review",
+        "speaker_consistency_review",
+        "episode_qa_review",
     ]
     payload = {key: getattr(args, key, None) for key in keys}
+    payload["preferred_terms"] = load_preferred_terms(payload.get("preferred_terms_file"))
     payload["filename_date"] = {
         "preset": getattr(args, "filename_date_preset", "strict_iso"),
         "position": getattr(args, "filename_date_position", "last"),
         "formats": getattr(args, "filename_date_formats", None),
     }
+    payload["review_runtime"] = resolve_review_runtime_config(payload)
     return payload
 
 
@@ -1989,6 +2876,7 @@ def process_file(
     cleanup_level: str = "normal",
     corrections_dir: Optional[str] = None,
     runtime_config: Optional[Dict[str, object]] = None,
+    review_calibration_session: Optional[ReviewCalibrationSession] = None,
     historical_similarity_scores: Optional[Dict[str, List[float]]] = None,
     resume_intermediates: bool = True,
     archive_debug_artifacts: bool = False,
@@ -1998,11 +2886,13 @@ def process_file(
     file_started = time.perf_counter()
     stage_timings: Dict[str, float] = {}
     print(f"Processing {audio_path.name}")
+    print_episode_mode("tier1+tier2" if resolve_review_runtime_config(runtime_config or {}).get("any_review_enabled") else "tier1-only")
     output_dir.mkdir(parents=True, exist_ok=True)
     clear_processing_checkpoint(output_dir, audio_path)
     log_memory_usage("before_transcription")
 
     transcription_started = time.perf_counter()
+    print_episode_stage(1, 5, "transcription")
     segments, info_payload, transcription_reused = run_transcription_stage(
         output_dir=output_dir,
         audio_path=audio_path,
@@ -2031,6 +2921,7 @@ def process_file(
     log_memory_usage("after_transcription")
 
     diarization_started = time.perf_counter()
+    print_episode_stage(2, 5, "diarization")
     diarized_turns, diarization_reused = run_diarization_stage(
         output_dir=output_dir,
         audio_path=audio_path,
@@ -2055,7 +2946,7 @@ def process_file(
     )
     log_memory_usage("after_diarization")
 
-    print("  stage: speaker matching")
+    print_episode_stage(3, 5, "speaker matching")
     matching_started = time.perf_counter()
     existing_profile = load_host_profile(host_profile_path)
     host_speaker, speaker_embeddings, updated_profile, durations, similarity_scores = choose_host_speaker(
@@ -2111,6 +3002,30 @@ def process_file(
     if correction_path:
         print(f"  manual corrections applied: {manual_corrections} from {correction_path}")
     cleaned_segments, cleanup_edits = build_cleaned_segments(normalized_segments, level=cleanup_level)
+    runtime_review_config = resolve_review_runtime_config(runtime_config or {})
+    print_episode_stage(4, 5, "review")
+    review_debug_dir = review_debug_directory(
+        runtime_review_config,
+        {
+            "audio_path": str(audio_path),
+            "output_dir": str(output_dir),
+            "review_input_source": "inline_cleaned_segments",
+        },
+    )
+    if review_debug_dir is not None:
+        print(f"  review debug output: {review_debug_dir}")
+    review_result = review_segments(
+        cleaned_segments,
+        runtime_review_config,
+        review_input_source="inline_cleaned_segments",
+        calibration_session=review_calibration_session,
+        progress_callback=make_review_progress_callback(),
+        debug_context={
+            "audio_path": str(audio_path),
+            "output_dir": str(output_dir),
+            "review_input_source": "inline_cleaned_segments",
+        },
+    )
     resolved_host_label = speaker_mapping.get(host_speaker, "HOST") if host_speaker else "HOST"
     host_output_labels = {resolved_host_label, "HOST"}
     review_rows = collect_review_rows(
@@ -2160,7 +3075,7 @@ def process_file(
     )
     log_memory_usage("after_speaker_matching")
 
-    print("  stage: writing outputs")
+    print_episode_stage(5, 5, "writing outputs")
     writing_started = time.perf_counter()
     base_name = audio_path.stem
     filename_date_config = (runtime_config or {}).get("filename_date", {})
@@ -2195,6 +3110,24 @@ def process_file(
         host_only=True,
         host_labels=host_output_labels,
         metadata=cleaned_metadata,
+    )
+    reviewed_segments = review_result["segments"]
+    review_metadata = review_result["metadata"]
+    reviewed_output_written = bool(reviewed_segments)
+    reviewed_output_paths = write_reviewed_output_bundle(
+        audio_path=audio_path,
+        output_dir=output_dir,
+        reviewed_segments=reviewed_segments,
+        review_metadata=review_metadata,
+        host_output_labels=host_output_labels,
+        episode_metadata=episode_metadata,
+        info_payload=info_payload,
+        diarized_turns=diarized_turns,
+        speaker_mapping=speaker_mapping,
+        host_speaker=host_speaker,
+        durations=durations,
+        known_assignments=known_assignments,
+        runtime_config=runtime_config,
     )
     output_write_review_csv(output_dir / f"{base_name}_review.csv", review_rows)
     speaker_review_path = output_dir / f"{base_name}_speaker_identity_review.csv"
@@ -2233,7 +3166,6 @@ def process_file(
         text_version="cleaned",
         pipeline_version=runtime_config.get("model", "") if runtime_config else "",
     )
-
     if updated_profile is not None and host_speaker is not None:
         save_host_profile(host_profile_path, updated_profile, str(audio_path))
     stage_timings["writing"] = time.perf_counter() - writing_started
@@ -2267,6 +3199,10 @@ def process_file(
     summary_row["diarization_artifact_reused"] = diarization_reused
     warnings_for_language = language_model_warnings(info_payload, language)
     summary_row["language_model_warnings"] = "; ".join(warnings_for_language)
+    apply_review_metadata_to_summary(summary_row, review_result)
+    summary_row["processing_mode"] = "tier1+tier2" if resolve_review_runtime_config(runtime_config or {}).get("any_review_enabled") else "tier1-only"
+    summary_row["tier1_reused_from_existing"] = False
+    summary_row["review_backfilled_from_cleaned_json"] = False
     stage_timings["total"] = time.perf_counter() - file_started
     outputs = [
         output_dir / f"{base_name}_speaker_transcript.txt",
@@ -2278,6 +3214,7 @@ def process_file(
         output_dir / f"{base_name}_speaker_transcript.json",
         output_dir / f"{base_name}_cleaned_speaker_transcript.json",
     ]
+    outputs.extend(reviewed_output_paths)
     output_write_output_manifest(
         output_dir / f"{base_name}_manifest.json",
         source_file=str(audio_path),
@@ -2344,6 +3281,20 @@ def print_benchmark_plan(args, audio_files: List[Path], durations: Dict[str, Opt
     print(f"  resume_intermediates: {args.resume_intermediates}")
 
 
+def run_review_benchmark_mode(args, output_dir: Path):
+    runtime_config = runtime_config_payload(args)
+    print("Review benchmark mode")
+    report = run_review_benchmark(runtime_config, output_dir)
+    json_path, md_path = write_review_benchmark_reports(output_dir, report)
+    print(f"  fixtures: {report['benchmark_metadata']['fixture_count']}")
+    print(f"  backend: {report['backend_identity']['backend_name']}")
+    print(f"  model: {report['backend_identity']['review_model_name']}")
+    print(f"  average quality score: {report['quality']['average_fixture_quality_score']}")
+    print(f"  average elapsed seconds: {report['speed']['average_elapsed_seconds']}")
+    print(f"  report json: {json_path}")
+    print(f"  report markdown: {md_path}")
+
+
 def estimate_audio_eta(processed_audio_seconds: float, elapsed_seconds: float, remaining_audio_seconds: float) -> Optional[float]:
     if processed_audio_seconds <= 0 or elapsed_seconds <= 0:
         return None
@@ -2375,6 +3326,14 @@ def build_child_process_command(args, audio_path: Path, output_dir: Path) -> Lis
         str(args.batch_size),
         "--cleanup-level",
         args.cleanup_level,
+        "--runtime-profile",
+        args.runtime_profile,
+        "--backend",
+        args.backend,
+        "--review-base-url",
+        args.review_base_url,
+        "--review-model-name",
+        args.review_model_name,
         "--diarization-model",
         args.diarization_model,
         "--speaker-model",
@@ -2408,6 +3367,34 @@ def build_child_process_command(args, audio_path: Path, output_dir: Path) -> Lis
         command.extend(["--filename-date-formats", *args.filename_date_formats])
     if args.corrections_dir:
         command.extend(["--corrections-dir", args.corrections_dir])
+    if args.transcript_cleanup_review is True:
+        command.append("--transcript-cleanup-review")
+    elif args.transcript_cleanup_review is False:
+        command.append("--no-transcript-cleanup-review")
+    if args.glossary_correction_review is True:
+        command.append("--glossary-correction-review")
+    elif args.glossary_correction_review is False:
+        command.append("--no-glossary-correction-review")
+    if args.speaker_consistency_review is True:
+        command.append("--speaker-consistency-review")
+    elif args.speaker_consistency_review is False:
+        command.append("--no-speaker-consistency-review")
+    if args.episode_qa_review is True:
+        command.append("--episode-qa-review")
+    elif args.episode_qa_review is False:
+        command.append("--no-episode-qa-review")
+    if args.review_debug:
+        command.append("--review-debug")
+    if args.review_debug_dir:
+        command.extend(["--review-debug-dir", args.review_debug_dir])
+    if args.review_auto_calibrate is True:
+        command.append("--review-auto-calibrate")
+    elif args.review_auto_calibrate is False:
+        command.append("--no-review-auto-calibrate")
+    if args.review_auto_adapt_upward is True:
+        command.append("--review-auto-adapt-upward")
+    elif args.review_auto_adapt_upward is False:
+        command.append("--no-review-auto-adapt-upward")
     if not args.resume_intermediates:
         command.append("--no-resume-intermediates")
     if args.archive_debug_artifacts:
@@ -2428,12 +3415,23 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
     resume_state_path = output_dir / RESUME_STATE_FILENAME
     existing_summary_rows = state_load_episode_summary_rows(summary_path, normalize_episode_summary_row)
     processed_files = state_load_processed_files(resume_state_path)
+    effective_runtime_config = runtime_config_payload(args)
+    episode_states = {
+        audio_path.name: classify_episode_processing_state(
+            audio_path,
+            output_dir,
+            processed_files,
+            existing_summary_rows,
+            effective_runtime_config,
+        )
+        for audio_path in audio_files
+    }
     pending_audio_files = [
         audio_path
         for audio_path in audio_files
-        if not state_is_file_already_processed(audio_path, output_dir, processed_files, existing_summary_rows)
+        if episode_states[audio_path.name]["state"] != "complete"
     ]
-    if pending_audio_files:
+    if any(episode_states[audio_path.name]["state"] == "needs_tier1" for audio_path in pending_audio_files):
         load_replacement_map(args.replacement_map_json)
     total_files = len(audio_files)
     batch_started = time.perf_counter()
@@ -2469,10 +3467,33 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
         else:
             print(f"Batch progress: file {index} of {total_files}")
 
-        if state_is_file_already_processed(audio_path, output_dir, processed_files, existing_summary_rows):
-            print(f"Skipping completed file: {audio_path.name}")
+        state_info = classify_episode_processing_state(
+            audio_path,
+            output_dir,
+            processed_files,
+            existing_summary_rows,
+            effective_runtime_config,
+        )
+        if state_info["state"] == "complete":
+            bundle_status = state_info.get("review_bundle_status")
+            if bundle_status == "current_review_complete":
+                print(
+                    f"Skipping completed file: {audio_path.name} "
+                    "(current reviewed bundle already present)"
+                )
+            else:
+                print(f"Skipping completed file: {audio_path.name}")
             processed_audio_seconds += duration_seconds or 0.0
             continue
+        if state_info["state"] == "needs_tier2_only" and state_info.get("missing_review_stages"):
+            print(
+                f"Review shortfall for {audio_path.name}: "
+                f"{', '.join(state_info['missing_review_stages'])}"
+            )
+        print(
+            f"Processing mode for {audio_path.name}: "
+            f"{'tier2-only backfill' if state_info['state'] == 'needs_tier2_only' else 'tier1+tier2'}"
+        )
 
         command = build_child_process_command(args, audio_path, output_dir)
         try:
@@ -2488,7 +3509,14 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
         existing_summary_rows = state_load_episode_summary_rows(summary_path, normalize_episode_summary_row)
         processed_files = state_load_processed_files(resume_state_path)
         if result.returncode != 0:
-            if state_is_file_already_processed(audio_path, output_dir, processed_files, existing_summary_rows):
+            refreshed_state = classify_episode_processing_state(
+                audio_path,
+                output_dir,
+                processed_files,
+                existing_summary_rows,
+                effective_runtime_config,
+            )
+            if refreshed_state["state"] == "complete":
                 print(
                     f"Child process for {audio_path.name} exited with code {result.returncode} "
                     "after writing all expected outputs; continuing batch."
@@ -2553,14 +3581,6 @@ def load_models(args, device: str):
 def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: List[Path]):
     """Process a batch in the current interpreter while reusing loaded models."""
 
-    preferred_terms = load_preferred_terms(args.preferred_terms_file)
-    initial_prompt, hotwords = build_prompt_bias(preferred_terms)
-    replacement_map = load_replacement_map(args.replacement_map_json)
-
-    device = get_device(args.device)
-    print(f"Using device: {device}")
-    whisper_model, diarization_pipeline, verifier, known_speaker_profiles = load_models(args, device)
-
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / SUMMARY_FILENAME
     resume_state_path = output_dir / RESUME_STATE_FILENAME
@@ -2568,7 +3588,45 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
     processed_files = state_load_processed_files(resume_state_path)
     episode_summary_rows_by_name = dict(existing_summary_rows)
     historical_similarity_scores = build_historical_similarity_scores(list(existing_summary_rows.values()))
+    effective_runtime_config = runtime_config_payload(args)
+    episode_states = {
+        audio_path.name: classify_episode_processing_state(
+            audio_path,
+            output_dir,
+            processed_files,
+            episode_summary_rows_by_name,
+            effective_runtime_config,
+        )
+        for audio_path in audio_files
+    }
+    resolved_review_runtime = resolve_review_runtime_config(effective_runtime_config)
+    resolved_review_backend_capabilities = enrich_backend_capabilities_with_identity(
+        resolve_backend_capabilities(effective_runtime_config)
+    )
+    review_calibration_session = (
+        load_review_calibration_session(output_dir, resolved_review_backend_capabilities)
+        if resolved_review_runtime.get("any_review_enabled") and resolved_review_runtime.get("backend_ready")
+        else None
+    )
+    needs_tier1 = any(state["state"] == "needs_tier1" for state in episode_states.values())
+    preferred_terms: List[str] = []
+    initial_prompt = None
+    hotwords = None
+    replacement_map: Dict[str, List[str]] = {}
+    device = None
+    whisper_model = diarization_pipeline = verifier = known_speaker_profiles = None
+    if needs_tier1:
+        preferred_terms = load_preferred_terms(args.preferred_terms_file)
+        initial_prompt, hotwords = build_prompt_bias(preferred_terms)
+        replacement_map = load_replacement_map(args.replacement_map_json)
+        device = get_device(args.device)
+        print(f"Using device: {device}")
+        whisper_model, diarization_pipeline, verifier, known_speaker_profiles = load_models(args, device)
+    else:
+        print("No tier-1 work required; running review backfill from existing cleaned JSON outputs only.")
+
     total_files = len(audio_files)
+    is_single_episode_worker = bool(args.input_file) or total_files == 1
     batch_started = time.perf_counter()
     durations = audio_duration_map(audio_files)
     processed_audio_seconds = 0.0
@@ -2591,51 +3649,87 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
         eta_seconds = estimate_audio_eta(processed_audio_seconds, elapsed, remaining_audio_seconds)
         if eta_seconds is None and average_seconds is not None:
             eta_seconds = average_seconds * remaining_files
-        if eta_seconds is not None:
-            print(
-                f"Batch progress: file {index} of {total_files} "
-                f"(estimated remaining {format_timestamp(eta_seconds)}, "
-                f"processed_audio={format_timestamp(processed_audio_seconds)})"
-            )
-        else:
-            print(f"Batch progress: file {index} of {total_files}")
-        if is_file_already_processed(audio_path, output_dir, processed_files, episode_summary_rows_by_name):
-            print(f"Skipping completed file: {audio_path.name}")
+        if not is_single_episode_worker:
+            if eta_seconds is not None:
+                print(
+                    f"Batch progress: file {index} of {total_files} "
+                    f"(estimated remaining {format_timestamp(eta_seconds)}, "
+                    f"processed_audio={format_timestamp(processed_audio_seconds)})"
+                )
+            else:
+                print(f"Batch progress: file {index} of {total_files}")
+        state_info = classify_episode_processing_state(
+            audio_path,
+            output_dir,
+            processed_files,
+            episode_summary_rows_by_name,
+            effective_runtime_config,
+        )
+        if state_info["state"] == "complete":
+            bundle_status = state_info.get("review_bundle_status")
+            if bundle_status == "current_review_complete":
+                print(
+                    f"Skipping completed file: {audio_path.name} "
+                    "(current reviewed bundle already present)"
+                )
+            else:
+                print(f"Skipping completed file: {audio_path.name}")
             processed_audio_seconds += duration_seconds or 0.0
             continue
+        if not is_single_episode_worker:
+            if state_info["state"] == "needs_tier2_only" and state_info.get("missing_review_stages"):
+                print(
+                    f"Review shortfall for {audio_path.name}: "
+                    f"{', '.join(state_info['missing_review_stages'])}"
+                )
+            print(
+                f"Processing mode for {audio_path.name}: "
+                f"{'tier2-only backfill' if state_info['state'] == 'needs_tier2_only' else 'tier1+tier2'}"
+            )
 
-        episode_summary = process_file(
-            audio_path=audio_path,
-            output_dir=output_dir,
-            whisper_model=whisper_model,
-            diarization_pipeline=diarization_pipeline,
-            verifier=verifier,
-            language=args.language,
-            beam_size=args.beam_size,
-            batch_size=args.batch_size,
-            initial_prompt=initial_prompt,
-            hotwords=hotwords,
-            replacement_map=replacement_map,
-            host_reference=args.host_reference,
-            host_profile_path=args.host_profile_json,
-            known_speaker_profiles=known_speaker_profiles,
-            host_threshold=args.host_threshold,
-            assume_dominant=args.assume_dominant_speaker_is_host,
-            max_embedding_seconds=args.max_embedding_seconds,
-            min_host_seconds=args.min_host_seconds,
-            num_speakers=args.num_speakers,
-            cleanup_level=args.cleanup_level,
-            corrections_dir=args.corrections_dir,
-            runtime_config=runtime_config_payload(args),
-            historical_similarity_scores=historical_similarity_scores,
-            resume_intermediates=args.resume_intermediates,
-            archive_debug_artifacts=args.archive_debug_artifacts,
-        )
+        if state_info["state"] == "needs_tier2_only":
+            episode_summary = process_review_backfill_from_cleaned_json(
+                audio_path=audio_path,
+                output_dir=output_dir,
+                runtime_config=effective_runtime_config,
+                review_calibration_session=review_calibration_session,
+                existing_summary_row=episode_summary_rows_by_name.get(audio_path.name),
+            )
+        else:
+            episode_summary = process_file(
+                audio_path=audio_path,
+                output_dir=output_dir,
+                whisper_model=whisper_model,
+                diarization_pipeline=diarization_pipeline,
+                verifier=verifier,
+                language=args.language,
+                beam_size=args.beam_size,
+                batch_size=args.batch_size,
+                initial_prompt=initial_prompt,
+                hotwords=hotwords,
+                replacement_map=replacement_map,
+                host_reference=args.host_reference,
+                host_profile_path=args.host_profile_json,
+                known_speaker_profiles=known_speaker_profiles,
+                host_threshold=args.host_threshold,
+                assume_dominant=args.assume_dominant_speaker_is_host,
+                max_embedding_seconds=args.max_embedding_seconds,
+                min_host_seconds=args.min_host_seconds,
+                num_speakers=args.num_speakers,
+                cleanup_level=args.cleanup_level,
+                corrections_dir=args.corrections_dir,
+                runtime_config=effective_runtime_config,
+                review_calibration_session=review_calibration_session,
+                historical_similarity_scores=historical_similarity_scores,
+                resume_intermediates=args.resume_intermediates,
+                archive_debug_artifacts=args.archive_debug_artifacts,
+            )
         episode_summary_rows_by_name[audio_path.name] = episode_summary
         historical_similarity_scores = build_historical_similarity_scores(list(episode_summary_rows_by_name.values()))
         processed_files[audio_path.name] = audio_file_fingerprint(audio_path)
         write_episode_summary_csv(summary_path, list(episode_summary_rows_by_name.values()))
         state_save_processed_files(resume_state_path, processed_files)
+        save_review_calibration_session(output_dir, review_calibration_session)
         processed_audio_seconds += duration_seconds or 0.0
         gc.collect()
         if torch.cuda.is_available():
@@ -2643,6 +3737,7 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
 
     write_episode_summary_csv(summary_path, list(episode_summary_rows_by_name.values()))
     state_save_processed_files(resume_state_path, processed_files)
+    save_review_calibration_session(output_dir, review_calibration_session)
     output_write_batch_report_md(
         output_dir / "_batch_report.md",
         list(episode_summary_rows_by_name.values()),
@@ -2655,6 +3750,14 @@ def main():
     """CLI entry point used by the compatibility wrapper and package console script."""
 
     args = parse_args()
+
+    if args.review_benchmark:
+        output_dir = Path(args.output_dir) if args.output_dir else Path.cwd()
+        run_review_benchmark_mode(args, output_dir)
+        return
+
+    if not args.input_dir:
+        raise RuntimeError("--input-dir is required unless --review-benchmark is used.")
 
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir) if args.output_dir else input_dir
@@ -2671,7 +3774,22 @@ def main():
         print_benchmark_plan(args, audio_files, durations)
         return
 
-    if not args.hf_token:
+    effective_runtime_config = runtime_config_payload(args)
+    existing_summary_rows = state_load_episode_summary_rows(output_dir / SUMMARY_FILENAME, normalize_episode_summary_row)
+    processed_files = state_load_processed_files(output_dir / RESUME_STATE_FILENAME)
+    requires_tier1 = any(
+        classify_episode_processing_state(
+            audio_path,
+            output_dir,
+            processed_files,
+            existing_summary_rows,
+            effective_runtime_config,
+        )["state"]
+        == "needs_tier1"
+        for audio_path in audio_files
+    )
+
+    if requires_tier1 and not args.hf_token:
         raise RuntimeError(
             "A Hugging Face token is required for pyannote diarization. "
             "Set HF_TOKEN or pass --hf-token."
@@ -2690,4 +3808,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

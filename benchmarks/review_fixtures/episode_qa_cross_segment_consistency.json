@@ -1,0 +1,81 @@
+{
+  "name": "episode_qa_cross_segment_consistency",
+  "focus_stage": "episode_qa_review",
+  "description": "Cross-segment context should resolve the second segment to ChromaDB for consistency.",
+  "cleaned_payload": {
+    "schema_version": 2,
+    "pipeline": "podcast-host-transcription-pipeline",
+    "source_file": "Episode QA 20260605.mp3",
+    "metadata": {
+      "source_file": "Episode QA 20260605.mp3",
+      "source_filename": "Episode QA 20260605.mp3",
+      "episode_date": "2026-06-05",
+      "episode_date_compact": "20260605",
+      "episode_year": 2026,
+      "episode_month": 6,
+      "episode_day": 5,
+      "episode_sort_key": 20260605
+    },
+    "episode_date": "2026-06-05",
+    "episode_date_compact": "20260605",
+    "episode_sort_key": 20260605,
+    "transcription": {
+      "duration": 30.0
+    },
+    "host_detected": true,
+    "host_original_speaker_id": "SPEAKER_00",
+    "speaker_mapping": {
+      "SPEAKER_00": "HOST"
+    },
+    "known_speaker_assignments": {},
+    "speaker_durations_seconds": {
+      "SPEAKER_00": 30.0
+    },
+    "diarization_turns": [],
+    "segments": [
+      {
+        "id": 1,
+        "start": 0.0,
+        "end": 4.0,
+        "speaker": "HOST",
+        "text": "This episode focuses on ChromaDB migration steps.",
+        "avg_logprob": -0.1,
+        "no_speech_prob": 0.01,
+        "episode_date": "2026-06-05",
+        "episode_sort_key": 20260605,
+        "transcription_confidence": {
+          "quality": "high",
+          "avg_logprob": -0.1,
+          "no_speech_prob": 0.01,
+          "warnings": []
+        },
+        "words": []
+      },
+      {
+        "id": 2,
+        "start": 4.0,
+        "end": 9.0,
+        "speaker": "HOST",
+        "text": "Later on I shorten that to chroma db once or twice.",
+        "avg_logprob": -0.1,
+        "no_speech_prob": 0.01,
+        "episode_date": "2026-06-05",
+        "episode_sort_key": 20260605,
+        "transcription_confidence": {
+          "quality": "high",
+          "avg_logprob": -0.1,
+          "no_speech_prob": 0.01,
+          "warnings": []
+        },
+        "words": []
+      }
+    ]
+  },
+  "expected": {
+    "changed_segment_ids": [2],
+    "text_by_id": {
+      "2": "Later on I shorten that to ChromaDB once or twice."
+    },
+    "speaker_by_id": {}
+  }
+}

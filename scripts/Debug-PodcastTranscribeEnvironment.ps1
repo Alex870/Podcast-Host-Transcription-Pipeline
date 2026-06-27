@@ -239,6 +239,16 @@ $FilenameDateConfig = if ($Config.filename_date) { $Config.filename_date } else 
 $FilenameDatePreset = if ($FilenameDateConfig -and $FilenameDateConfig.preset) { [string]$FilenameDateConfig.preset } else { "strict_iso" }
 $FilenameDatePosition = if ($FilenameDateConfig -and $FilenameDateConfig.position) { [string]$FilenameDateConfig.position } else { "last" }
 $FilenameDateFormats = if ($FilenameDateConfig -and $FilenameDateConfig.formats) { @($FilenameDateConfig.formats) } else { @() }
+$RuntimeProfile = if ($Config.runtime_profile) { [string]$Config.runtime_profile } else { "baseline_16gb" }
+$ReviewBackend = if ($Config.backend) { [string]$Config.backend } else { "none" }
+$ReviewBaseUrl = if ($Config.review_base_url) { [string]$Config.review_base_url } else { "" }
+$ReviewModelName = if ($Config.review_model_name) { [string]$Config.review_model_name } else { "" }
+$ReviewDebug = if ($null -ne $Config.review_debug) { [bool]$Config.review_debug } else { $false }
+$ReviewDebugDir = if ($Config.review_debug_dir) { [string](Resolve-ConfigPathValue $Config.review_debug_dir) } else { "" }
+$TranscriptCleanupReview = if ($null -ne $Config.transcript_cleanup_review) { [bool]$Config.transcript_cleanup_review } else { $false }
+$GlossaryCorrectionReview = if ($null -ne $Config.glossary_correction_review) { [bool]$Config.glossary_correction_review } else { $false }
+$SpeakerConsistencyReview = if ($null -ne $Config.speaker_consistency_review) { [bool]$Config.speaker_consistency_review } else { $false }
+$EpisodeQaReview = if ($null -ne $Config.episode_qa_review) { [bool]$Config.episode_qa_review } else { $false }
 $Device = if ($Config.device) { [string]$Config.device } else { "auto" }
 $Model = if ($Config.model) { [string]$Config.model } else { "large-v3" }
 $TokenResolution = Resolve-HfToken -ConfigObject $Config -EnvFilePath $EnvPath -ConfigFilePath $ConfigPath
@@ -276,6 +286,29 @@ if ($FilenameDateFormats.Count -gt 0) {
 Write-CheckResult "Host profile path" $true $HostProfileJson
 Write-CheckResult "Configured device" $true $Device
 Write-CheckResult "Configured model" $true $Model
+Write-CheckResult "Runtime profile" $true $RuntimeProfile
+Write-CheckResult "Review backend" $true $ReviewBackend
+Write-CheckResult "Review debug" $true $ReviewDebug
+Write-CheckResult "Review debug directory" $true $(if ($ReviewDebugDir) { $ReviewDebugDir } else { "Default: <output>\\_processing_artifacts\\<episode>\\review_debug" })
+Write-CheckResult "Transcript cleanup review" $true $TranscriptCleanupReview
+Write-CheckResult "Glossary correction review" $true $GlossaryCorrectionReview
+Write-CheckResult "Speaker consistency review" $true $SpeakerConsistencyReview
+Write-CheckResult "Episode QA review" $true $EpisodeQaReview
+
+if ($ReviewBackend -ne "none" -and ($TranscriptCleanupReview -or $GlossaryCorrectionReview -or $SpeakerConsistencyReview -or $EpisodeQaReview)) {
+    $reviewBackendConfigured = -not [string]::IsNullOrWhiteSpace($ReviewBaseUrl) -and -not [string]::IsNullOrWhiteSpace($ReviewModelName)
+    Write-CheckResult "Review backend base URL" $reviewBackendConfigured $(if ($ReviewBaseUrl) { $ReviewBaseUrl } else { "Not configured." })
+    Write-CheckResult "Review model name" $reviewBackendConfigured $(if ($ReviewModelName) { $ReviewModelName } else { "Not configured." })
+    if ($reviewBackendConfigured) {
+        try {
+            $modelsUri = $ReviewBaseUrl.TrimEnd("/") + "/v1/models"
+            $null = Invoke-RestMethod -Uri $modelsUri -Method Get -TimeoutSec 10
+            Write-CheckResult "Review backend reachability" $true $modelsUri
+        } catch {
+            Write-CheckResult "Review backend reachability" $false $_.Exception.Message
+        }
+    }
+}
 
 Write-Section "Token Resolution"
 foreach ($attempt in $TokenResolution.Attempts) {
