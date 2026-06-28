@@ -124,7 +124,9 @@ from podcast_transcribe.outputs import (
     write_batch_report_md as output_write_batch_report_md,
     write_json_output as output_write_json_output,
     write_output_manifest as output_write_output_manifest,
+    write_review_run_report as output_write_review_run_report,
     write_review_csv as output_write_review_csv,
+    write_speaker_workflow_report as output_write_speaker_workflow_report,
     write_speaker_identity_review_csv as output_write_speaker_identity_review_csv,
     write_text_transcript as output_write_text_transcript,
 )
@@ -1862,6 +1864,18 @@ def build_episode_summary_row(
         "glossary_review_corrected_count": 0,
         "speaker_consistency_review_corrected_count": 0,
         "episode_qa_review_corrected_count": 0,
+        "review_material_change": False,
+        "review_unique_stage_count": 0,
+        "review_noop_stage_count": 0,
+        "review_returned_change_count": 0,
+        "review_applied_change_count": 0,
+        "review_overridden_change_count": 0,
+        "episode_qa_added_value": False,
+        "preferred_term_intervention_count": 0,
+        "review_guard_intervention_count": 0,
+        "speaker_drift_flag": False,
+        "recurring_unnamed_speaker_flag": False,
+        "host_profile_stability_flag": False,
         "processing_mode": "",
         "tier1_reused_from_existing": False,
         "review_backfilled_from_cleaned_json": False,
@@ -1928,6 +1942,18 @@ def write_episode_summary_csv(path: Path, rows: List[Dict[str, object]]):
         "glossary_review_corrected_count",
         "speaker_consistency_review_corrected_count",
         "episode_qa_review_corrected_count",
+        "review_material_change",
+        "review_unique_stage_count",
+        "review_noop_stage_count",
+        "review_returned_change_count",
+        "review_applied_change_count",
+        "review_overridden_change_count",
+        "episode_qa_added_value",
+        "preferred_term_intervention_count",
+        "review_guard_intervention_count",
+        "speaker_drift_flag",
+        "recurring_unnamed_speaker_flag",
+        "host_profile_stability_flag",
         "processing_mode",
         "tier1_reused_from_existing",
         "review_backfilled_from_cleaned_json",
@@ -2006,6 +2032,13 @@ def normalize_episode_summary_row(row: Dict[str, object]) -> Dict[str, object]:
         "glossary_review_corrected_count",
         "speaker_consistency_review_corrected_count",
         "episode_qa_review_corrected_count",
+        "review_unique_stage_count",
+        "review_noop_stage_count",
+        "review_returned_change_count",
+        "review_applied_change_count",
+        "review_overridden_change_count",
+        "preferred_term_intervention_count",
+        "review_guard_intervention_count",
     }
     bool_fields = {
         "host_detected",
@@ -2013,6 +2046,11 @@ def normalize_episode_summary_row(row: Dict[str, object]) -> Dict[str, object]:
         "diarization_artifact_reused",
         "review_attempted",
         "reviewed_output_written",
+        "review_material_change",
+        "episode_qa_added_value",
+        "speaker_drift_flag",
+        "recurring_unnamed_speaker_flag",
+        "host_profile_stability_flag",
         "tier1_reused_from_existing",
         "review_backfilled_from_cleaned_json",
     }
@@ -2039,6 +2077,8 @@ def normalize_episode_summary_row(row: Dict[str, object]) -> Dict[str, object]:
 def apply_review_metadata_to_summary(summary_row: Dict[str, object], review_result: Dict[str, object]):
     review_metadata = review_result["metadata"]
     stage_results = review_metadata.get("review_stage_results") if isinstance(review_metadata.get("review_stage_results"), dict) else {}
+    change_summary = review_metadata.get("review_change_summary") if isinstance(review_metadata.get("review_change_summary"), dict) else {}
+    guard_interventions = review_metadata.get("review_guard_interventions") if isinstance(review_metadata.get("review_guard_interventions"), dict) else {}
     summary_row["review_attempted"] = bool(review_result["attempted"])
     summary_row["review_status"] = str(review_metadata.get("review_status") or "")
     summary_row["review_skip_reason"] = str(review_metadata.get("review_skip_reason") or "")
@@ -2076,6 +2116,37 @@ def apply_review_metadata_to_summary(summary_row: Dict[str, object], review_resu
     summary_row["episode_qa_review_corrected_count"] = int(
         ((stage_results.get("episode_qa_review") or {}).get("corrected_segment_count")) or 0
     )
+    summary_row["review_material_change"] = bool(change_summary.get("material_change"))
+    summary_row["review_unique_stage_count"] = int(change_summary.get("unique_stage_count") or 0)
+    summary_row["review_noop_stage_count"] = int(change_summary.get("no_op_stage_count") or 0)
+    summary_row["review_returned_change_count"] = int(change_summary.get("returned_change_count") or 0)
+    summary_row["review_applied_change_count"] = int(change_summary.get("applied_change_count") or 0)
+    summary_row["review_overridden_change_count"] = int(change_summary.get("overridden_change_count") or 0)
+    summary_row["episode_qa_added_value"] = bool(change_summary.get("episode_qa_added_value"))
+    summary_row["preferred_term_intervention_count"] = int(change_summary.get("protected_term_intervention_count") or 0)
+    summary_row["review_guard_intervention_count"] = int(guard_interventions.get("protected_term_preservations") or 0)
+
+
+def apply_speaker_risk_flags_to_summary(
+    summary_row: Dict[str, object],
+    speaker_mapping: Optional[Dict[str, str]] = None,
+):
+    labels = [str(label or "").strip() for label in (speaker_mapping or {}).values()]
+    recurring_unnamed = any(label.upper().startswith("SPEAKER_") for label in labels)
+    host_stability = (
+        not bool(summary_row.get("host_detected"))
+        or coerce_int(summary_row.get("host_match_near_threshold_count"), 0) > 0
+        or coerce_int(summary_row.get("host_match_ambiguous_count"), 0) > 0
+        or coerce_int(summary_row.get("host_low_coverage_count"), 0) > 0
+        or coerce_float(summary_row.get("top_host_similarity"), 1.0) < 0.6
+        or (
+            summary_row.get("host_similarity_margin") not in ("", None)
+            and coerce_float(summary_row.get("host_similarity_margin"), 1.0) < 0.08
+        )
+    )
+    summary_row["speaker_drift_flag"] = coerce_int(summary_row.get("speaker_similarity_drift_count"), 0) > 0
+    summary_row["recurring_unnamed_speaker_flag"] = recurring_unnamed
+    summary_row["host_profile_stability_flag"] = host_stability
 
 
 def checkpoint_path(output_dir: Path, audio_path: Path) -> Path:
@@ -2588,6 +2659,7 @@ def build_review_backfill_summary_row(
     summary_row["transcription_artifact_reused"] = True
     summary_row["diarization_artifact_reused"] = True
     apply_review_metadata_to_summary(summary_row, review_result)
+    apply_speaker_risk_flags_to_summary(summary_row, speaker_mapping)
     summary_row["processing_mode"] = "tier2-only backfill"
     summary_row["tier1_reused_from_existing"] = True
     summary_row["review_backfilled_from_cleaned_json"] = True
@@ -2805,10 +2877,35 @@ def runtime_config_payload(args) -> Dict[str, object]:
     return payload
 
 
+def write_run_reports(output_dir: Path, rows: List[Dict[str, object]], elapsed_seconds: Optional[float] = None):
+    output_write_batch_report_md(
+        output_dir / "_batch_report.md",
+        rows,
+        elapsed_seconds=elapsed_seconds,
+    )
+    output_write_review_run_report(output_dir, rows, elapsed_seconds=elapsed_seconds)
+    output_write_speaker_workflow_report(output_dir, rows)
+
+
+def print_final_review_summary(rows: List[Dict[str, object]]):
+    review_attempted = sum(1 for row in rows if coerce_bool(row.get("review_attempted"), False))
+    material_changes = sum(1 for row in rows if coerce_bool(row.get("review_material_change"), False))
+    unresolved_risk = sum(
+        1
+        for row in rows
+        if coerce_bool(row.get("speaker_drift_flag"), False)
+        or coerce_bool(row.get("recurring_unnamed_speaker_flag"), False)
+        or coerce_bool(row.get("host_profile_stability_flag"), False)
+    )
+    print("Review run summary")
+    print(f"  review attempted: {review_attempted}/{len(rows)}")
+    print(f"  episodes with material review changes: {material_changes}")
+    print(f"  unresolved speaker-risk episodes: {unresolved_risk}")
+
+
 def correction_path_for_audio(corrections_dir: Optional[str], audio_path: Path) -> Optional[Path]:
-    if not corrections_dir:
-        return None
-    path = Path(corrections_dir) / f"{audio_path.stem}_corrections.csv"
+    base_dir = Path(corrections_dir) if corrections_dir else Path("corrections")
+    path = base_dir / f"{audio_path.stem}_corrections.csv"
     return path if path.exists() else None
 
 
@@ -3200,6 +3297,7 @@ def process_file(
     warnings_for_language = language_model_warnings(info_payload, language)
     summary_row["language_model_warnings"] = "; ".join(warnings_for_language)
     apply_review_metadata_to_summary(summary_row, review_result)
+    apply_speaker_risk_flags_to_summary(summary_row, speaker_mapping)
     summary_row["processing_mode"] = "tier1+tier2" if resolve_review_runtime_config(runtime_config or {}).get("any_review_enabled") else "tier1-only"
     summary_row["tier1_reused_from_existing"] = False
     summary_row["review_backfilled_from_cleaned_json"] = False
@@ -3291,6 +3389,9 @@ def run_review_benchmark_mode(args, output_dir: Path):
     print(f"  model: {report['backend_identity']['review_model_name']}")
     print(f"  average quality score: {report['quality']['average_fixture_quality_score']}")
     print(f"  average elapsed seconds: {report['speed']['average_elapsed_seconds']}")
+    print(f"  quality per second: {report['derived_scores']['quality_per_second']}")
+    print(f"  recommended for fast default: {report['production_recommendations']['recommended_for_fast_default']}")
+    print(f"  recommended for long context qa: {report['production_recommendations']['recommended_for_long_context_qa']}")
     print(f"  report json: {json_path}")
     print(f"  report markdown: {md_path}")
 
@@ -3526,11 +3627,12 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
         processed_audio_seconds += duration_seconds or 0.0
 
     existing_summary_rows = state_load_episode_summary_rows(summary_path, normalize_episode_summary_row)
-    output_write_batch_report_md(
-        output_dir / "_batch_report.md",
+    write_run_reports(
+        output_dir,
         list(existing_summary_rows.values()),
         elapsed_seconds=time.perf_counter() - batch_started,
     )
+    print_final_review_summary(list(existing_summary_rows.values()))
     print(f"Wrote folder summary: {summary_path}")
 
 
@@ -3738,11 +3840,12 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
     write_episode_summary_csv(summary_path, list(episode_summary_rows_by_name.values()))
     state_save_processed_files(resume_state_path, processed_files)
     save_review_calibration_session(output_dir, review_calibration_session)
-    output_write_batch_report_md(
-        output_dir / "_batch_report.md",
+    write_run_reports(
+        output_dir,
         list(episode_summary_rows_by_name.values()),
         elapsed_seconds=time.perf_counter() - batch_started,
     )
+    print_final_review_summary(list(episode_summary_rows_by_name.values()))
     print(f"Wrote folder summary: {summary_path}")
 
 

@@ -15,7 +15,9 @@ from podcast_transcribe.outputs import (
     write_batch_report_md,
     write_json_output,
     write_output_manifest,
+    write_review_run_report,
     write_speaker_identity_review_csv,
+    write_speaker_workflow_report,
     write_text_transcript,
 )
 
@@ -433,6 +435,14 @@ class OutputTests(unittest.TestCase):
                         "glossary_review_corrected_count": 0,
                         "speaker_consistency_review_corrected_count": 0,
                         "episode_qa_review_corrected_count": 0,
+                        "review_material_change": True,
+                        "episode_qa_added_value": False,
+                        "preferred_term_intervention_count": 1,
+                        "speaker_drift_flag": True,
+                        "recurring_unnamed_speaker_flag": True,
+                        "host_profile_stability_flag": False,
+                        "review_applied_change_count": 1,
+                        "review_unique_stage_count": 1,
                     }
                 ],
                 elapsed_seconds=90,
@@ -444,6 +454,51 @@ class OutputTests(unittest.TestCase):
             self.assertIn("episode.mp3", text)
             self.assertIn("Review attempted: 1/1", text)
             self.assertIn("Cleanup-review corrections: 1", text)
+            self.assertIn("Episodes with material review changes: 1", text)
+            self.assertIn("Highest Unresolved Risk Episodes", text)
+
+    def test_review_and_speaker_reports_are_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            rows = [
+                {
+                    "episode": "episode.mp3",
+                    "review_attempted": True,
+                    "reviewed_output_written": True,
+                    "review_material_change": True,
+                    "episode_qa_added_value": True,
+                    "preferred_term_intervention_count": 1,
+                    "speaker_drift_flag": True,
+                    "recurring_unnamed_speaker_flag": True,
+                    "host_profile_stability_flag": True,
+                    "review_priority_score": 12.5,
+                    "review_applied_change_count": 2,
+                    "review_unique_stage_count": 2,
+                    "cleanup_review_corrected_count": 1,
+                    "glossary_review_corrected_count": 1,
+                    "speaker_consistency_review_corrected_count": 0,
+                    "episode_qa_review_corrected_count": 1,
+                    "review_completed_stages": "transcript_cleanup_review;glossary_correction_review;episode_qa_review",
+                    "host_label": "SPEAKER_02",
+                    "top_host_similarity": 0.44,
+                    "host_similarity_margin": 0.03,
+                    "review_priority_reason": "host drift",
+                    "host_share_of_speech": 0.31,
+                    "host_duration_seconds": 820.0,
+                }
+            ]
+
+            review_paths = write_review_run_report(output_dir, rows, elapsed_seconds=12.0)
+            speaker_paths = write_speaker_workflow_report(output_dir, rows)
+
+            self.assertTrue(review_paths["json"].exists())
+            self.assertTrue(review_paths["md"].exists())
+            self.assertTrue(speaker_paths["json"].exists())
+            self.assertTrue(speaker_paths["md"].exists())
+            review_payload = json.loads(review_paths["json"].read_text(encoding="utf-8"))
+            speaker_payload = json.loads(speaker_paths["json"].read_text(encoding="utf-8"))
+            self.assertEqual(review_payload["material_change_count"], 1)
+            self.assertEqual(len(speaker_payload["recurring_unnamed_speaker_candidates"]), 1)
 
 
 if __name__ == "__main__":

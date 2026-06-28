@@ -34,7 +34,7 @@ Persistent host voice profile updated over time to improve host matching across 
 ### `corrections_dir`
 
 - Type: `string`
-- Default: `""`
+- Default: `""` in config, with launcher/workbench fallback to `corrections`
 - Affects: cleanup/output generation
 
 Optional directory containing manual correction CSVs named like `<audio_stem>_corrections.csv`.

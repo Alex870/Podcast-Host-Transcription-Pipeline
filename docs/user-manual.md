@@ -16,6 +16,7 @@ The menu options are:
 2. `Run transcription pipeline`
 3. `Migrate settings and state from a legacy directory`
 4. `Run review benchmark`
+5. `Launch transcript review workbench`
 
 ## Normal Transcription Workflow
 
@@ -78,6 +79,39 @@ It can migrate:
 - pretrained speaker model directories
 - corrections directory contents
 - prior output directory contents
+
+## Transcript Review Workbench
+
+Option `5` launches the local browser workbench.
+
+The workbench is meant for already-processed episodes. It reads cleaned and reviewed transcript bundles from the output directory and presents:
+
+- cleaned transcript text
+- reviewed transcript differences when present
+- summary/provenance data
+- deterministic QA signals
+- optional semantic issue findings from the configured review backend
+
+The launcher now tries to keep the frontend bundle current automatically:
+
+- if frontend dependencies are missing, it runs `npm install`
+- if the built bundle is missing or older than the tracked frontend source/config files, it runs `npm run build`
+- it then serves the built frontend from the backend, rather than switching normal operator use into a Vite dev server
+
+Node.js/npm still needs to be installed on the machine for that automatic setup to work.
+
+The first run asks for:
+
+- the project root
+- the processed output folder
+
+Approved write-back actions in v1 are intentionally narrow:
+
+- episode text corrections -> correction CSVs
+- preferred glossary additions -> `preferred_terms.txt`
+- alias/replacement updates -> `preferred_replacements.json`
+
+The workbench writes semantic scan cache files under `_workbench/` and audit entries under `.workbench/`.
 - configured source directory contents when that source directory lives inside the legacy repo
 
 Important migration behavior:

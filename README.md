@@ -8,6 +8,7 @@ It is built for shows where speaker identity matters, especially when you want s
 - recurring speaker labeling from known samples
 - deterministic cleanup and glossary normalization
 - additive local-LLM review for stronger machines
+- a local browser review workbench for processed transcript inspection and operator write-back
 - outputs shaped for the rest of the podcast toolchain
 
 The shared transcript, processed-cache, Chroma metadata, and `podcast.json` expectations across the podcast stack are documented in [`docs/podcast_pipeline_contract.md`](docs/podcast_pipeline_contract.md).
@@ -22,7 +23,9 @@ Basic podcast transcribers usually stop at "faithfully capture the words." That 
 - `scripts/Convert-AudioToDiarizedText.ps1`: main PowerShell runner
 - `scripts/Debug-PodcastTranscribeEnvironment.ps1`: environment validation
 - `scripts/Migrate-LegacyPodcastTranscribeState.ps1`: migrate config, state, and outputs from an older working directory
+- `scripts/Launch-PodcastTranscribeWorkbench.ps1`: local transcript review workbench launcher
 - `src/podcast_transcribe/`: Python package for the pipeline
+- `workbench-ui/`: React + Vite frontend for the transcript review workbench
 - `examples/`: example config, glossary, and replacement files
 - `docs/`: Quick Start, user docs, config reference, architecture, and contract docs
 - `benchmarks/review_fixtures/`: checked-in cleaned-transcript fixtures for review benchmarking
@@ -41,8 +44,10 @@ Current bootstrap options:
 2. Run the transcription pipeline
 3. Migrate settings and state from a legacy directory
 4. Run review benchmark
+5. Launch transcript review workbench
 
 All PowerShell entrypoints pause at the end so the console window stays open long enough to read the result.
+Option `5` will also install workbench frontend dependencies and rebuild the bundled UI automatically when needed.
 
 ## Outputs
 
@@ -54,7 +59,7 @@ Per episode, the pipeline can emit:
 - optional reviewed files: `*_reviewed_speaker_transcript.txt`, `*_reviewed_host_only.txt`, `*_reviewed_speaker_transcript.json`
 - provenance and reporting: `*_manifest.json`
 
-Batch-level outputs include `_episode_review_summary.csv` and `_batch_report.md`.
+Batch-level outputs include `_episode_review_summary.csv`, `_batch_report.md`, `_review_run_report.*`, and `_speaker_workflow_report.*`.
 
 ## Getting Started
 
@@ -82,6 +87,7 @@ Engineering/supporting docs:
 - [`docs/architecture.md`](docs/architecture.md)
 - [`docs/podcast_pipeline_contract.md`](docs/podcast_pipeline_contract.md)
 - [`roadmap.md`](roadmap.md)
+- [`docs/workbench-implementation-plan.md`](docs/workbench-implementation-plan.md)
 
 ## High-Level Workflow
 

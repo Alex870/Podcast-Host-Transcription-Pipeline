@@ -16,6 +16,8 @@ _episode_review_summary.csv
 _batch_report.md
 _processing_checkpoints/
 _processing_artifacts/
+_workbench/
+.workbench/
 
 *_speaker_transcript.txt
 *_speaker_transcript.json
@@ -23,3 +25,6 @@ _processing_artifacts/
 *_speaker_identity_review.csv
 *_manifest.json
 *_review.csv
+
+workbench-ui/node_modules/
+workbench-ui/dist/

@@ -1020,15 +1020,19 @@ def _collect_window_updates(
     calibration_session: Optional[ReviewCalibrationSession] = None,
     progress_callback: Optional[ReviewProgressCallback] = None,
     debug_context: Optional[Dict[str, object]] = None,
-) -> Tuple[Dict[str, Dict[str, object]], List[str]]:
+) -> Tuple[Dict[str, Dict[str, object]], List[str], Dict[str, int]]:
     candidates_by_id: Dict[str, List[Dict[str, object]]] = {}
     notes: List[str] = []
     family_name = _review_stage_family(stage_definition["name"])
+    split_event_count = 0
+    conflicting_update_count = 0
+    returned_item_count = 0
 
     def collect_with_backoff(
         window: List[SegmentItem],
         window_context: Dict[str, object],
     ) -> Tuple[List[Dict[str, object]], List[str], bool]:
+        nonlocal split_event_count
         try:
             payload = _execute_stage_backend_request(
                 window,
@@ -1052,6 +1056,7 @@ def _collect_window_updates(
                 midpoint = max(1, len(window) // 2)
                 left = window[:midpoint]
                 right = window[midpoint:]
+                split_event_count += 1
                 split_notes = [
                     (
                         f"{stage_definition['name']} window {window_context.get('window_index')}/"
@@ -1135,6 +1140,7 @@ def _collect_window_updates(
         for note in window_notes:
             notes.append(str(note))
         for item in reviewed_items:
+            returned_item_count += 1
             candidates_by_id.setdefault(str(item["id"]), []).append(item)
 
     resolved_updates: Dict[str, Dict[str, object]] = {}
@@ -1149,10 +1155,16 @@ def _collect_window_updates(
         if len(unique_signatures) == 1:
             resolved_updates[segment_id] = candidates[0]
         else:
+            conflicting_update_count += 1
             notes.append(
                 f"Conflicting {stage_definition['name']} updates were ignored for segment {segment_id} during chunk reconciliation."
             )
-    return resolved_updates, notes
+    return resolved_updates, notes, {
+        "window_count": len(windows),
+        "split_event_count": split_event_count,
+        "conflicting_update_count": conflicting_update_count,
+        "returned_item_count": returned_item_count,
+    }
 
 
 def _apply_stage_updates(
@@ -1160,11 +1172,14 @@ def _apply_stage_updates(
     updates_by_id: Dict[str, Dict[str, object]],
     stage_definition: Dict[str, object],
     preferred_terms: Optional[List[str]] = None,
-) -> Tuple[List[SegmentItem], int, List[str], int]:
+) -> Tuple[List[SegmentItem], Dict[str, int], List[str]]:
     corrected_segment_count = 0
     updated_segments: List[SegmentItem] = []
     stage_notes: List[str] = []
     protected_term_violation_count = 0
+    returned_change_count = 0
+    applied_change_count = 0
+    overridden_change_count = 0
     allow_text_edits = True
     allow_speaker_edits = stage_definition["name"] in {"speaker_consistency_review", "episode_qa_review"}
     protected_terms = [str(term).strip() for term in (preferred_terms or []) if str(term).strip()]
@@ -1172,6 +1187,17 @@ def _apply_stage_updates(
     for segment in segments:
         reviewed = deepcopy(segment)
         update = updates_by_id.get(str(segment.id), {})
+        intended_change = False
+        if allow_text_edits and "text" in update:
+            intended_text = str(update.get("text") or segment.text).strip() or segment.text
+            if intended_text != segment.text:
+                intended_change = True
+        if allow_speaker_edits and "speaker" in update:
+            intended_speaker = str(update.get("speaker") or segment.speaker or "").strip()
+            if intended_speaker and intended_speaker != segment.speaker:
+                intended_change = True
+        if intended_change:
+            returned_change_count += 1
         changed = False
         if allow_text_edits:
             reviewed_text = str(update.get("text") or segment.text).strip() or segment.text
@@ -1198,8 +1224,17 @@ def _apply_stage_updates(
                 changed = True
         if changed:
             corrected_segment_count += 1
+            applied_change_count += 1
+        elif intended_change:
+            overridden_change_count += 1
         updated_segments.append(reviewed)
-    return updated_segments, corrected_segment_count, stage_notes, protected_term_violation_count
+    return updated_segments, {
+        "corrected_segment_count": corrected_segment_count,
+        "returned_change_count": returned_change_count,
+        "applied_change_count": applied_change_count,
+        "overridden_change_count": overridden_change_count,
+        "protected_term_violation_count": protected_term_violation_count,
+    }, stage_notes
 
 
 def _disabled_stage_result(stage_definition: Dict[str, object]) -> Dict[str, object]:
@@ -1209,6 +1244,14 @@ def _disabled_stage_result(stage_definition: Dict[str, object]) -> Dict[str, obj
         "skip_reason": "",
         "corrected_segment_count": 0,
         "protected_term_violation_count": 0,
+        "returned_change_count": 0,
+        "applied_change_count": 0,
+        "overridden_change_count": 0,
+        "window_count": 0,
+        "split_event_count": 0,
+        "conflicting_update_count": 0,
+        "budget_used": 0,
+        "mode": "disabled",
         "edit_scope": stage_definition["edit_scope"],
     }
 
@@ -1220,6 +1263,14 @@ def _skipped_stage_result(stage_definition: Dict[str, object], reason: str, atte
         "skip_reason": reason,
         "corrected_segment_count": 0,
         "protected_term_violation_count": 0,
+        "returned_change_count": 0,
+        "applied_change_count": 0,
+        "overridden_change_count": 0,
+        "window_count": 0,
+        "split_event_count": 0,
+        "conflicting_update_count": 0,
+        "budget_used": 0,
+        "mode": "skipped",
         "edit_scope": stage_definition["edit_scope"],
     }
 
@@ -1234,6 +1285,12 @@ def _run_review_stage(
     debug_context: Optional[Dict[str, object]] = None,
 ) -> Tuple[List[SegmentItem], Dict[str, object], List[str], str]:
     stage_started = time.perf_counter()
+    family_name = _review_stage_family(stage_definition["name"])
+    stage_budget = (
+        calibration_session.budget_for_stage(stage_definition["name"])
+        if calibration_session
+        else _family_default_budget(backend_capabilities, family_name)
+    )
     if progress_callback:
         progress_callback(
             {
@@ -1271,9 +1328,7 @@ def _run_review_stage(
                 "skipped",
             )
         budget = (
-            calibration_session.budget_for_stage(stage_definition["name"])
-            if calibration_session
-            else max(4096, int(backend_capabilities.get("max_context_budget") or 0) - 2048)
+            stage_budget
         )
         full_episode_cost = sum(_estimated_segment_tokens(segment) for segment in segments)
         if full_episode_cost <= budget:
@@ -1303,7 +1358,7 @@ def _run_review_stage(
                             "had_split": False,
                         }
                     )
-                updated_segments, corrected_segment_count, guard_notes, protected_term_violation_count = _apply_stage_updates(
+                updated_segments, change_stats, guard_notes = _apply_stage_updates(
                     segments,
                     updates_by_id,
                     stage_definition,
@@ -1315,9 +1370,17 @@ def _run_review_stage(
                         "attempted": True,
                         "status": "completed",
                         "skip_reason": "",
-                        "corrected_segment_count": int(payload.get("corrected_segment_count") or corrected_segment_count),
+                        "corrected_segment_count": int(payload.get("corrected_segment_count") or change_stats["corrected_segment_count"]),
                         "edit_scope": stage_definition["edit_scope"],
-                        "protected_term_violation_count": protected_term_violation_count,
+                        "protected_term_violation_count": change_stats["protected_term_violation_count"],
+                        "returned_change_count": change_stats["returned_change_count"],
+                        "applied_change_count": change_stats["applied_change_count"],
+                        "overridden_change_count": change_stats["overridden_change_count"],
+                        "window_count": 1,
+                        "split_event_count": 0,
+                        "conflicting_update_count": 0,
+                        "budget_used": budget,
+                        "mode": "full_episode",
                     },
                     _normalize_episode_notes(payload) + guard_notes,
                     "full_episode",
@@ -1339,13 +1402,13 @@ def _run_review_stage(
                     raise
                 if calibration_session:
                     calibration_session.note_truncation(
-                        _review_stage_family(stage_definition["name"]),
+                        family_name,
                         full_episode_cost,
                         progress_callback=progress_callback,
                     )
 
         windows = _split_segments_by_token_budget(segments, budget, overlap_segments=EPISODE_QA_OVERLAP_SEGMENTS)
-        updates_by_id, notes = _collect_window_updates(
+        updates_by_id, notes, window_stats = _collect_window_updates(
             windows,
             backend_capabilities,
             stage_definition,
@@ -1355,7 +1418,7 @@ def _run_review_stage(
             progress_callback=progress_callback,
             debug_context=debug_context,
         )
-        updated_segments, corrected_segment_count, guard_notes, protected_term_violation_count = _apply_stage_updates(
+        updated_segments, change_stats, guard_notes = _apply_stage_updates(
             segments,
             updates_by_id,
             stage_definition,
@@ -1367,9 +1430,17 @@ def _run_review_stage(
                 "attempted": True,
                 "status": "completed",
                 "skip_reason": "",
-                "corrected_segment_count": corrected_segment_count,
+                "corrected_segment_count": change_stats["corrected_segment_count"],
                 "edit_scope": stage_definition["edit_scope"],
-                "protected_term_violation_count": protected_term_violation_count,
+                "protected_term_violation_count": change_stats["protected_term_violation_count"],
+                "returned_change_count": change_stats["returned_change_count"],
+                "applied_change_count": change_stats["applied_change_count"],
+                "overridden_change_count": change_stats["overridden_change_count"],
+                "window_count": window_stats["window_count"],
+                "split_event_count": window_stats["split_event_count"],
+                "conflicting_update_count": window_stats["conflicting_update_count"],
+                "budget_used": budget,
+                "mode": "chunked",
             },
             notes + guard_notes,
             "chunked",
@@ -1387,13 +1458,9 @@ def _run_review_stage(
             )
         return result
 
-    local_budget = (
-        calibration_session.budget_for_stage(stage_definition["name"])
-        if calibration_session
-        else min(LOCAL_REVIEW_CONTEXT_LIMIT, max(2048, int(backend_capabilities.get("max_context_budget") or 0) - 1024))
-    )
+    local_budget = stage_budget
     windows = _split_segments_by_token_budget(segments, local_budget, overlap_segments=0)
-    updates_by_id, notes = _collect_window_updates(
+    updates_by_id, notes, window_stats = _collect_window_updates(
         windows,
         backend_capabilities,
         stage_definition,
@@ -1403,7 +1470,7 @@ def _run_review_stage(
         progress_callback=progress_callback,
         debug_context=debug_context,
     )
-    updated_segments, corrected_segment_count, guard_notes, protected_term_violation_count = _apply_stage_updates(
+    updated_segments, change_stats, guard_notes = _apply_stage_updates(
         segments,
         updates_by_id,
         stage_definition,
@@ -1415,9 +1482,17 @@ def _run_review_stage(
             "attempted": True,
             "status": "completed",
             "skip_reason": "",
-            "corrected_segment_count": corrected_segment_count,
+            "corrected_segment_count": change_stats["corrected_segment_count"],
             "edit_scope": stage_definition["edit_scope"],
-            "protected_term_violation_count": protected_term_violation_count,
+            "protected_term_violation_count": change_stats["protected_term_violation_count"],
+            "returned_change_count": change_stats["returned_change_count"],
+            "applied_change_count": change_stats["applied_change_count"],
+            "overridden_change_count": change_stats["overridden_change_count"],
+            "window_count": window_stats["window_count"],
+            "split_event_count": window_stats["split_event_count"],
+            "conflicting_update_count": window_stats["conflicting_update_count"],
+            "budget_used": local_budget,
+            "mode": "local_batch",
         },
         notes + guard_notes,
         "local_batch",
@@ -1452,6 +1527,76 @@ def _prepare_review_segments(
         reviewed.review_stage_flags = flags
         prepared.append(reviewed)
     return prepared
+
+
+def _build_review_intelligence_summary(
+    stage_results: Dict[str, Dict[str, object]],
+    enabled_stages: List[str],
+) -> Tuple[Dict[str, object], Dict[str, Dict[str, object]], Dict[str, object]]:
+    stage_value: Dict[str, Dict[str, object]] = {}
+    unique_stage_count = 0
+    no_op_stage_count = 0
+    protected_term_intervention_count = 0
+    total_returned_change_count = 0
+    total_applied_change_count = 0
+    total_overridden_change_count = 0
+    for stage_name in enabled_stages:
+        result = stage_results.get(stage_name) or {}
+        corrected_segment_count = int(result.get("corrected_segment_count") or 0)
+        applied_change_count = int(result.get("applied_change_count") or 0)
+        returned_change_count = int(result.get("returned_change_count") or 0)
+        overridden_change_count = int(result.get("overridden_change_count") or 0)
+        intervention_count = int(result.get("protected_term_violation_count") or 0)
+        produced_unique_changes = corrected_segment_count > 0
+        is_no_op = str(result.get("status") or "") == "completed" and corrected_segment_count == 0
+        if produced_unique_changes:
+            unique_stage_count += 1
+        if is_no_op:
+            no_op_stage_count += 1
+        protected_term_intervention_count += intervention_count
+        total_returned_change_count += returned_change_count
+        total_applied_change_count += applied_change_count
+        total_overridden_change_count += overridden_change_count
+        stage_value[stage_name] = {
+            "status": str(result.get("status") or ""),
+            "mode": str(result.get("mode") or ""),
+            "produced_unique_changes": produced_unique_changes,
+            "no_op": is_no_op,
+            "corrected_segment_count": corrected_segment_count,
+            "returned_change_count": returned_change_count,
+            "applied_change_count": applied_change_count,
+            "overridden_change_count": overridden_change_count,
+            "protected_term_intervention_count": intervention_count,
+            "window_count": int(result.get("window_count") or 0),
+            "split_event_count": int(result.get("split_event_count") or 0),
+            "conflicting_update_count": int(result.get("conflicting_update_count") or 0),
+            "budget_used": int(result.get("budget_used") or 0),
+            "edit_scope": str(result.get("edit_scope") or ""),
+            "skip_reason": str(result.get("skip_reason") or ""),
+        }
+
+    change_summary = {
+        "material_change": total_applied_change_count > 0,
+        "enabled_stage_count": len(enabled_stages),
+        "unique_stage_count": unique_stage_count,
+        "no_op_stage_count": no_op_stage_count,
+        "returned_change_count": total_returned_change_count,
+        "applied_change_count": total_applied_change_count,
+        "overridden_change_count": total_overridden_change_count,
+        "protected_term_intervention_count": protected_term_intervention_count,
+        "episode_qa_added_value": bool(
+            (stage_value.get("episode_qa_review") or {}).get("produced_unique_changes")
+        ),
+    }
+    guard_interventions = {
+        "protected_term_preservations": protected_term_intervention_count,
+        "stages_with_interventions": [
+            stage_name
+            for stage_name, value in stage_value.items()
+            if int(value.get("protected_term_intervention_count") or 0) > 0
+        ],
+    }
+    return change_summary, stage_value, guard_interventions
 
 
 def review_segments(
@@ -1489,10 +1634,18 @@ def review_segments(
         "review_calibration": {},
         "preferred_terms": preferred_terms,
         "protected_term_violation_count": 0,
+        "review_change_summary": {},
+        "review_stage_value": {},
+        "review_guard_interventions": {},
     }
 
     if not backend_capabilities["any_review_enabled"]:
         metadata["review_skip_reason"] = "review_disabled"
+        (
+            metadata["review_change_summary"],
+            metadata["review_stage_value"],
+            metadata["review_guard_interventions"],
+        ) = _build_review_intelligence_summary(metadata["review_stage_results"], enabled_stages)
         return {
             "attempted": False,
             "skipped": True,
@@ -1516,6 +1669,11 @@ def review_segments(
                         }
                     )
         metadata["review_skip_reason"] = "backend_unavailable"
+        (
+            metadata["review_change_summary"],
+            metadata["review_stage_value"],
+            metadata["review_guard_interventions"],
+        ) = _build_review_intelligence_summary(metadata["review_stage_results"], enabled_stages)
         return {
             "attempted": False,
             "skipped": True,
@@ -1616,6 +1774,11 @@ def review_segments(
             first_stage = metadata["review_skipped_stages"][0]
             metadata["review_skip_reason"] = metadata["review_stage_results"][first_stage]["skip_reason"]
         metadata["review_calibration"] = calibration_session.metadata_snapshot() if calibration_session else {}
+        (
+            metadata["review_change_summary"],
+            metadata["review_stage_value"],
+            metadata["review_guard_interventions"],
+        ) = _build_review_intelligence_summary(metadata["review_stage_results"], enabled_stages)
         return {
             "attempted": True,
             "skipped": False,
@@ -1630,6 +1793,11 @@ def review_segments(
         metadata["review_skip_reason"] = metadata["review_stage_results"][first_stage]["skip_reason"]
     metadata["episode_notes"] = episode_notes
     metadata["review_calibration"] = calibration_session.metadata_snapshot() if calibration_session else {}
+    (
+        metadata["review_change_summary"],
+        metadata["review_stage_value"],
+        metadata["review_guard_interventions"],
+    ) = _build_review_intelligence_summary(metadata["review_stage_results"], enabled_stages)
     return {
         "attempted": True,
         "skipped": True,

@@ -502,6 +502,102 @@ def _model_verdict(report: Dict[str, object]) -> List[str]:
     return verdicts
 
 
+def _safe_divide(numerator: float, denominator: float) -> float:
+    return 0.0 if denominator <= 0 else numerator / denominator
+
+
+def _derive_stage_usefulness(fixture_results: List[Dict[str, object]]) -> Dict[str, Dict[str, float]]:
+    result: Dict[str, Dict[str, float]] = {}
+    for stage_name in sorted({str(row["focus_stage"]) for row in fixture_results}):
+        stage_rows = [row for row in fixture_results if row["focus_stage"] == stage_name]
+        if not stage_rows:
+            continue
+        result[stage_name] = {
+            "fixture_count": len(stage_rows),
+            "hit_rate": round(
+                sum(1 for row in stage_rows if int(row["quality"]["returned_changed_segment_count"]) > 0)
+                / len(stage_rows),
+                4,
+            ),
+            "average_quality_score": round(
+                mean(float(row["quality"]["fixture_quality_score"]) for row in stage_rows),
+                2,
+            ),
+            "average_patch_compactness": round(
+                mean(float(row["quality"]["patch_compactness"]) for row in stage_rows),
+                4,
+            ),
+        }
+    return result
+
+
+def _derive_scores(
+    speed_metrics: Dict[str, object],
+    stability_metrics: Dict[str, object],
+    quality_metrics: Dict[str, object],
+    fixture_results: List[Dict[str, object]],
+) -> Dict[str, float]:
+    elapsed = float(speed_metrics.get("total_elapsed_seconds") or 0.0)
+    useful_corrections = sum(int(row["quality"]["expected_changed_segment_count"]) for row in fixture_results)
+    quality_per_second = round(
+        _safe_divide(float(quality_metrics.get("average_fixture_quality_score") or 0.0), max(float(speed_metrics.get("average_elapsed_seconds") or 0.0), 0.001)),
+        4,
+    )
+    useful_corrections_per_second = round(_safe_divide(useful_corrections, elapsed), 4)
+    over_edit_penalty = round(
+        _safe_divide(float(quality_metrics.get("over_edit_count") or 0.0), max(len(fixture_results), 1)),
+        4,
+    )
+    preferred_term_safety_rate = round(float(quality_metrics.get("average_glossary_safety") or 0.0), 4)
+    stability_score = round(
+        max(
+            0.0,
+            100.0
+            - float(stability_metrics.get("adaptive_split_count") or 0) * 2.0
+            - float(stability_metrics.get("hard_failure_count") or 0) * 10.0
+            - float(stability_metrics.get("budget_reduction_count") or 0) * 1.5,
+        ),
+        2,
+    )
+    return {
+        "quality_per_second": quality_per_second,
+        "useful_corrections_per_second": useful_corrections_per_second,
+        "over_edit_penalty": over_edit_penalty,
+        "preferred_term_safety_rate": preferred_term_safety_rate,
+        "stability_score": stability_score,
+    }
+
+
+def _production_recommendations(
+    quality_metrics: Dict[str, object],
+    derived_scores: Dict[str, float],
+    usable_capacity: Dict[str, object],
+) -> Dict[str, object]:
+    cleanup_capacity = usable_capacity.get("transcript_cleanup_review") or {}
+    speaker_capacity = usable_capacity.get("speaker_consistency_review") or {}
+    episode_qa_capacity = usable_capacity.get("episode_qa_review") or {}
+    full_episode_supported = bool(episode_qa_capacity.get("full_episode_supported"))
+    return {
+        "recommended_for_fast_default": bool(
+            derived_scores.get("quality_per_second", 0.0) >= 20.0
+            and float(quality_metrics.get("average_fixture_quality_score") or 0.0) >= 80.0
+        ),
+        "recommended_for_quality_pass": bool(
+            float(quality_metrics.get("average_fixture_quality_score") or 0.0) >= 85.0
+            and float(quality_metrics.get("average_glossary_safety") or 0.0) >= 1.0
+        ),
+        "recommended_for_speaker_consistency": bool(
+            float((quality_metrics.get("focus_stage_scores") or {}).get("speaker_consistency_review") or 0.0) >= 80.0
+            and int(speaker_capacity.get("recommended_operating_budget") or 0) >= 1000
+        ),
+        "recommended_for_long_context_qa": bool(
+            full_episode_supported
+            or int(((episode_qa_capacity.get("chunked") or {}).get("recommended_operating_budget") or 0)) >= 4000
+        ),
+        "recommended_cleanup_budget": int(cleanup_capacity.get("recommended_operating_budget") or 0),
+    }
+
+
 def run_review_benchmark(
     runtime_review_config: Dict[str, object],
     output_dir: Path,
@@ -676,6 +772,9 @@ def run_review_benchmark(
         },
     }
     usable_capacity = _capacity_profile(backend_capabilities, fixtures)
+    stage_usefulness = _derive_stage_usefulness(fixture_results)
+    derived_scores = _derive_scores(speed_metrics, stability_metrics, quality_metrics, fixture_results)
+    production_recommendations = _production_recommendations(quality_metrics, derived_scores, usable_capacity)
     return {
         "benchmark_metadata": {
             "fixture_dir": str(fixture_dir or default_fixture_dir()),
@@ -697,6 +796,9 @@ def run_review_benchmark(
         "stability": stability_metrics,
         "quality": quality_metrics,
         "usable_capacity": usable_capacity,
+        "stage_usefulness": stage_usefulness,
+        "derived_scores": derived_scores,
+        "production_recommendations": production_recommendations,
         "fixtures": fixture_results,
         "model_verdict": _model_verdict(
             {
@@ -748,8 +850,21 @@ def write_review_benchmark_reports(output_dir: Path, report: Dict[str, object]) 
         f"- average_overproduction_ratio: {report['quality']['average_overproduction_ratio']}",
         f"- protected_term_violation_count: {report['quality']['protected_term_violation_count']}",
         "",
-        "## Verdict",
+        "## Derived Scores",
+        f"- quality_per_second: {report['derived_scores']['quality_per_second']}",
+        f"- useful_corrections_per_second: {report['derived_scores']['useful_corrections_per_second']}",
+        f"- over_edit_penalty: {report['derived_scores']['over_edit_penalty']}",
+        f"- preferred_term_safety_rate: {report['derived_scores']['preferred_term_safety_rate']}",
+        f"- stability_score: {report['derived_scores']['stability_score']}",
+        "",
+        "## Production Recommendations",
     ]
+    for key, value in sorted((report.get("production_recommendations") or {}).items()):
+        lines.append(f"- {key}: {value}")
+    lines.extend([
+        "",
+        "## Verdict",
+    ])
     for line in report.get("model_verdict") or []:
         lines.append(f"- {line}")
     lines.extend([
@@ -758,6 +873,12 @@ def write_review_benchmark_reports(output_dir: Path, report: Dict[str, object]) 
     ])
     for stage_name, score in sorted((report["quality"].get("focus_stage_scores") or {}).items()):
         lines.append(f"- {stage_name}: {score}")
+    lines.extend(["", "## Stage Usefulness"])
+    for stage_name, item in sorted((report.get("stage_usefulness") or {}).items()):
+        lines.append(
+            f"- {stage_name}: hit_rate={item.get('hit_rate')}, average_quality_score={item.get('average_quality_score')}, "
+            f"average_patch_compactness={item.get('average_patch_compactness')}"
+        )
     lines.extend(["", "## Usable Capacity"])
     for stage_name, capacity in sorted((report.get("usable_capacity") or {}).items()):
         if isinstance(capacity, dict) and "full_episode" in capacity:

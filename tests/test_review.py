@@ -233,6 +233,7 @@ class ReviewTests(unittest.TestCase):
 
         self.assertEqual(result["segments"][0].text, "ChromaDB stays exactly spelled this way.")
         self.assertEqual(result["metadata"]["protected_term_violation_count"], 1)
+        self.assertEqual(result["metadata"]["review_guard_interventions"]["protected_term_preservations"], 1)
 
     def test_cleanup_review_recursively_splits_truncated_windows(self):
         segments = [
@@ -434,6 +435,9 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("review_calibration", result["metadata"])
         self.assertIn("families", result["metadata"]["review_calibration"])
         self.assertIn("local_text_review", result["metadata"]["review_calibration"]["families"])
+        self.assertIn("review_change_summary", result["metadata"])
+        self.assertIn("review_stage_value", result["metadata"])
+        self.assertIn("transcript_cleanup_review", result["metadata"]["review_stage_value"])
 
     def test_speaker_consistency_review_can_relabel_speaker(self):
         segments = [make_segment(1, "SPEAKER_01", "hello there")]

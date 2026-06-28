@@ -13,6 +13,7 @@ You will need:
   - `pyannote/speaker-diarization-community-1`
   - `pyannote/segmentation-3.0`
 - FFmpeg installed with a usable `bin` directory such as `C:/ffmpeg/bin`
+- Node.js with a working `npm` if you want to use the transcript review workbench
 - enough local compute for Whisper, pyannote, and PyTorch-based audio processing
 
 An NVIDIA GPU is strongly recommended for practical throughput.
@@ -227,7 +228,31 @@ Benchmark mode runs the checked-in cleaned-transcript fixtures through the stage
 
 These reports include speed, stability, quality, and usable-capacity information for the configured review model/backend.
 
-## 13. Where Outputs Appear
+## 13. Optional: Launch the Transcript Review Workbench
+
+Use the bootstrap and choose `5`.
+
+The workbench is a local browser app for reviewing already-processed episodes. It can:
+
+- load cleaned and reviewed transcript bundles
+- show transcript, metadata, and provenance in one view
+- run on-demand semantic issue scans through the configured local/LAN review backend
+- write approved transcript corrections into episode correction CSVs
+- write approved glossary changes into `preferred_terms.txt` and `preferred_replacements.json`
+
+Option `5` now handles frontend setup for you:
+
+- if `workbench-ui/node_modules` is missing, it installs frontend dependencies automatically
+- if `workbench-ui/dist` is missing or stale, it rebuilds the workbench bundle automatically
+
+You still need Node.js/npm available on the machine the first time that setup is required.
+
+The first time you open it, provide:
+
+- the project root
+- the processed output folder
+
+## 14. Where Outputs Appear
 
 Outputs are written to the configured output directory, typically an `output` folder beside the source folder.
 
@@ -236,9 +261,12 @@ Important files:
 - per-episode transcript, cleaned transcript, reviewed transcript, CSV, and manifest files
 - `_episode_review_summary.csv`
 - `_batch_report.md`
+- `_review_run_report.json`
+- `_speaker_workflow_report.json`
+- `_workbench/` for semantic scan cache files
 - `_processing_artifacts/` for resume/debug artifacts
 
-## 14. If You Are Migrating from an Older Working Directory
+## 15. If You Are Migrating from an Older Working Directory
 
 Use the bootstrap and choose `3`.
 

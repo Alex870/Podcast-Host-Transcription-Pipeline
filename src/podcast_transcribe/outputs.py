@@ -479,6 +479,12 @@ def write_batch_report_md(path: Path, rows: List[Dict[str, object]], elapsed_sec
     glossary_review_corrections = sum(int(row.get("glossary_review_corrected_count") or 0) for row in rows)
     speaker_review_corrections = sum(int(row.get("speaker_consistency_review_corrected_count") or 0) for row in rows)
     episode_qa_review_corrections = sum(int(row.get("episode_qa_review_corrected_count") or 0) for row in rows)
+    review_material_changes = sum(1 for row in rows if str(row.get("review_material_change")).lower() in {"true", "1", "yes"})
+    episode_qa_added_value = sum(1 for row in rows if str(row.get("episode_qa_added_value")).lower() in {"true", "1", "yes"})
+    preferred_term_interventions = sum(int(row.get("preferred_term_intervention_count") or 0) for row in rows)
+    speaker_drift_flags = sum(1 for row in rows if str(row.get("speaker_drift_flag")).lower() in {"true", "1", "yes"})
+    recurring_unnamed_flags = sum(1 for row in rows if str(row.get("recurring_unnamed_speaker_flag")).lower() in {"true", "1", "yes"})
+    host_stability_flags = sum(1 for row in rows if str(row.get("host_profile_stability_flag")).lower() in {"true", "1", "yes"})
     detected_hosts = sum(1 for row in rows if str(row.get("host_detected")).lower() in {"true", "1", "yes"})
     average_priority = (
         sum(float(row.get("review_priority_score") or 0.0) for row in rows) / total_episodes
@@ -501,6 +507,12 @@ def write_batch_report_md(path: Path, rows: List[Dict[str, object]], elapsed_sec
         f"- Glossary-review corrections: {glossary_review_corrections}",
         f"- Speaker-consistency corrections: {speaker_review_corrections}",
         f"- Episode-QA corrections: {episode_qa_review_corrections}",
+        f"- Episodes with material review changes: {review_material_changes}",
+        f"- Episode-QA added value: {episode_qa_added_value}",
+        f"- Preferred-term interventions: {preferred_term_interventions}",
+        f"- Speaker drift flags: {speaker_drift_flags}",
+        f"- Recurring unnamed speaker flags: {recurring_unnamed_flags}",
+        f"- Host profile stability flags: {host_stability_flags}",
         f"- Average review priority score: {average_priority:.2f}",
     ]
     if elapsed_seconds is not None:
@@ -512,6 +524,37 @@ def write_batch_report_md(path: Path, rows: List[Dict[str, object]], elapsed_sec
             f"| {row.get('episode', '')} | {row.get('episode_date', '')} | "
             f"{row.get('review_priority_score', '')} | {reason} |"
         )
+    activity_rows = [
+        row for row in sorted(
+            rows,
+            key=lambda item: (
+                int(item.get("review_applied_change_count") or 0),
+                int(item.get("review_unique_stage_count") or 0),
+            ),
+            reverse=True,
+        )
+        if int(row.get("review_applied_change_count") or 0) > 0
+    ]
+    if activity_rows:
+        lines.extend(["", "## Highest Review Activity Episodes", "", "| Episode | Applied Changes | Unique Stages | Episode QA Added Value |", "|---|---:|---:|---:|"])
+        for row in activity_rows[:10]:
+            lines.append(
+                f"| {row.get('episode', '')} | {row.get('review_applied_change_count', 0)} | "
+                f"{row.get('review_unique_stage_count', 0)} | {row.get('episode_qa_added_value', False)} |"
+            )
+    risk_rows = [
+        row for row in sorted_rows
+        if str(row.get("speaker_drift_flag")).lower() in {"true", "1", "yes"}
+        or str(row.get("recurring_unnamed_speaker_flag")).lower() in {"true", "1", "yes"}
+        or str(row.get("host_profile_stability_flag")).lower() in {"true", "1", "yes"}
+    ]
+    if risk_rows:
+        lines.extend(["", "## Highest Unresolved Risk Episodes", "", "| Episode | Speaker Drift | Unnamed Speaker | Host Stability |", "|---|---:|---:|---:|"])
+        for row in risk_rows[:10]:
+            lines.append(
+                f"| {row.get('episode', '')} | {row.get('speaker_drift_flag', False)} | "
+                f"{row.get('recurring_unnamed_speaker_flag', False)} | {row.get('host_profile_stability_flag', False)} |"
+            )
     speaker_stats = _speaker_aggregate_stats_for_report(rows)
     if speaker_stats:
         lines.extend(["", "## Speaker Aggregates", "", "| Speaker | Episodes | Seconds | Avg Similarity | Avg Review Priority |", "|---|---:|---:|---:|---:|"])
@@ -529,6 +572,214 @@ def write_batch_report_md(path: Path, rows: List[Dict[str, object]], elapsed_sec
                 f"with {candidate['total_duration_seconds']} seconds of speech: {candidate['recommendation']}."
             )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def build_review_run_report(rows: List[Dict[str, object]], elapsed_seconds: Optional[float] = None) -> Dict[str, object]:
+    review_attempted_count = sum(1 for row in rows if str(row.get("review_attempted")).lower() in {"true", "1", "yes"})
+    reviewed_bundle_count = sum(1 for row in rows if str(row.get("reviewed_output_written")).lower() in {"true", "1", "yes"})
+    material_change_count = sum(1 for row in rows if str(row.get("review_material_change")).lower() in {"true", "1", "yes"})
+    unresolved_speaker_risk_count = sum(
+        1
+        for row in rows
+        if str(row.get("speaker_drift_flag")).lower() in {"true", "1", "yes"}
+        or str(row.get("recurring_unnamed_speaker_flag")).lower() in {"true", "1", "yes"}
+        or str(row.get("host_profile_stability_flag")).lower() in {"true", "1", "yes"}
+    )
+    stage_hit_counts = {
+        "cleanup": sum(1 for row in rows if int(row.get("cleanup_review_corrected_count") or 0) > 0),
+        "glossary": sum(1 for row in rows if int(row.get("glossary_review_corrected_count") or 0) > 0),
+        "speaker_consistency": sum(1 for row in rows if int(row.get("speaker_consistency_review_corrected_count") or 0) > 0),
+        "episode_qa": sum(1 for row in rows if int(row.get("episode_qa_review_corrected_count") or 0) > 0),
+    }
+    stage_noop_counts = {
+        "cleanup": sum(
+            1
+            for row in rows
+            if "transcript_cleanup_review" in str(row.get("review_completed_stages") or "")
+            and int(row.get("cleanup_review_corrected_count") or 0) == 0
+        ),
+        "glossary": sum(
+            1
+            for row in rows
+            if "glossary_correction_review" in str(row.get("review_completed_stages") or "")
+            and int(row.get("glossary_review_corrected_count") or 0) == 0
+        ),
+        "speaker_consistency": sum(
+            1
+            for row in rows
+            if "speaker_consistency_review" in str(row.get("review_completed_stages") or "")
+            and int(row.get("speaker_consistency_review_corrected_count") or 0) == 0
+        ),
+        "episode_qa": sum(
+            1
+            for row in rows
+            if "episode_qa_review" in str(row.get("review_completed_stages") or "")
+            and int(row.get("episode_qa_review_corrected_count") or 0) == 0
+        ),
+    }
+    highest_risk = [
+        {
+            "episode": row.get("episode", ""),
+            "review_priority_score": row.get("review_priority_score", 0),
+            "speaker_drift_flag": row.get("speaker_drift_flag", False),
+            "recurring_unnamed_speaker_flag": row.get("recurring_unnamed_speaker_flag", False),
+            "host_profile_stability_flag": row.get("host_profile_stability_flag", False),
+        }
+        for row in sorted(rows, key=lambda item: float(item.get("review_priority_score") or 0.0), reverse=True)
+        if str(row.get("speaker_drift_flag")).lower() in {"true", "1", "yes"}
+        or str(row.get("recurring_unnamed_speaker_flag")).lower() in {"true", "1", "yes"}
+        or str(row.get("host_profile_stability_flag")).lower() in {"true", "1", "yes"}
+    ][:10]
+    highest_activity = [
+        {
+            "episode": row.get("episode", ""),
+            "review_applied_change_count": int(row.get("review_applied_change_count") or 0),
+            "review_unique_stage_count": int(row.get("review_unique_stage_count") or 0),
+            "episode_qa_added_value": row.get("episode_qa_added_value", False),
+        }
+        for row in sorted(
+            rows,
+            key=lambda item: (
+                int(item.get("review_applied_change_count") or 0),
+                int(item.get("review_unique_stage_count") or 0),
+            ),
+            reverse=True,
+        )
+        if int(row.get("review_applied_change_count") or 0) > 0
+    ][:10]
+    return {
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "episode_count": len(rows),
+        "elapsed_seconds": round(elapsed_seconds, 3) if elapsed_seconds is not None else None,
+        "review_attempted_count": review_attempted_count,
+        "reviewed_bundle_count": reviewed_bundle_count,
+        "material_change_count": material_change_count,
+        "episode_qa_added_value_count": sum(1 for row in rows if str(row.get("episode_qa_added_value")).lower() in {"true", "1", "yes"}),
+        "preferred_term_intervention_count": sum(int(row.get("preferred_term_intervention_count") or 0) for row in rows),
+        "unresolved_speaker_risk_count": unresolved_speaker_risk_count,
+        "stage_hit_counts": stage_hit_counts,
+        "stage_noop_counts": stage_noop_counts,
+        "highest_risk_episodes": highest_risk,
+        "highest_review_activity_episodes": highest_activity,
+    }
+
+
+def write_review_run_report(output_dir: Path, rows: List[Dict[str, object]], elapsed_seconds: Optional[float] = None) -> Dict[str, Path]:
+    report = build_review_run_report(rows, elapsed_seconds=elapsed_seconds)
+    json_path = output_dir / "_review_run_report.json"
+    md_path = output_dir / "_review_run_report.md"
+    json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    lines = [
+        "# Review Run Report",
+        "",
+        f"- Episodes: {report['episode_count']}",
+        f"- Review attempted: {report['review_attempted_count']}",
+        f"- Reviewed bundles written: {report['reviewed_bundle_count']}",
+        f"- Material changes: {report['material_change_count']}",
+        f"- Episode QA added value: {report['episode_qa_added_value_count']}",
+        f"- Preferred-term interventions: {report['preferred_term_intervention_count']}",
+        f"- Unresolved speaker risk episodes: {report['unresolved_speaker_risk_count']}",
+        "",
+        "## Stage Totals",
+    ]
+    for stage_name, count in report["stage_hit_counts"].items():
+        lines.append(f"- {stage_name}: hit={count}, noop={report['stage_noop_counts'].get(stage_name, 0)}")
+    if report["highest_risk_episodes"]:
+        lines.extend(["", "## Highest Risk Episodes"])
+        for row in report["highest_risk_episodes"]:
+            lines.append(
+                f"- {row['episode']}: drift={row['speaker_drift_flag']}, unnamed={row['recurring_unnamed_speaker_flag']}, "
+                f"host_stability={row['host_profile_stability_flag']}, priority={row['review_priority_score']}"
+            )
+    if report["highest_review_activity_episodes"]:
+        lines.extend(["", "## Highest Review Activity Episodes"])
+        for row in report["highest_review_activity_episodes"]:
+            lines.append(
+                f"- {row['episode']}: applied_changes={row['review_applied_change_count']}, "
+                f"unique_stages={row['review_unique_stage_count']}, episode_qa_added_value={row['episode_qa_added_value']}"
+            )
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {"json": json_path, "md": md_path}
+
+
+def build_speaker_workflow_report(rows: List[Dict[str, object]]) -> Dict[str, object]:
+    recurring_candidates = _promotion_candidates_for_report(rows)
+    drift_alerts = [
+        {
+            "episode": row.get("episode", ""),
+            "speaker": row.get("host_label", ""),
+            "top_host_similarity": row.get("top_host_similarity", ""),
+            "review_priority_score": row.get("review_priority_score", 0),
+        }
+        for row in rows
+        if str(row.get("speaker_drift_flag")).lower() in {"true", "1", "yes"}
+    ]
+    stability_warnings = [
+        {
+            "episode": row.get("episode", ""),
+            "host_label": row.get("host_label", ""),
+            "top_host_similarity": row.get("top_host_similarity", ""),
+            "host_similarity_margin": row.get("host_similarity_margin", ""),
+            "reason": row.get("review_priority_reason", ""),
+        }
+        for row in rows
+        if str(row.get("host_profile_stability_flag")).lower() in {"true", "1", "yes"}
+    ]
+    possible_cohosts = [
+        {
+            "episode": row.get("episode", ""),
+            "host_label": row.get("host_label", ""),
+            "host_share_of_speech": row.get("host_share_of_speech", ""),
+            "review_priority_reason": row.get("review_priority_reason", ""),
+        }
+        for row in rows
+        if row.get("host_share_of_speech") not in ("", None) and float(row.get("host_share_of_speech") or 0.0) < 0.45
+    ]
+    return {
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "recurring_unnamed_speaker_candidates": recurring_candidates,
+        "known_speaker_drift_alerts": drift_alerts,
+        "host_profile_stability_warnings": stability_warnings,
+        "possible_cohost_candidates": possible_cohosts[:10],
+    }
+
+
+def write_speaker_workflow_report(output_dir: Path, rows: List[Dict[str, object]]) -> Dict[str, Path]:
+    report = build_speaker_workflow_report(rows)
+    json_path = output_dir / "_speaker_workflow_report.json"
+    md_path = output_dir / "_speaker_workflow_report.md"
+    json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    lines = [
+        "# Speaker Workflow Report",
+        "",
+        f"- Recurring unnamed speaker candidates: {len(report['recurring_unnamed_speaker_candidates'])}",
+        f"- Known speaker drift alerts: {len(report['known_speaker_drift_alerts'])}",
+        f"- Host profile stability warnings: {len(report['host_profile_stability_warnings'])}",
+        f"- Possible co-host candidates: {len(report['possible_cohost_candidates'])}",
+    ]
+    if report["recurring_unnamed_speaker_candidates"]:
+        lines.extend(["", "## Recurring Unnamed Speaker Candidates"])
+        for item in report["recurring_unnamed_speaker_candidates"]:
+            lines.append(
+                f"- {item['speaker']}: {item['episode_count']} episode(s), {item['total_duration_seconds']} seconds, "
+                f"{item['recommendation']}"
+            )
+    if report["known_speaker_drift_alerts"]:
+        lines.extend(["", "## Known Speaker Drift Alerts"])
+        for item in report["known_speaker_drift_alerts"][:10]:
+            lines.append(
+                f"- {item['episode']}: speaker={item['speaker']}, top_host_similarity={item['top_host_similarity']}, "
+                f"priority={item['review_priority_score']}"
+            )
+    if report["host_profile_stability_warnings"]:
+        lines.extend(["", "## Host Profile Stability Warnings"])
+        for item in report["host_profile_stability_warnings"][:10]:
+            lines.append(
+                f"- {item['episode']}: host={item['host_label']}, similarity={item['top_host_similarity']}, "
+                f"margin={item['host_similarity_margin']}, reason={item['reason']}"
+            )
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {"json": json_path, "md": md_path}
 
 
 def _speaker_aggregate_stats_for_report(rows: List[Dict[str, object]]) -> Dict[str, Dict[str, object]]:
