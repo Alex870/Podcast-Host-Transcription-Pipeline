@@ -1,4 +1,4 @@
-import type { EpisodeBundle, SessionInfo } from "./types";
+import type { EpisodeBundle, LearnedRule, SessionInfo, TeachMeProposal } from "./types";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -93,4 +93,57 @@ export function applyReplacement(preferredTerm: string, alias: string) {
 
 export function loadAudit() {
   return request<{ entries: Array<Record<string, unknown>> }>("/api/audit");
+}
+
+export function proposeTeachMeRule(episodeId: string, segmentId: number, desiredReviewedText: string, supersedesRuleId = "") {
+  return request<TeachMeProposal>(`/api/episodes/${encodeURIComponent(episodeId)}/teach-me/propose`, {
+    method: "POST",
+    body: JSON.stringify({ segmentId, desiredReviewedText, supersedesRuleId }),
+  });
+}
+
+export function listReviewRules() {
+  return request<{ rules: LearnedRule[] }>("/api/review-rules");
+}
+
+export function loadReviewRule(ruleId: string) {
+  return request<LearnedRule>(`/api/review-rules/${encodeURIComponent(ruleId)}`);
+}
+
+export function approveReviewRule(ruleId: string, episodeId: string) {
+  return request<{ status: string; rule: LearnedRule; rerun: Record<string, unknown> }>(
+    `/api/review-rules/${encodeURIComponent(ruleId)}/approve`,
+    {
+      method: "POST",
+      body: JSON.stringify({ episodeId }),
+    },
+  );
+}
+
+export function rejectReviewRule(ruleId: string) {
+  return request<{ status: string; rule: LearnedRule }>(`/api/review-rules/${encodeURIComponent(ruleId)}/reject`, {
+    method: "POST",
+  });
+}
+
+export function disableReviewRule(ruleId: string) {
+  return request<{ status: string; rule: LearnedRule }>(`/api/review-rules/${encodeURIComponent(ruleId)}/disable`, {
+    method: "POST",
+  });
+}
+
+export function rerunReviewRule(ruleId: string, episodeId: string) {
+  return request<{ status: string; episode_id: string }>(
+    `/api/review-rules/${encodeURIComponent(ruleId)}/rerun-current-episode`,
+    {
+      method: "POST",
+      body: JSON.stringify({ episodeId }),
+    },
+  );
+}
+
+export function backfillReviewRule(ruleId: string) {
+  return request<{ status: string; episode_count: number }>(`/api/review-rules/${encodeURIComponent(ruleId)}/backfill`, {
+    method: "POST",
+  });
 }

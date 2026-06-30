@@ -10,6 +10,7 @@ import csv
 import json
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.request
 from copy import deepcopy
@@ -18,6 +19,25 @@ from typing import Dict, List, Optional, Tuple
 
 from podcast_transcribe.config import resolve_review_runtime_config
 from podcast_transcribe.contract import validate_reviewed_transcript_payload, validate_transcript_payload
+from podcast_transcribe.learned_rules import (
+    LEARNED_RULE_ALLOWED_FAMILIES,
+    LEARNED_RULE_ALLOWED_STAGES,
+    approved_review_rules,
+    get_review_rule as load_single_review_rule,
+    load_review_rule_library,
+    normalize_learned_rule,
+    save_review_rule_library,
+    upsert_review_rule,
+)
+from podcast_transcribe.models import SegmentItem, WordItem
+from podcast_transcribe.outputs import (
+    write_batch_report_md,
+    write_json_output,
+    write_review_run_report,
+    write_speaker_workflow_report,
+    write_text_transcript,
+)
+from podcast_transcribe.review import review_segments
 
 
 WORKBENCH_DIRNAME = "_workbench"
@@ -26,6 +46,8 @@ AUDIT_LOG_SUBDIR = ".workbench"
 AUDIT_LOG_FILENAME = "audit_log.jsonl"
 ISSUE_RESOLUTION_SUBDIR = "issue_resolution"
 DEFAULT_CORRECTIONS_DIRNAME = "corrections"
+TEACH_ME_SUBDIR = "teach_me"
+TEACH_ME_CONTROL_FIXTURE_PATH = Path(__file__).resolve().parents[2] / "benchmarks" / "review_fixtures" / "teach_me_controls.json"
 
 _GLOSSARY_WRITE_LOCK = threading.Lock()
 
@@ -47,6 +69,275 @@ def _resolve_under_root(root: Path, raw_path: Optional[str], default_relative: O
     else:
         path = root
     return path.resolve()
+
+
+def _cli_helpers():
+    try:
+        from podcast_transcribe.cli import (
+            build_review_backfill_summary_row,
+            normalize_episode_summary_row,
+            segment_items_from_cleaned_payload,
+            write_episode_summary_csv,
+            write_reviewed_output_bundle,
+            write_run_reports,
+        )
+
+        return {
+            "build_review_backfill_summary_row": build_review_backfill_summary_row,
+            "normalize_episode_summary_row": normalize_episode_summary_row,
+            "segment_items_from_cleaned_payload": segment_items_from_cleaned_payload,
+            "write_episode_summary_csv": write_episode_summary_csv,
+            "write_reviewed_output_bundle": write_reviewed_output_bundle,
+            "write_run_reports": write_run_reports,
+        }
+    except ModuleNotFoundError:
+        return {
+            "build_review_backfill_summary_row": _fallback_build_review_backfill_summary_row,
+            "normalize_episode_summary_row": _fallback_normalize_episode_summary_row,
+            "segment_items_from_cleaned_payload": _fallback_segment_items_from_cleaned_payload,
+            "write_episode_summary_csv": _fallback_write_episode_summary_csv,
+            "write_reviewed_output_bundle": _fallback_write_reviewed_output_bundle,
+            "write_run_reports": _fallback_write_run_reports,
+        }
+
+
+def _state_helpers():
+    from podcast_transcribe.state import SUMMARY_FILENAME, load_episode_summary_rows
+
+    return {
+        "SUMMARY_FILENAME": SUMMARY_FILENAME,
+        "load_episode_summary_rows": load_episode_summary_rows,
+    }
+
+
+def _coerce_float(value: object, default: float = 0.0) -> float:
+    if value in ("", None):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_int(value: object, default: int = 0) -> int:
+    if value in ("", None):
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in ("", None):
+        return default
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return default
+
+
+def _format_timestamp(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "unknown"
+    total = max(0, int(seconds))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _fallback_segment_items_from_cleaned_payload(payload: Dict[str, object]) -> List[SegmentItem]:
+    rebuilt_segments: List[SegmentItem] = []
+    for index, raw_segment in enumerate(payload.get("segments") or []):
+        if not isinstance(raw_segment, dict):
+            raise RuntimeError(f"Segment {index} in cleaned transcript JSON is not an object.")
+        words_payload = raw_segment.get("words") or []
+        words = [
+            WordItem(
+                start=word.get("start") if isinstance(word, dict) else None,
+                end=word.get("end") if isinstance(word, dict) else None,
+                word=str(word.get("word") or "") if isinstance(word, dict) else "",
+                speaker=str(word.get("speaker") or raw_segment.get("speaker") or "") if isinstance(word, dict) else "",
+            )
+            for word in words_payload
+            if isinstance(word, dict)
+        ]
+        rebuilt_segments.append(
+            SegmentItem(
+                id=int(raw_segment["id"]),
+                start=float(raw_segment["start"]),
+                end=float(raw_segment["end"]),
+                text=str(raw_segment["text"]),
+                speaker=str(raw_segment.get("speaker") or ""),
+                avg_logprob=raw_segment.get("avg_logprob"),
+                no_speech_prob=raw_segment.get("no_speech_prob"),
+                words=words,
+                original_text=raw_segment.get("original_text"),
+                cleanup_applied=_coerce_bool(raw_segment.get("cleanup_applied"), False),
+                cleanup_level=str(raw_segment.get("cleanup_level") or ""),
+                manual_correction_applied=_coerce_bool(raw_segment.get("manual_correction_applied"), False),
+                original_speaker=raw_segment.get("original_speaker"),
+            )
+        )
+    return rebuilt_segments
+
+
+def _fallback_write_episode_summary_csv(path: Path, rows: List[Dict[str, object]]):
+    fieldnames = sorted({key for row in rows for key in row.keys()} | {"episode"})
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _fallback_normalize_episode_summary_row(row: Dict[str, object]) -> Dict[str, object]:
+    normalized = dict(row)
+    for key in ("processing_seconds", "review_priority_score", "host_duration_seconds", "host_share_of_speech"):
+        if key in normalized and normalized[key] not in ("", None):
+            normalized[key] = _coerce_float(normalized[key], 0.0)
+    for key in (
+        "transcript_segments",
+        "reviewed_segment_count",
+        "review_corrected_segment_count",
+        "review_unique_stage_count",
+        "preferred_term_intervention_count",
+    ):
+        if key in normalized:
+            normalized[key] = _coerce_int(normalized[key], 0)
+    for key in ("review_attempted", "reviewed_output_written", "review_material_change", "episode_qa_added_value"):
+        if key in normalized:
+            normalized[key] = _coerce_bool(normalized[key], False)
+    return normalized
+
+
+def _fallback_write_run_reports(output_dir: Path, rows: List[Dict[str, object]], elapsed_seconds: Optional[float] = None):
+    write_batch_report_md(output_dir / "_batch_report.md", rows, elapsed_seconds=elapsed_seconds)
+    write_review_run_report(output_dir, rows, elapsed_seconds=elapsed_seconds)
+    write_speaker_workflow_report(output_dir, rows)
+
+
+def _fallback_write_reviewed_output_bundle(
+    audio_path: Path,
+    output_dir: Path,
+    reviewed_segments: List[SegmentItem],
+    review_metadata: Dict[str, object],
+    host_output_labels: set[str],
+    episode_metadata: Dict[str, object],
+    info_payload: Dict[str, object],
+    diarized_turns: List[Dict[str, object]],
+    speaker_mapping: Dict[str, str],
+    host_speaker: Optional[str],
+    durations: Dict[str, float],
+    known_assignments: Dict[str, Dict[str, object]],
+    runtime_config: Optional[Dict[str, object]],
+) -> List[Path]:
+    if not reviewed_segments:
+        return []
+    reviewed_text_version = (
+        "reviewed_llm_high_context"
+        if review_metadata.get("review_runtime_profile") == "high_context_5090"
+        else "reviewed_llm"
+    )
+    reviewed_metadata = {**episode_metadata, "text_version": reviewed_text_version}
+    base_name = audio_path.stem
+    reviewed_paths = [
+        output_dir / f"{base_name}_reviewed_speaker_transcript.txt",
+        output_dir / f"{base_name}_reviewed_host_only.txt",
+        output_dir / f"{base_name}_reviewed_speaker_transcript.json",
+    ]
+    write_text_transcript(
+        reviewed_paths[0],
+        reviewed_segments,
+        _format_timestamp,
+        host_only=False,
+        metadata=reviewed_metadata,
+    )
+    write_text_transcript(
+        reviewed_paths[1],
+        reviewed_segments,
+        _format_timestamp,
+        host_only=True,
+        host_labels=host_output_labels,
+        metadata=reviewed_metadata,
+    )
+    write_json_output(
+        reviewed_paths[2],
+        source_file=str(audio_path),
+        info_payload=info_payload,
+        diarized_turns=diarized_turns,
+        segments=reviewed_segments,
+        speaker_mapping=speaker_mapping,
+        host_speaker=host_speaker,
+        durations=durations,
+        known_assignments=known_assignments,
+        metadata=reviewed_metadata,
+        text_version=reviewed_text_version,
+        pipeline_version=runtime_config.get("model", "") if runtime_config else "",
+        review_metadata=review_metadata,
+    )
+    return reviewed_paths
+
+
+def _fallback_build_review_backfill_summary_row(
+    audio_path: Path,
+    cleaned_payload: Dict[str, object],
+    cleaned_segments: List[SegmentItem],
+    review_result: Dict[str, object],
+    existing_summary_row: Optional[Dict[str, object]] = None,
+    processing_seconds: float = 0.0,
+) -> Dict[str, object]:
+    metadata = cleaned_payload.get("metadata") if isinstance(cleaned_payload.get("metadata"), dict) else {}
+    review_metadata = review_result.get("metadata") if isinstance(review_result.get("metadata"), dict) else {}
+    stage_results = review_metadata.get("review_stage_results") if isinstance(review_metadata.get("review_stage_results"), dict) else {}
+    change_summary = review_metadata.get("review_change_summary") if isinstance(review_metadata.get("review_change_summary"), dict) else {}
+    row = dict(existing_summary_row or {})
+    row.update(
+        {
+            "episode": audio_path.name,
+            "episode_date": metadata.get("episode_date", ""),
+            "episode_date_compact": metadata.get("episode_date_compact", ""),
+            "episode_year": metadata.get("episode_year", ""),
+            "episode_month": metadata.get("episode_month", ""),
+            "episode_day": metadata.get("episode_day", ""),
+            "episode_sort_key": metadata.get("episode_sort_key", ""),
+            "transcript_segments": len(cleaned_segments),
+            "processing_seconds": processing_seconds,
+            "review_attempted": bool(review_result.get("attempted")),
+            "review_status": str(review_metadata.get("review_status") or ""),
+            "review_skip_reason": str(review_metadata.get("review_skip_reason") or ""),
+            "review_runtime_profile": str(review_metadata.get("review_runtime_profile") or ""),
+            "review_backend": str(review_metadata.get("review_backend") or ""),
+            "review_model_name": str(review_metadata.get("review_model_name") or ""),
+            "reviewed_segment_count": int(review_metadata.get("reviewed_segment_count") or 0),
+            "review_corrected_segment_count": int(review_metadata.get("corrected_segment_count") or 0),
+            "reviewed_output_written": bool(review_result.get("segments")),
+            "review_pipeline_version": str(review_metadata.get("review_pipeline_version") or ""),
+            "review_enabled_stages": ";".join(str(item) for item in review_metadata.get("review_enabled_stages") or []),
+            "review_completed_stages": ";".join(str(item) for item in review_metadata.get("review_completed_stages") or []),
+            "review_skipped_stages": ";".join(str(item) for item in review_metadata.get("review_skipped_stages") or []),
+            "review_input_source": str(review_metadata.get("review_input_source") or ""),
+            "review_episode_qa_mode": str(review_metadata.get("episode_qa_mode") or ""),
+            "active_learned_rule_ids": ";".join(str(item) for item in review_metadata.get("active_learned_rule_ids") or []),
+            "contributing_learned_rule_ids": ";".join(str(item) for item in review_metadata.get("contributing_learned_rule_ids") or []),
+            "cleanup_review_corrected_count": int(((stage_results.get("transcript_cleanup_review") or {}).get("corrected_segment_count")) or 0),
+            "glossary_review_corrected_count": int(((stage_results.get("glossary_correction_review") or {}).get("corrected_segment_count")) or 0),
+            "speaker_consistency_review_corrected_count": int(((stage_results.get("speaker_consistency_review") or {}).get("corrected_segment_count")) or 0),
+            "episode_qa_review_corrected_count": int(((stage_results.get("episode_qa_review") or {}).get("corrected_segment_count")) or 0),
+            "review_material_change": bool(change_summary.get("material_change")),
+            "review_unique_stage_count": int(change_summary.get("unique_stage_count") or 0),
+            "preferred_term_intervention_count": int(change_summary.get("protected_term_intervention_count") or 0),
+            "processing_mode": "tier2-only backfill",
+            "tier1_reused_from_existing": True,
+            "review_backfilled_from_cleaned_json": True,
+        }
+    )
+    return row
 
 
 def _assert_within_root(root: Path, path: Path):
@@ -370,6 +661,658 @@ def run_semantic_scan(project_root: Path, output_dir: Path, episode_id: str, for
     return result
 
 
+def _teach_me_session_path(output_dir: Path, episode_id: str, session_id: str) -> Path:
+    paths = resolve_workbench_paths(output_dir.parent if output_dir.name == "output" else output_dir, output_dir)
+    return paths["workbench_dir"] / TEACH_ME_SUBDIR / episode_id / f"{session_id}.json"
+
+
+def _teach_me_workbench_dir(output_dir: Path) -> Path:
+    return output_dir / WORKBENCH_DIRNAME / TEACH_ME_SUBDIR
+
+
+def _review_rule_prompt() -> str:
+    return (
+        "You are extracting a reusable, narrow review rule from a single operator-approved transcript edit. "
+        "Return strict JSON. Do not write code. Do not propose broad paraphrase rules. "
+        "Keep the rule local, conservative, and suitable for an LLM transcript review stage. "
+        "Never mutate deterministic cleanup behavior. Never violate protected preferred terms. "
+        "Only choose from these rule families: cleanup_preference, glossary_naming_preference, "
+        "speaker_label_preference, style_phrasing_preference, do_not_change_constraint. "
+        "Only choose from these stage targets: transcript_cleanup_review, glossary_correction_review, "
+        "speaker_consistency_review, episode_qa_review."
+    )
+
+
+def _choose_rule_family(candidate: Dict[str, object]) -> str:
+    family = str(candidate.get("rule_family") or "").strip()
+    return family if family in LEARNED_RULE_ALLOWED_FAMILIES else "style_phrasing_preference"
+
+
+def _choose_stage_target(candidate: Dict[str, object]) -> str:
+    stage_target = str(candidate.get("stage_target") or "").strip()
+    return stage_target if stage_target in LEARNED_RULE_ALLOWED_STAGES else "transcript_cleanup_review"
+
+
+def _load_teach_me_controls() -> List[Dict[str, object]]:
+    if not TEACH_ME_CONTROL_FIXTURE_PATH.exists():
+        return []
+    payload = _load_json(TEACH_ME_CONTROL_FIXTURE_PATH)
+    fixtures = payload.get("fixtures")
+    return [item for item in fixtures if isinstance(item, dict)] if isinstance(fixtures, list) else []
+
+
+def _teaching_source_example(bundle: Dict[str, object], segment_id: int, desired_reviewed_text: str) -> Dict[str, object]:
+    cleaned_segment = next((segment for segment in bundle["cleaned"]["segments"] if int(segment["id"]) == int(segment_id)), None)
+    if cleaned_segment is None:
+        raise RuntimeError(f"Segment {segment_id} was not found in cleaned transcript data.")
+    reviewed_segment = next((segment for segment in bundle["reviewed"]["segments"] if int(segment["id"]) == int(segment_id)), None)
+    return {
+        "segment_id": int(segment_id),
+        "speaker": str(cleaned_segment.get("speaker") or ""),
+        "cleaned_text": str(cleaned_segment.get("text") or ""),
+        "reviewed_text": str((reviewed_segment or {}).get("text") or cleaned_segment.get("text") or ""),
+        "desired_reviewed_text": str(desired_reviewed_text).strip(),
+        "start": cleaned_segment.get("start"),
+        "end": cleaned_segment.get("end"),
+    }
+
+
+def _nearby_example_segments(bundle: Dict[str, object], segment_id: int) -> List[Dict[str, object]]:
+    cleaned_segments = list(bundle["cleaned"]["segments"])
+    indexes = [index for index, segment in enumerate(cleaned_segments) if int(segment["id"]) == int(segment_id)]
+    if not indexes:
+        return []
+    index = indexes[0]
+    examples: List[Dict[str, object]] = []
+    for offset in (-1, 1):
+        nearby_index = index + offset
+        if 0 <= nearby_index < len(cleaned_segments):
+            segment = cleaned_segments[nearby_index]
+            examples.append(
+                {
+                    "segment_id": int(segment["id"]),
+                    "speaker": str(segment.get("speaker") or ""),
+                    "cleaned_text": str(segment.get("text") or ""),
+                    "expected_text": str(segment.get("text") or ""),
+                    "expected_changed": False,
+                    "source": "nearby_episode_control",
+                }
+            )
+    return examples
+
+
+def _induce_learned_rule_candidate(
+    project_root: Path,
+    output_dir: Path,
+    episode_id: str,
+    source_example: Dict[str, object],
+    supersedes_rule_id: str = "",
+) -> Dict[str, object]:
+    config = load_project_config(project_root)
+    runtime_review = resolve_review_runtime_config(config)
+    if not runtime_review.get("backend_ready"):
+        raise RuntimeError("Teach Me requires a configured review backend and model.")
+    existing_rules = load_review_rule_library(project_root)["rules"]
+    prompt_payload = {
+        "episode_id": episode_id,
+        "source_example": source_example,
+        "existing_rules": [
+            {
+                "rule_id": rule.get("rule_id"),
+                "rule_family": rule.get("rule_family"),
+                "stage_target": rule.get("stage_target"),
+                "summary": rule.get("summary"),
+                "status": rule.get("status"),
+            }
+            for rule in existing_rules
+        ],
+        "preferred_terms": _read_preferred_terms(resolve_workbench_paths(project_root, output_dir)["preferred_terms_path"]),
+        "replacement_map": _read_replacement_map(resolve_workbench_paths(project_root, output_dir)["replacement_map_path"]),
+        "review_stage_flags": {
+            "transcript_cleanup_review": bool(runtime_review.get("transcript_cleanup_review")),
+            "glossary_correction_review": bool(runtime_review.get("glossary_correction_review")),
+            "speaker_consistency_review": bool(runtime_review.get("speaker_consistency_review")),
+            "episode_qa_review": bool(runtime_review.get("episode_qa_review")),
+        },
+        "supersedes_rule_id": supersedes_rule_id,
+    }
+    parsed = _openai_compatible_request(
+        str(runtime_review.get("review_base_url") or ""),
+        str(runtime_review.get("review_model_name") or ""),
+        _review_rule_prompt(),
+        json.dumps(prompt_payload, ensure_ascii=True),
+        max_tokens=1800,
+    )
+    candidate = parsed.get("rule_candidate")
+    if not isinstance(candidate, dict):
+        raise RuntimeError("Teach Me rule induction did not return a rule_candidate object.")
+    family = _choose_rule_family(candidate)
+    stage_target = _choose_stage_target(candidate)
+    instruction_payload = candidate.get("instruction_payload") if isinstance(candidate.get("instruction_payload"), dict) else {}
+    return {
+        "rule_id": f"rule_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",
+        "status": "draft",
+        "activation_status": "pending_approval",
+        "rule_family": family,
+        "stage_target": stage_target,
+        "summary": str(candidate.get("summary") or "").strip(),
+        "explanation": str(candidate.get("explanation") or "").strip(),
+        "instruction_payload": {
+            "directive": str(instruction_payload.get("directive") or "").strip(),
+            "avoid": [str(item).strip() for item in (instruction_payload.get("avoid") or []) if str(item).strip()],
+            "positive_examples": [item for item in (instruction_payload.get("positive_examples") or []) if isinstance(item, dict)],
+            "negative_examples": [item for item in (instruction_payload.get("negative_examples") or []) if isinstance(item, dict)],
+        },
+        "confidence": float(candidate.get("confidence") or 0.0),
+        "ambiguity_notes": [str(item).strip() for item in (candidate.get("ambiguity_notes") or []) if str(item).strip()],
+        "source_examples": [source_example],
+        "validation": {},
+        "activation_scope": "project_review_layer",
+        "supersedes_rule_id": supersedes_rule_id,
+        "superseded_by_rule_id": "",
+        "provenance": {
+            "created_at_epoch_ms": int(time.time() * 1000),
+            "updated_at_epoch_ms": int(time.time() * 1000),
+            "backend": str(runtime_review.get("backend") or ""),
+            "review_model_name": str(runtime_review.get("review_model_name") or ""),
+            "validation_evidence": {},
+        },
+        "audit": {
+            "approvals": [],
+            "reruns": [],
+            "backfills": [],
+        },
+    }
+
+
+def _rule_runtime_config(config: Dict[str, object], stage_target: str) -> Dict[str, object]:
+    payload = dict(config)
+    payload["transcript_cleanup_review"] = stage_target == "transcript_cleanup_review"
+    payload["glossary_correction_review"] = stage_target == "glossary_correction_review"
+    payload["speaker_consistency_review"] = stage_target == "speaker_consistency_review"
+    payload["episode_qa_review"] = stage_target == "episode_qa_review"
+    return payload
+
+
+def _segment_item_from_text(segment_id: int, speaker: str, text: str) -> SegmentItem:
+    return SegmentItem(
+        id=segment_id,
+        start=float(segment_id),
+        end=float(segment_id) + 1.0,
+        text=text,
+        speaker=speaker,
+        avg_logprob=-0.1,
+        no_speech_prob=0.01,
+        words=[WordItem(start=float(segment_id), end=float(segment_id) + 0.1, word=(text.split() or [""])[0], speaker=speaker)],
+        original_text=text,
+        cleanup_applied=False,
+        cleanup_level="normal",
+        manual_correction_applied=False,
+        original_speaker=speaker,
+    )
+
+
+def _run_rule_candidate_once(
+    config: Dict[str, object],
+    stage_target: str,
+    segments: List[SegmentItem],
+    rule_candidate: Dict[str, object],
+) -> Dict[str, object]:
+    runtime_config = _rule_runtime_config(config, stage_target)
+    return review_segments(
+        segments,
+        runtime_config,
+        review_input_source="teach_me_validation",
+        learned_rules=[{**rule_candidate, "status": "approved"}],
+    )
+
+
+def _extract_result_text(review_result: Dict[str, object], segment_id: int, fallback_text: str) -> str:
+    for segment in review_result.get("segments") or []:
+        if int(getattr(segment, "id", 0)) == int(segment_id):
+            return str(getattr(segment, "text", fallback_text) or fallback_text)
+    return str(fallback_text)
+
+
+def _validation_feedback(rule_candidate: Dict[str, object], validation: Dict[str, object]) -> str:
+    failures = []
+    taught = validation.get("taught_example") if isinstance(validation.get("taught_example"), dict) else {}
+    if taught and not taught.get("exact_match"):
+        failures.append("taught example did not match desired reviewed text exactly")
+    controls = validation.get("controls") if isinstance(validation.get("controls"), list) else []
+    over_edits = [item.get("fixture_id") for item in controls if isinstance(item, dict) and not item.get("passed")]
+    if over_edits:
+        failures.append(f"control failures: {', '.join(str(item) for item in over_edits)}")
+    if not failures:
+        return ""
+    return (
+        "Refine the rule candidate conservatively so it matches the taught example and avoids overreach. "
+        f"Current failures: {'; '.join(failures)}."
+    )
+
+
+def _refine_rule_candidate(
+    project_root: Path,
+    output_dir: Path,
+    episode_id: str,
+    source_example: Dict[str, object],
+    current_candidate: Dict[str, object],
+    validation: Dict[str, object],
+) -> Dict[str, object]:
+    config = load_project_config(project_root)
+    runtime_review = resolve_review_runtime_config(config)
+    feedback = _validation_feedback(current_candidate, validation)
+    if not feedback:
+        return current_candidate
+    prompt_payload = {
+        "episode_id": episode_id,
+        "source_example": source_example,
+        "current_candidate": current_candidate,
+        "validation": validation,
+        "feedback": feedback,
+    }
+    parsed = _openai_compatible_request(
+        str(runtime_review.get("review_base_url") or ""),
+        str(runtime_review.get("review_model_name") or ""),
+        _review_rule_prompt(),
+        json.dumps(prompt_payload, ensure_ascii=True),
+        max_tokens=1600,
+    )
+    candidate = parsed.get("rule_candidate")
+    if not isinstance(candidate, dict):
+        return current_candidate
+    current_candidate["rule_family"] = _choose_rule_family(candidate)
+    current_candidate["stage_target"] = _choose_stage_target(candidate)
+    current_candidate["summary"] = str(candidate.get("summary") or current_candidate.get("summary") or "").strip()
+    current_candidate["explanation"] = str(candidate.get("explanation") or current_candidate.get("explanation") or "").strip()
+    instruction_payload = candidate.get("instruction_payload") if isinstance(candidate.get("instruction_payload"), dict) else {}
+    current_candidate["instruction_payload"] = {
+        "directive": str(instruction_payload.get("directive") or current_candidate.get("instruction_payload", {}).get("directive") or "").strip(),
+        "avoid": [str(item).strip() for item in (instruction_payload.get("avoid") or []) if str(item).strip()],
+        "positive_examples": [item for item in (instruction_payload.get("positive_examples") or []) if isinstance(item, dict)],
+        "negative_examples": [item for item in (instruction_payload.get("negative_examples") or []) if isinstance(item, dict)],
+    }
+    current_candidate["confidence"] = float(candidate.get("confidence") or current_candidate.get("confidence") or 0.0)
+    current_candidate["ambiguity_notes"] = [str(item).strip() for item in (candidate.get("ambiguity_notes") or []) if str(item).strip()]
+    current_candidate["provenance"]["updated_at_epoch_ms"] = int(time.time() * 1000)
+    return current_candidate
+
+
+def validate_teach_me_rule_candidate(
+    project_root: Path,
+    output_dir: Path,
+    episode_id: str,
+    source_example: Dict[str, object],
+    rule_candidate: Dict[str, object],
+) -> Dict[str, object]:
+    config = load_project_config(project_root)
+    stage_target = str(rule_candidate.get("stage_target") or "transcript_cleanup_review")
+    validation = {
+        "stage_target": stage_target,
+        "taught_example": {},
+        "nearby_examples": [],
+        "controls": [],
+        "pass": False,
+        "warnings": [],
+        "refinement_iterations": 0,
+    }
+    bundle = load_episode_bundle(project_root, output_dir, episode_id)
+    nearby_examples = _nearby_example_segments(bundle, int(source_example["segment_id"]))
+    controls = [fixture for fixture in _load_teach_me_controls() if str(fixture.get("stage_target") or "") in {"", stage_target}]
+
+    current_candidate = normalize_learned_rule(rule_candidate)
+    for attempt in range(3):
+        taught_result = _run_rule_candidate_once(
+            config,
+            stage_target,
+            [_segment_item_from_text(int(source_example["segment_id"]), str(source_example["speaker"]), str(source_example["cleaned_text"]))],
+            current_candidate,
+        )
+        taught_text = _extract_result_text(taught_result, int(source_example["segment_id"]), str(source_example["cleaned_text"]))
+        validation["taught_example"] = {
+            "expected_text": str(source_example["desired_reviewed_text"]),
+            "produced_text": taught_text,
+            "exact_match": taught_text == str(source_example["desired_reviewed_text"]),
+        }
+
+        validation["nearby_examples"] = []
+        for example in nearby_examples:
+            result = _run_rule_candidate_once(
+                config,
+                stage_target,
+                [_segment_item_from_text(int(example["segment_id"]), str(example["speaker"]), str(example["cleaned_text"]))],
+                current_candidate,
+            )
+            produced = _extract_result_text(result, int(example["segment_id"]), str(example["cleaned_text"]))
+            validation["nearby_examples"].append(
+                {
+                    "segment_id": int(example["segment_id"]),
+                    "expected_text": str(example["expected_text"]),
+                    "produced_text": produced,
+                    "passed": produced == str(example["expected_text"]),
+                }
+            )
+
+        validation["controls"] = []
+        for index, fixture in enumerate(controls, start=1):
+            result = _run_rule_candidate_once(
+                config,
+                stage_target,
+                [_segment_item_from_text(index, str(fixture.get("speaker") or "HOST"), str(fixture.get("input_text") or ""))],
+                current_candidate,
+            )
+            produced = _extract_result_text(result, index, str(fixture.get("input_text") or ""))
+            expected = str(fixture.get("expected_text") or fixture.get("input_text") or "")
+            validation["controls"].append(
+                {
+                    "fixture_id": str(fixture.get("fixture_id") or f"fixture_{index}"),
+                    "expected_text": expected,
+                    "produced_text": produced,
+                    "passed": produced == expected,
+                }
+            )
+
+        validation["pass"] = bool(validation["taught_example"].get("exact_match")) and all(
+            bool(item.get("passed")) for item in validation["controls"]
+        )
+        if validation["pass"] or attempt >= 2:
+            break
+        validation["refinement_iterations"] = attempt + 1
+        current_candidate = _refine_rule_candidate(project_root, output_dir, episode_id, source_example, current_candidate, validation)
+
+    warnings = []
+    if not validation["taught_example"].get("exact_match"):
+        warnings.append("taught_example_mismatch")
+    warnings.extend(
+        f"control_failure:{item['fixture_id']}"
+        for item in validation["controls"]
+        if not item.get("passed")
+    )
+    validation["warnings"] = warnings
+    validation["refinement_iterations"] = int(validation["refinement_iterations"])
+    current_candidate["validation"] = validation
+    current_candidate["provenance"]["validation_evidence"] = validation
+    return current_candidate
+
+
+def _teach_me_session_artifact_path(output_dir: Path, episode_id: str, session_id: str) -> Path:
+    return _teach_me_workbench_dir(output_dir) / episode_id / f"{session_id}.json"
+
+
+def propose_teach_me_rule(
+    project_root: Path,
+    output_dir: Path,
+    episode_id: str,
+    segment_id: int,
+    desired_reviewed_text: str,
+    supersedes_rule_id: str = "",
+) -> Dict[str, object]:
+    bundle = load_episode_bundle(project_root, output_dir, episode_id)
+    desired = str(desired_reviewed_text).strip()
+    if not desired:
+        raise RuntimeError("Desired reviewed text cannot be blank.")
+    source_example = _teaching_source_example(bundle, segment_id, desired)
+    candidate = _induce_learned_rule_candidate(project_root, output_dir, episode_id, source_example, supersedes_rule_id=supersedes_rule_id)
+    candidate = validate_teach_me_rule_candidate(project_root, output_dir, episode_id, source_example, candidate)
+    session_id = f"teach_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    artifact = {
+        "session_id": session_id,
+        "episode_id": episode_id,
+        "segment_id": int(segment_id),
+        "source_example": source_example,
+        "rule_candidate": candidate,
+    }
+    artifact_path = _teach_me_session_artifact_path(output_dir, episode_id, session_id)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(json.dumps(artifact, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    upsert_review_rule(project_root, candidate)
+    _append_audit_log(
+        project_root,
+        output_dir,
+        {
+            "created_at_epoch_ms": int(time.time() * 1000),
+            "action": "teach_me_rule_proposed",
+            "episode_id": episode_id,
+            "segment_id": int(segment_id),
+            "session_id": session_id,
+            "rule_id": candidate["rule_id"],
+            "target_path": str(artifact_path),
+        },
+    )
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        "episode_id": episode_id,
+        "segment_id": int(segment_id),
+        "source_example": source_example,
+        "rule_candidate": candidate,
+    }
+
+
+def _update_summary_for_episode(output_dir: Path, summary_row: Dict[str, object]):
+    cli = _cli_helpers()
+    state = _state_helpers()
+    summary_path = output_dir / state["SUMMARY_FILENAME"]
+    existing_rows = state["load_episode_summary_rows"](summary_path, cli["normalize_episode_summary_row"])
+    existing_rows[str(summary_row.get("episode") or "")] = cli["normalize_episode_summary_row"](summary_row)
+    cli["write_episode_summary_csv"](summary_path, list(existing_rows.values()))
+    cli["write_run_reports"](output_dir, list(existing_rows.values()))
+
+
+def rerun_review_with_approved_rules(
+    project_root: Path,
+    output_dir: Path,
+    episode_id: str,
+    focus_rule_id: str = "",
+) -> Dict[str, object]:
+    approved_rules = approved_review_rules(project_root)
+    if focus_rule_id and not any(str(rule.get("rule_id") or "") == str(focus_rule_id) for rule in approved_rules):
+        raise RuntimeError(f"Approved learned rule not found: {focus_rule_id}")
+    cleaned_path = output_dir / f"{episode_id}_cleaned_speaker_transcript.json"
+    cleaned_payload = _load_json(cleaned_path)
+    cli = _cli_helpers()
+    cleaned_segments = cli["segment_items_from_cleaned_payload"](cleaned_payload)
+    config = load_project_config(project_root)
+    review_result = review_segments(
+        cleaned_segments,
+        config,
+        review_input_source="cleaned_json_backfill",
+        learned_rules=approved_rules,
+    )
+    review_metadata = review_result["metadata"]
+    approved_rule_ids = [str(rule.get("rule_id") or "") for rule in approved_rules if str(rule.get("rule_id") or "")]
+    review_metadata["active_learned_rule_ids"] = approved_rule_ids
+    contributing_rule_ids = [
+        rule_id
+        for rule_id in (review_metadata.get("contributing_learned_rule_ids") or [])
+        if str(rule_id) in approved_rule_ids
+    ]
+    if focus_rule_id and focus_rule_id in approved_rule_ids and focus_rule_id not in contributing_rule_ids:
+        contributing_rule_ids.append(focus_rule_id)
+    review_metadata["contributing_learned_rule_ids"] = contributing_rule_ids
+    episode_metadata = cleaned_payload.get("metadata") if isinstance(cleaned_payload.get("metadata"), dict) else {}
+    source_file = str(cleaned_payload.get("source_file") or f"{episode_id}.mp3")
+    audio_path = Path(source_file)
+    host_speaker = cleaned_payload.get("host_original_speaker_id")
+    speaker_mapping = {
+        str(key): str(value)
+        for key, value in (cleaned_payload.get("speaker_mapping") or {}).items()
+        if value not in ("", None)
+    }
+    resolved_host_label = speaker_mapping.get(str(host_speaker), "HOST") if host_speaker else "HOST"
+    host_output_labels = {resolved_host_label, "HOST"}
+    durations = {
+        str(key): float(value)
+        for key, value in (cleaned_payload.get("speaker_durations_seconds") or {}).items()
+        if value not in ("", None)
+    }
+    known_assignments = {
+        str(key): value
+        for key, value in (cleaned_payload.get("known_speaker_assignments") or {}).items()
+        if isinstance(value, dict)
+    }
+    diarized_turns = [turn for turn in (cleaned_payload.get("diarization_turns") or []) if isinstance(turn, dict)]
+    info_payload = cleaned_payload.get("transcription") if isinstance(cleaned_payload.get("transcription"), dict) else {}
+    reviewed_paths = cli["write_reviewed_output_bundle"](
+        audio_path=audio_path,
+        output_dir=output_dir,
+        reviewed_segments=review_result["segments"],
+        review_metadata=review_metadata,
+        host_output_labels=host_output_labels,
+        episode_metadata=episode_metadata,
+        info_payload=info_payload,
+        diarized_turns=diarized_turns,
+        speaker_mapping=speaker_mapping,
+        host_speaker=str(host_speaker) if host_speaker not in ("", None) else None,
+        durations=durations,
+        known_assignments=known_assignments,
+        runtime_config=config,
+    )
+    summary_row = cli["build_review_backfill_summary_row"](
+        audio_path=audio_path,
+        cleaned_payload=cleaned_payload,
+        cleaned_segments=cleaned_segments,
+        review_result=review_result,
+        processing_seconds=0.0,
+    )
+    _update_summary_for_episode(output_dir, summary_row)
+    if focus_rule_id:
+        rule = get_review_rule(project_root, focus_rule_id)
+        if rule:
+            reruns = rule.get("audit", {}).get("reruns") if isinstance(rule.get("audit"), dict) else []
+            reruns = list(reruns or [])
+            reruns.append({"episode_id": episode_id, "created_at_epoch_ms": int(time.time() * 1000)})
+            rule["audit"]["reruns"] = reruns
+            rule["provenance"]["updated_at_epoch_ms"] = int(time.time() * 1000)
+            upsert_review_rule(project_root, rule)
+    _append_audit_log(
+        project_root,
+        output_dir,
+        {
+            "created_at_epoch_ms": int(time.time() * 1000),
+            "action": "teach_me_current_episode_rerun",
+            "episode_id": episode_id,
+            "rule_id": focus_rule_id,
+            "reviewed_output_paths": [str(path) for path in reviewed_paths],
+        },
+    )
+    return {
+        "status": "ok",
+        "episode_id": episode_id,
+        "reviewed_output_paths": [str(path) for path in reviewed_paths],
+        "review_metadata": review_metadata,
+        "summary_row": summary_row,
+    }
+
+
+def approve_review_rule(project_root: Path, output_dir: Path, rule_id: str, episode_id: str) -> Dict[str, object]:
+    rule = get_review_rule(project_root, rule_id)
+    if rule is None:
+        raise RuntimeError(f"Learned rule not found: {rule_id}")
+    if rule.get("supersedes_rule_id"):
+        superseded = get_review_rule(project_root, str(rule.get("supersedes_rule_id") or ""))
+        if superseded:
+            superseded["status"] = "superseded"
+            superseded["superseded_by_rule_id"] = rule_id
+            superseded["provenance"]["updated_at_epoch_ms"] = int(time.time() * 1000)
+            upsert_review_rule(project_root, superseded)
+    rule["status"] = "approved"
+    rule["activation_status"] = "approved"
+    approvals = rule.get("audit", {}).get("approvals") if isinstance(rule.get("audit"), dict) else []
+    approvals = list(approvals or [])
+    approvals.append({"episode_id": episode_id, "created_at_epoch_ms": int(time.time() * 1000)})
+    rule["audit"]["approvals"] = approvals
+    rule["provenance"]["updated_at_epoch_ms"] = int(time.time() * 1000)
+    upsert_review_rule(project_root, rule)
+    rerun_result = rerun_review_with_approved_rules(project_root, output_dir, episode_id, focus_rule_id=rule_id)
+    _append_audit_log(
+        project_root,
+        output_dir,
+        {
+            "created_at_epoch_ms": int(time.time() * 1000),
+            "action": "teach_me_rule_approved",
+            "episode_id": episode_id,
+            "rule_id": rule_id,
+        },
+    )
+    return {
+        "status": "ok",
+        "rule": get_review_rule(project_root, rule_id),
+        "rerun": rerun_result,
+    }
+
+
+def reject_review_rule(project_root: Path, output_dir: Path, rule_id: str) -> Dict[str, object]:
+    rule = get_review_rule(project_root, rule_id)
+    if rule is None:
+        raise RuntimeError(f"Learned rule not found: {rule_id}")
+    rule["status"] = "disabled"
+    rule["activation_status"] = "rejected"
+    rule["provenance"]["updated_at_epoch_ms"] = int(time.time() * 1000)
+    upsert_review_rule(project_root, rule)
+    _append_audit_log(
+        project_root,
+        output_dir,
+        {
+            "created_at_epoch_ms": int(time.time() * 1000),
+            "action": "teach_me_rule_rejected",
+            "rule_id": rule_id,
+        },
+    )
+    return {"status": "ok", "rule": rule}
+
+
+def disable_review_rule(project_root: Path, output_dir: Path, rule_id: str) -> Dict[str, object]:
+    rule = get_review_rule(project_root, rule_id)
+    if rule is None:
+        raise RuntimeError(f"Learned rule not found: {rule_id}")
+    rule["status"] = "disabled"
+    rule["activation_status"] = "disabled"
+    rule["provenance"]["updated_at_epoch_ms"] = int(time.time() * 1000)
+    upsert_review_rule(project_root, rule)
+    _append_audit_log(
+        project_root,
+        output_dir,
+        {
+            "created_at_epoch_ms": int(time.time() * 1000),
+            "action": "teach_me_rule_disabled",
+            "rule_id": rule_id,
+        },
+    )
+    return {"status": "ok", "rule": rule}
+
+
+def backfill_review_rule(project_root: Path, output_dir: Path, rule_id: str) -> Dict[str, object]:
+    rule = get_review_rule(project_root, rule_id)
+    if rule is None or str(rule.get("status") or "") != "approved":
+        raise RuntimeError(f"Approved learned rule not found: {rule_id}")
+    episodes = discover_episode_bundles(output_dir)
+    completed = []
+    for episode in episodes:
+        episode_id = str(episode.get("episode_id") or "")
+        if not episode_id:
+            continue
+        rerun_review_with_approved_rules(project_root, output_dir, episode_id, focus_rule_id=rule_id)
+        completed.append(episode_id)
+    backfills = rule.get("audit", {}).get("backfills") if isinstance(rule.get("audit"), dict) else []
+    backfills = list(backfills or [])
+    backfills.append({"episode_ids": completed, "created_at_epoch_ms": int(time.time() * 1000)})
+    rule["audit"]["backfills"] = backfills
+    rule["provenance"]["updated_at_epoch_ms"] = int(time.time() * 1000)
+    upsert_review_rule(project_root, rule)
+    _append_audit_log(
+        project_root,
+        output_dir,
+        {
+            "created_at_epoch_ms": int(time.time() * 1000),
+            "action": "teach_me_rule_backfill",
+            "rule_id": rule_id,
+            "episode_ids": completed,
+        },
+    )
+    return {"status": "ok", "rule_id": rule_id, "episode_ids": completed, "episode_count": len(completed)}
+
+
 def preview_text_correction(project_root: Path, output_dir: Path, episode_id: str, segment_id: int, corrected_text: str) -> Dict[str, object]:
     bundle = load_episode_bundle(project_root, output_dir, episode_id)
     segment = next((item for item in bundle["cleaned"]["segments"] if int(item["id"]) == int(segment_id)), None)
@@ -556,3 +1499,11 @@ def load_audit_log(project_root: Path, output_dir: Path, limit: int = 200) -> Li
         if isinstance(payload, dict):
             entries.append(payload)
     return entries[-limit:]
+
+
+def list_review_rules(project_root: Path) -> List[Dict[str, object]]:
+    return load_review_rule_library(project_root)["rules"]
+
+
+def get_review_rule(project_root: Path, rule_id: str) -> Optional[Dict[str, object]]:
+    return load_single_review_rule(project_root, rule_id)

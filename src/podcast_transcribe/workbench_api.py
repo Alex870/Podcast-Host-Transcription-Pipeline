@@ -15,12 +15,20 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from podcast_transcribe.workbench_core import (
+    approve_review_rule,
     apply_preferred_term_addition,
     apply_replacement_map_update,
     apply_text_correction,
+    backfill_review_rule,
+    disable_review_rule,
     discover_episode_bundles,
+    get_review_rule,
+    list_review_rules,
     load_audit_log,
     load_episode_bundle,
+    propose_teach_me_rule,
+    reject_review_rule,
+    rerun_review_with_approved_rules,
     resolve_workbench_paths,
     run_semantic_scan,
 )
@@ -34,6 +42,16 @@ class SessionOpenRequest(BaseModel):
 class TextCorrectionRequest(BaseModel):
     segment_id: int = Field(..., alias="segmentId")
     corrected_text: str = Field(..., alias="correctedText")
+
+
+class TeachMeRequest(BaseModel):
+    segment_id: int = Field(..., alias="segmentId")
+    desired_reviewed_text: str = Field(..., alias="desiredReviewedText")
+    supersedes_rule_id: str = Field("", alias="supersedesRuleId")
+
+
+class RuleEpisodeRequest(BaseModel):
+    episode_id: str = Field(..., alias="episodeId")
 
 
 class PreferredTermRequest(BaseModel):
@@ -228,6 +246,88 @@ def get_audit(limit: int = 200):
     try:
         project_root, output_dir = SESSION.require()
         return {"entries": load_audit_log(project_root, output_dir, limit=limit)}
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/episodes/{episode_id}/teach-me/propose")
+def propose_teach_me_rule_endpoint(episode_id: str, payload: TeachMeRequest):
+    try:
+        project_root, output_dir = SESSION.require()
+        return propose_teach_me_rule(
+            project_root,
+            output_dir,
+            episode_id,
+            payload.segment_id,
+            payload.desired_reviewed_text,
+            supersedes_rule_id=payload.supersedes_rule_id,
+        )
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.get("/api/review-rules")
+def review_rules():
+    try:
+        project_root, _output_dir = SESSION.require()
+        return {"rules": list_review_rules(project_root)}
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.get("/api/review-rules/{rule_id}")
+def review_rule_detail(rule_id: str):
+    try:
+        project_root, _output_dir = SESSION.require()
+        rule = get_review_rule(project_root, rule_id)
+        if rule is None:
+            raise RuntimeError(f"Learned rule not found: {rule_id}")
+        return rule
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/review-rules/{rule_id}/approve")
+def approve_review_rule_endpoint(rule_id: str, payload: RuleEpisodeRequest):
+    try:
+        project_root, output_dir = SESSION.require()
+        return approve_review_rule(project_root, output_dir, rule_id, payload.episode_id)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/review-rules/{rule_id}/reject")
+def reject_review_rule_endpoint(rule_id: str):
+    try:
+        project_root, output_dir = SESSION.require()
+        return reject_review_rule(project_root, output_dir, rule_id)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/review-rules/{rule_id}/disable")
+def disable_review_rule_endpoint(rule_id: str):
+    try:
+        project_root, output_dir = SESSION.require()
+        return disable_review_rule(project_root, output_dir, rule_id)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/review-rules/{rule_id}/rerun-current-episode")
+def rerun_review_rule_endpoint(rule_id: str, payload: RuleEpisodeRequest):
+    try:
+        project_root, output_dir = SESSION.require()
+        return rerun_review_with_approved_rules(project_root, output_dir, payload.episode_id, focus_rule_id=rule_id)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/review-rules/{rule_id}/backfill")
+def backfill_review_rule_endpoint(rule_id: str):
+    try:
+        project_root, output_dir = SESSION.require()
+        return backfill_review_rule(project_root, output_dir, rule_id)
     except Exception as exc:
         raise _json_error(exc) from exc
 

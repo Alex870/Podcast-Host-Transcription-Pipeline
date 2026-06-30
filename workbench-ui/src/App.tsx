@@ -4,17 +4,24 @@ import {
   applyPreferredTerm,
   applyReplacement,
   applyTextCorrection,
+  approveReviewRule,
+  backfillReviewRule,
+  disableReviewRule,
   getSession,
   listEpisodes,
+  listReviewRules,
   loadAudit,
   loadEpisode,
   openSession,
   previewPreferredTerm,
   previewReplacement,
   previewTextCorrection,
+  proposeTeachMeRule,
+  rejectReviewRule,
+  rerunReviewRule,
   runScan,
 } from "./api";
-import type { EpisodeBundle, Finding, TranscriptSegment } from "./types";
+import type { EpisodeBundle, Finding, LearnedRule, TeachMeProposal, TranscriptSegment } from "./types";
 
 const LOCAL_STORAGE_PROJECT_KEY = "podcast-workbench-project-root";
 const LOCAL_STORAGE_OUTPUT_KEY = "podcast-workbench-output-dir";
@@ -53,10 +60,14 @@ export default function App() {
     (localStorage.getItem(LOCAL_STORAGE_VIEW_KEY) as "cleaned" | "compare") || "compare",
   );
   const [activeFinding, setActiveFinding] = useState<Finding | null>(null);
+  const [selectedTranscriptSegmentId, setSelectedTranscriptSegmentId] = useState<number | null>(null);
   const [correctionText, setCorrectionText] = useState("");
+  const [teachMeText, setTeachMeText] = useState("");
+  const [teachMeProposal, setTeachMeProposal] = useState<TeachMeProposal | null>(null);
   const [preferredTermInput, setPreferredTermInput] = useState("");
   const [replacementPreferred, setReplacementPreferred] = useState("");
   const [replacementAlias, setReplacementAlias] = useState("");
+  const [selectedRuleId, setSelectedRuleId] = useState("");
   const [statusMessage, setStatusMessage] = useState("");
 
   const sessionQuery = useQuery({
@@ -113,6 +124,12 @@ export default function App() {
   const auditQuery = useQuery({
     queryKey: ["audit"],
     queryFn: loadAudit,
+    enabled: sessionQuery.data?.sessionOpen === true,
+  });
+
+  const rulesQuery = useQuery({
+    queryKey: ["reviewRules"],
+    queryFn: listReviewRules,
     enabled: sessionQuery.data?.sessionOpen === true,
   });
 
@@ -188,22 +205,111 @@ export default function App() {
     onError: (error: Error) => setStatusMessage(error.message),
   });
 
+  const teachMeMutation = useMutation({
+    mutationFn: (payload: { segmentId: number; desiredReviewedText: string; supersedesRuleId?: string }) =>
+      proposeTeachMeRule(selectedEpisodeId, payload.segmentId, payload.desiredReviewedText, payload.supersedesRuleId ?? ""),
+    onSuccess: async (payload) => {
+      setTeachMeProposal(payload);
+      setSelectedRuleId(payload.rule_candidate.rule_id);
+      await queryClient.invalidateQueries({ queryKey: ["reviewRules"] });
+      setStatusMessage("Generalized rule proposal ready for review.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const approveRuleMutation = useMutation({
+    mutationFn: (ruleId: string) => approveReviewRule(ruleId, selectedEpisodeId),
+    onSuccess: async (payload) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["reviewRules"] }),
+        queryClient.invalidateQueries({ queryKey: ["episode", selectedEpisodeId] }),
+        queryClient.invalidateQueries({ queryKey: ["audit"] }),
+        queryClient.invalidateQueries({ queryKey: ["episodes"] }),
+      ]);
+      setTeachMeProposal(null);
+      setStatusMessage(`Rule approved and current episode rerun: ${payload.rule.rule_id}`);
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const rejectRuleMutation = useMutation({
+    mutationFn: (ruleId: string) => rejectReviewRule(ruleId),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["reviewRules"] }),
+        queryClient.invalidateQueries({ queryKey: ["audit"] }),
+      ]);
+      setTeachMeProposal(null);
+      setStatusMessage("Rule proposal rejected.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const disableRuleMutation = useMutation({
+    mutationFn: (ruleId: string) => disableReviewRule(ruleId),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["reviewRules"] }),
+        queryClient.invalidateQueries({ queryKey: ["audit"] }),
+      ]);
+      setStatusMessage("Rule disabled.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const rerunRuleMutation = useMutation({
+    mutationFn: (ruleId: string) => rerunReviewRule(ruleId, selectedEpisodeId),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["episode", selectedEpisodeId] }),
+        queryClient.invalidateQueries({ queryKey: ["audit"] }),
+        queryClient.invalidateQueries({ queryKey: ["episodes"] }),
+      ]);
+      setStatusMessage("Current episode rerun with approved learned rules.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const backfillRuleMutation = useMutation({
+    mutationFn: (ruleId: string) => backfillReviewRule(ruleId),
+    onSuccess: async (payload) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["episode", selectedEpisodeId] }),
+        queryClient.invalidateQueries({ queryKey: ["audit"] }),
+        queryClient.invalidateQueries({ queryKey: ["episodes"] }),
+        queryClient.invalidateQueries({ queryKey: ["reviewRules"] }),
+      ]);
+      setStatusMessage(`Backfill complete across ${payload.episode_count} episode(s).`);
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
   const rows = useMemo(() => transcriptRows(episodeQuery.data, viewMode), [episodeQuery.data, viewMode]);
   const semanticFindings = (episodeQuery.data?.semantic_scan?.findings as Finding[] | undefined) ?? [];
   const allFindings = [...(episodeQuery.data?.deterministic_findings ?? []), ...semanticFindings];
+  const selectedRule: LearnedRule | undefined = rulesQuery.data?.rules.find((rule) => rule.rule_id === selectedRuleId);
 
   useEffect(() => {
     localStorage.setItem(LOCAL_STORAGE_VIEW_KEY, viewMode);
   }, [viewMode]);
 
   const activeSegment = useMemo<TranscriptSegment | undefined>(() => {
-    const segmentId = activeFinding?.segment_ids?.[0];
+    const segmentId = selectedTranscriptSegmentId ?? activeFinding?.segment_ids?.[0];
     return episodeQuery.data?.cleaned.segments.find((segment) => segment.id === segmentId);
-  }, [activeFinding, episodeQuery.data]);
+  }, [activeFinding, episodeQuery.data, selectedTranscriptSegmentId]);
 
   useEffect(() => {
     setCorrectionText(activeFinding?.suggested_text ?? "");
   }, [activeFinding]);
+
+  useEffect(() => {
+    if (!activeSegment) {
+      setTeachMeText("");
+      return;
+    }
+    const reviewedSegment = episodeQuery.data?.reviewed.segments.find((segment) => segment.id === activeSegment.id);
+    setTeachMeText(reviewedSegment?.text ?? activeSegment.text);
+  }, [activeSegment, episodeQuery.data]);
 
   return (
     <div className="app-shell">
@@ -287,7 +393,14 @@ export default function App() {
               </thead>
               <tbody>
                 {rows.map((row) => (
-                  <tr key={row.id} className={row.changed ? "changed-row" : ""}>
+                  <tr
+                    key={row.id}
+                    className={`${row.changed ? "changed-row" : ""} ${selectedTranscriptSegmentId === row.id ? "selected-row" : ""}`}
+                    onClick={() => {
+                      setSelectedTranscriptSegmentId(row.id);
+                      setActiveFinding(null);
+                    }}
+                  >
                     <td>{formatTimestamp(row.start)} - {formatTimestamp(row.end)}</td>
                     <td>{row.speaker || "UNKNOWN"}</td>
                     <td>{row.text}</td>
@@ -363,6 +476,62 @@ export default function App() {
             </div>
 
             <div className="action-block">
+              <h3>Teach me</h3>
+              <div className="hint-text">Teach the review layer how to make this kind of reviewed-text revision in future runs.</div>
+              <div className="action-meta">
+                Segment: {activeSegment?.id ?? "—"} {activeSegment ? `(${activeSegment.speaker})` : ""}
+              </div>
+              <textarea
+                value={teachMeText}
+                onChange={(event) => setTeachMeText(event.target.value)}
+                placeholder="Desired reviewed text for this segment"
+                rows={4}
+              />
+              <div className="button-row">
+                <button
+                  onClick={() => activeSegment && teachMeMutation.mutate({ segmentId: activeSegment.id, desiredReviewedText: teachMeText })}
+                  disabled={!activeSegment || !teachMeText.trim()}
+                >
+                  Teach me from this edit
+                </button>
+                <button
+                  onClick={() =>
+                    activeSegment &&
+                    selectedRule &&
+                    teachMeMutation.mutate({
+                      segmentId: activeSegment.id,
+                      desiredReviewedText: teachMeText,
+                      supersedesRuleId: selectedRule.rule_id,
+                    })
+                  }
+                  disabled={!activeSegment || !teachMeText.trim() || !selectedRule}
+                >
+                  Refine rule from this edit
+                </button>
+              </div>
+              {teachMeProposal ? (
+                <div className="teach-me-proposal">
+                  <strong>{teachMeProposal.rule_candidate.summary || "Untitled learned rule"}</strong>
+                  <div>{teachMeProposal.rule_candidate.rule_family} | {teachMeProposal.rule_candidate.stage_target}</div>
+                  <div>Confidence: {teachMeProposal.rule_candidate.confidence.toFixed(2)}</div>
+                  <div>{teachMeProposal.rule_candidate.explanation || "No explanation provided."}</div>
+                  <div className="hint-text">
+                    Validation: {String((teachMeProposal.rule_candidate.validation as Record<string, unknown>)?.pass ?? false)} |{" "}
+                    Warnings: {((teachMeProposal.rule_candidate.validation as Record<string, unknown>)?.warnings as string[] | undefined)?.join(", ") || "none"}
+                  </div>
+                  <div className="button-row">
+                    <button onClick={() => approveRuleMutation.mutate(teachMeProposal.rule_candidate.rule_id)}>
+                      Approve rule
+                    </button>
+                    <button onClick={() => rejectRuleMutation.mutate(teachMeProposal.rule_candidate.rule_id)}>
+                      Reject rule
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="action-block">
               <h3>Preferred term</h3>
               <input value={preferredTermInput} onChange={(event) => setPreferredTermInput(event.target.value)} placeholder="Preferred term" />
               <div className="button-row">
@@ -391,6 +560,55 @@ export default function App() {
                   </div>
                 ))}
               </div>
+            </div>
+
+            <div className="action-block">
+              <h3>Learned rules</h3>
+              <div className="audit-list">
+                {(rulesQuery.data?.rules ?? []).map((rule) => (
+                  <button
+                    key={rule.rule_id}
+                    className={`finding-item ${selectedRuleId === rule.rule_id ? "selected" : ""}`}
+                    onClick={() => setSelectedRuleId(rule.rule_id)}
+                  >
+                    <div className="finding-row">
+                      <strong>{rule.summary || rule.rule_id}</strong>
+                      <span>{rule.status}</span>
+                    </div>
+                    <div className="finding-meta">{rule.rule_family} | {rule.stage_target}</div>
+                  </button>
+                ))}
+              </div>
+              {selectedRule ? (
+                <div className="teach-me-proposal">
+                  <strong>{selectedRule.summary || selectedRule.rule_id}</strong>
+                  <div>{selectedRule.rule_family} | {selectedRule.stage_target}</div>
+                  <div>{selectedRule.explanation || "No explanation provided."}</div>
+                  <div className="button-row">
+                    <button
+                      onClick={() => selectedRule && approveRuleMutation.mutate(selectedRule.rule_id)}
+                      disabled={selectedRule.status === "approved" || !selectedEpisodeId}
+                    >
+                      Approve rule
+                    </button>
+                    <button onClick={() => selectedRule && disableRuleMutation.mutate(selectedRule.rule_id)}>
+                      Disable rule
+                    </button>
+                    <button
+                      onClick={() => selectedRule && rerunRuleMutation.mutate(selectedRule.rule_id)}
+                      disabled={selectedRule.status !== "approved" || !selectedEpisodeId}
+                    >
+                      Re-run current episode
+                    </button>
+                    <button
+                      onClick={() => selectedRule && backfillRuleMutation.mutate(selectedRule.rule_id)}
+                      disabled={selectedRule.status !== "approved"}
+                    >
+                      Backfill other episodes
+                    </button>
+                  </div>
+                </div>
+              ) : null}
             </div>
           </section>
         </aside>

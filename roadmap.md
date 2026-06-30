@@ -238,6 +238,15 @@ These are the most plausible next roadmap steps from here.
 - add cross-episode views for recurring issue patterns, glossary candidates, and speaker instability
 - make the workbench useful as a library-level triage console, not just a single-episode viewer
 
+### Workbench Phase 6: Teach-Me Review Learning
+
+- manual reviewed-text editing as supervised teaching input
+- project-local learned review-rule library
+- LLM-based rule induction with bounded validation and refinement
+- explicit approval before activation
+- current-episode rerun plus optional batch backfill
+- rule management, auditability, and review-stage integration
+
 ## Deprioritized or Reframed Work
 
 These are ideas that still matter, but no longer define the center of the roadmap.

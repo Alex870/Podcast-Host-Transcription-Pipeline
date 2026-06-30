@@ -1,0 +1,25 @@
+{
+  "fixtures": [
+    {
+      "fixture_id": "protected_term_preserve",
+      "stage_target": "glossary_correction_review",
+      "speaker": "HOST",
+      "input_text": "ChromaDB remains the preferred product spelling here.",
+      "expected_text": "ChromaDB remains the preferred product spelling here."
+    },
+    {
+      "fixture_id": "cleanup_no_overreach",
+      "stage_target": "transcript_cleanup_review",
+      "speaker": "HOST",
+      "input_text": "This sentence is already clean and should remain unchanged.",
+      "expected_text": "This sentence is already clean and should remain unchanged."
+    },
+    {
+      "fixture_id": "style_no_broad_paraphrase",
+      "stage_target": "episode_qa_review",
+      "speaker": "HOST",
+      "input_text": "The speaker makes a clear point without needing any stylistic rewrite.",
+      "expected_text": "The speaker makes a clear point without needing any stylistic rewrite."
+    }
+  ]
+}

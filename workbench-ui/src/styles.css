@@ -208,6 +208,10 @@ textarea {
   background: rgba(50, 103, 180, 0.12);
 }
 
+.selected-row td {
+  background: rgba(82, 140, 222, 0.18);
+}
+
 .metadata-panel,
 .findings-panel,
 .actions-panel {
@@ -238,6 +242,16 @@ textarea {
   padding-bottom: 14px;
   margin-bottom: 14px;
   border-bottom: 1px solid #243040;
+}
+
+.teach-me-proposal {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid #334862;
+  border-radius: 6px;
+  background: #172131;
 }
 
 .segmented-control {

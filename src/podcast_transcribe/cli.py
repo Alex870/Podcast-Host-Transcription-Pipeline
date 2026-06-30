@@ -63,10 +63,11 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
+import huggingface_hub
 import numpy as np
+import scipy
 import torch
 import torchaudio
-import huggingface_hub
 from faster_whisper import WhisperModel
 
 
@@ -143,6 +144,7 @@ from podcast_transcribe.review_benchmark import run_review_benchmark, write_revi
 from podcast_transcribe.state import (
     ARTIFACT_DIRNAME,
     CHECKPOINT_DIRNAME,
+    DIARIZATION_HISTORY_FILENAME,
     RESUME_STATE_FILENAME,
     REVIEW_CALIBRATION_FILENAME,
     SUMMARY_FILENAME,
@@ -150,10 +152,12 @@ from podcast_transcribe.state import (
     clear_stage_artifacts as state_clear_stage_artifacts,
     expected_output_paths as state_expected_output_paths,
     is_file_already_processed as state_is_file_already_processed,
+    load_diarization_history_state as state_load_diarization_history_state,
     load_review_calibration_state as state_load_review_calibration_state,
     load_stage_artifact as state_load_stage_artifact,
     load_episode_summary_rows as state_load_episode_summary_rows,
     load_processed_files as state_load_processed_files,
+    save_diarization_history_state as state_save_diarization_history_state,
     save_review_calibration_state as state_save_review_calibration_state,
     save_stage_artifact as state_save_stage_artifact,
     save_processed_files as state_save_processed_files,
@@ -170,6 +174,15 @@ from podcast_transcribe.speakers import (
 
 SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
 LONG_FILE_WARNING_HOURS = 4.0
+DIARIZATION_CHUNK_MINUTES = 25.0
+DIARIZATION_CHUNK_OVERLAP_SECONDS = 90.0
+DIARIZATION_PROBE_MARGIN_SECONDS = 30.0 * 60.0
+DIARIZATION_PROBE_NEARBY_FAILURE_SECONDS = 15.0 * 60.0
+DIARIZATION_PROBE_RECENT_WINDOW = 5
+DIARIZATION_PROBE_COOLDOWN_EPISODES = 3
+DIARIZATION_PROBE_COOLDOWN_SECONDS = 24.0 * 60.0 * 60.0
+DIARIZATION_RECONCILIATION_SIMILARITY = 0.72
+DIARIZATION_MIN_EMBEDDING_SECONDS = 0.75
 
 
 class ProgressHook:
@@ -312,6 +325,236 @@ def make_review_progress_callback():
 
 def review_calibration_state_path(output_dir: Path) -> Path:
     return output_dir / REVIEW_CALIBRATION_FILENAME
+
+
+def diarization_history_state_path(output_dir: Path) -> Path:
+    return output_dir / DIARIZATION_HISTORY_FILENAME
+
+
+def current_time_epoch_seconds() -> float:
+    return float(time.time())
+
+
+def diarization_runtime_fingerprint(
+    diarization_model_id: str,
+    input_mode: str,
+) -> Dict[str, object]:
+    return {
+        "diarization_model_id": str(diarization_model_id or ""),
+        "pyannote_version": str(getattr(pyannote_audio, "__version__", "") or ""),
+        "scipy_version": str(getattr(scipy, "__version__", "") or ""),
+        "torch_version": str(getattr(torch, "__version__", "") or ""),
+        "input_mode": str(input_mode or ""),
+    }
+
+
+def _normalize_diarization_history_record(record: Dict[str, object]) -> Dict[str, object]:
+    normalized = dict(record)
+    normalized["duration_seconds"] = float(record.get("duration_seconds") or 0.0)
+    normalized["timestamp_epoch_seconds"] = float(record.get("timestamp_epoch_seconds") or 0.0)
+    normalized["probe"] = bool(record.get("probe"))
+    normalized["invalidated"] = bool(record.get("invalidated"))
+    normalized["mode"] = str(record.get("mode") or "")
+    normalized["outcome"] = str(record.get("outcome") or "")
+    return normalized
+
+
+def load_diarization_history(output_dir: Path) -> Dict[str, object]:
+    payload = state_load_diarization_history_state(diarization_history_state_path(output_dir))
+    if not isinstance(payload, dict):
+        return {"records": []}
+    records = payload.get("records") or []
+    return {
+        "records": [
+            _normalize_diarization_history_record(record)
+            for record in records
+            if isinstance(record, dict)
+        ]
+    }
+
+
+def save_diarization_history(output_dir: Path, payload: Dict[str, object]):
+    state_save_diarization_history_state(diarization_history_state_path(output_dir), payload)
+
+
+def diarization_history_records_for_fingerprint(
+    history_state: Dict[str, object],
+    fingerprint: Dict[str, object],
+) -> List[Dict[str, object]]:
+    return [
+        record
+        for record in (history_state.get("records") or [])
+        if isinstance(record, dict) and record.get("runtime_fingerprint") == fingerprint
+    ]
+
+
+def diarization_learning_state(
+    history_state: Dict[str, object],
+    fingerprint: Dict[str, object],
+) -> Dict[str, object]:
+    records = diarization_history_records_for_fingerprint(history_state, fingerprint)
+    successes = [
+        record for record in records
+        if record.get("mode") == "global" and record.get("outcome") == "success"
+    ]
+    failures = [
+        record for record in records
+        if record.get("mode") == "global" and record.get("outcome") == "memory_error" and not record.get("invalidated")
+    ]
+    safe_success_ceiling = max((float(record.get("duration_seconds") or 0.0) for record in successes), default=0.0)
+    failure_floor = min((float(record.get("duration_seconds") or 0.0) for record in failures), default=0.0)
+    recent_probes = [
+        record for record in records
+        if record.get("probe")
+    ]
+    recent_probes = sorted(recent_probes, key=lambda item: float(item.get("timestamp_epoch_seconds") or 0.0), reverse=True)
+    return {
+        "records": records,
+        "safe_success_ceiling": safe_success_ceiling,
+        "failure_floor": failure_floor,
+        "recent_probes": recent_probes,
+    }
+
+
+def should_probe_diarization_duration(
+    duration_seconds: float,
+    learning_state: Dict[str, object],
+    now_epoch_seconds: Optional[float] = None,
+) -> Tuple[bool, str]:
+    failure_floor = float(learning_state.get("failure_floor") or 0.0)
+    if failure_floor <= 0:
+        return False, "no_failure_floor"
+    if duration_seconds <= failure_floor:
+        return False, "below_failure_floor"
+    if duration_seconds > failure_floor + DIARIZATION_PROBE_MARGIN_SECONDS:
+        return False, "outside_probe_band"
+
+    recent_probes = learning_state.get("recent_probes") or []
+    nearby_failed_probe = any(
+        record.get("outcome") == "memory_error"
+        and abs(float(record.get("duration_seconds") or 0.0) - duration_seconds) <= DIARIZATION_PROBE_NEARBY_FAILURE_SECONDS
+        for record in recent_probes[:DIARIZATION_PROBE_RECENT_WINDOW]
+    )
+    if nearby_failed_probe:
+        return False, "recent_nearby_probe_failed"
+
+    if recent_probes:
+        latest_probe = recent_probes[0]
+        completed_episodes_since_probe = sum(
+            1
+            for record in learning_state.get("records") or []
+            if float(record.get("timestamp_epoch_seconds") or 0.0) > float(latest_probe.get("timestamp_epoch_seconds") or 0.0)
+        )
+        now_value = now_epoch_seconds if now_epoch_seconds is not None else current_time_epoch_seconds()
+        seconds_since_probe = now_value - float(latest_probe.get("timestamp_epoch_seconds") or 0.0)
+        if (
+            completed_episodes_since_probe < DIARIZATION_PROBE_COOLDOWN_EPISODES
+            and seconds_since_probe < DIARIZATION_PROBE_COOLDOWN_SECONDS
+        ):
+            return False, "probe_cooldown_active"
+
+    return True, "probe_band"
+
+
+def diarization_route_decision(
+    duration_seconds: Optional[float],
+    history_state: Dict[str, object],
+    fingerprint: Dict[str, object],
+) -> Dict[str, object]:
+    if duration_seconds is None or duration_seconds <= 0:
+        return {
+            "mode": "global",
+            "probe": False,
+            "learned_route": False,
+            "reason": "duration_unknown",
+            "failure_floor_seconds": 0.0,
+            "safe_success_ceiling_seconds": 0.0,
+        }
+    learning_state = diarization_learning_state(history_state, fingerprint)
+    safe_success_ceiling = float(learning_state.get("safe_success_ceiling") or 0.0)
+    failure_floor = float(learning_state.get("failure_floor") or 0.0)
+    if failure_floor <= 0:
+        return {
+            "mode": "global",
+            "probe": False,
+            "learned_route": False,
+            "reason": "no_failure_history",
+            "failure_floor_seconds": failure_floor,
+            "safe_success_ceiling_seconds": safe_success_ceiling,
+        }
+    if duration_seconds <= safe_success_ceiling:
+        return {
+            "mode": "global",
+            "probe": False,
+            "learned_route": True,
+            "reason": "below_safe_success_ceiling",
+            "failure_floor_seconds": failure_floor,
+            "safe_success_ceiling_seconds": safe_success_ceiling,
+        }
+    if duration_seconds <= failure_floor:
+        return {
+            "mode": "chunked_preemptive",
+            "probe": False,
+            "learned_route": True,
+            "reason": "at_or_below_failure_floor",
+            "failure_floor_seconds": failure_floor,
+            "safe_success_ceiling_seconds": safe_success_ceiling,
+        }
+    if duration_seconds > failure_floor + DIARIZATION_PROBE_MARGIN_SECONDS:
+        return {
+            "mode": "chunked_preemptive",
+            "probe": False,
+            "learned_route": True,
+            "reason": "above_failure_floor_plus_probe_margin",
+            "failure_floor_seconds": failure_floor,
+            "safe_success_ceiling_seconds": safe_success_ceiling,
+        }
+    probe_allowed, probe_reason = should_probe_diarization_duration(duration_seconds, learning_state)
+    return {
+        "mode": "global" if probe_allowed else "chunked_preemptive",
+        "probe": probe_allowed,
+        "learned_route": True,
+        "reason": probe_reason,
+        "failure_floor_seconds": failure_floor,
+        "safe_success_ceiling_seconds": safe_success_ceiling,
+    }
+
+
+def update_diarization_history(
+    output_dir: Path,
+    runtime_fingerprint: Dict[str, object],
+    audio_path: Path,
+    duration_seconds: float,
+    mode: str,
+    outcome: str,
+    probe: bool = False,
+):
+    history_state = load_diarization_history(output_dir)
+    record = {
+        "audio_file": audio_path.name,
+        "duration_seconds": float(duration_seconds or 0.0),
+        "mode": str(mode or ""),
+        "outcome": str(outcome or ""),
+        "probe": bool(probe),
+        "timestamp_epoch_seconds": current_time_epoch_seconds(),
+        "runtime_fingerprint": runtime_fingerprint,
+        "invalidated": False,
+    }
+    history_state.setdefault("records", []).append(record)
+    if mode == "global" and outcome == "success":
+        for existing in history_state["records"]:
+            if (
+                isinstance(existing, dict)
+                and existing.get("runtime_fingerprint") == runtime_fingerprint
+                and existing.get("mode") == "global"
+                and existing.get("outcome") == "memory_error"
+                and not existing.get("invalidated")
+                and float(existing.get("duration_seconds") or 0.0) >= float(duration_seconds or 0.0)
+            ):
+                existing["invalidated"] = True
+                existing["invalidated_by_audio_file"] = audio_path.name
+                existing["invalidated_at_epoch_seconds"] = record["timestamp_epoch_seconds"]
+    save_diarization_history(output_dir, history_state)
 
 
 def load_review_calibration_session(
@@ -1175,19 +1418,42 @@ def run_diarization_stage(
     output_dir: Path,
     audio_path: Path,
     diarization_pipeline: Pipeline,
+    diarization_model_id: str,
+    verifier: Any,
     num_speakers: Optional[int],
+    max_embedding_seconds: float,
     resume_intermediates: bool,
-) -> Tuple[List[Dict[str, object]], bool]:
+) -> Tuple[List[Dict[str, object]], bool, Dict[str, object]]:
     if resume_intermediates:
         cached = load_diarization_artifact(output_dir, audio_path)
         if cached is not None:
             print("  stage: diarization (reused cached artifact)")
-            return cached, True
+            metadata = {
+                "mode": "global",
+                "probe": False,
+                "learned_route": False,
+                "reason": "reused_cached_artifact",
+                "failure_floor_seconds": 0.0,
+                "safe_success_ceiling_seconds": 0.0,
+                "chunk_count": 0,
+                "chunk_overlap_seconds": 0.0,
+                "reconciliation_merge_count": 0,
+                "reconciliation_ambiguous_count": 0,
+            }
+            return cached, True, metadata
 
     print("  stage: diarization")
-    diarized_turns = diarize_audio(diarization_pipeline, str(audio_path), num_speakers=num_speakers)
+    diarized_turns, metadata = diarize_audio(
+        output_dir=output_dir,
+        pipeline=diarization_pipeline,
+        diarization_model_id=diarization_model_id,
+        verifier=verifier,
+        audio_path=str(audio_path),
+        num_speakers=num_speakers,
+        max_embedding_seconds=max_embedding_seconds,
+    )
     save_diarization_artifact(output_dir, audio_path, diarized_turns)
-    return diarized_turns, False
+    return diarized_turns, False, metadata
 
 
 def pyannote_path_input_available() -> bool:
@@ -1199,12 +1465,19 @@ def pyannote_path_input_available() -> bool:
     return hasattr(pyannote_io, "AudioDecoder")
 
 
-def diarize_audio(pipeline: Pipeline, audio_path: str, num_speakers: Optional[int]) -> List[Dict[str, object]]:
-    """Run pyannote diarization and return plain speaker-turn dictionaries."""
-
+def diarization_kwargs(num_speakers: Optional[int]) -> Dict[str, object]:
     kwargs = {}
     if num_speakers:
         kwargs["num_speakers"] = num_speakers
+    return kwargs
+
+
+def _call_global_diarization(
+    pipeline: Pipeline,
+    audio_path: str,
+    kwargs: Dict[str, object],
+) -> Tuple[List[Dict[str, object]], str]:
+    """Run pyannote diarization and return plain speaker-turn dictionaries plus input mode."""
 
     if pyannote_path_input_available():
         try:
@@ -1216,7 +1489,7 @@ def diarize_audio(pipeline: Pipeline, audio_path: str, num_speakers: Optional[in
                 f"Path-input error: {path_exc}"
             )
         else:
-            return diarization_to_turns(diarization)
+            return diarization_to_turns(diarization), "path_input"
 
     waveform, sample_rate = torchaudio.load(audio_path)
     diarization_input = {
@@ -1226,7 +1499,376 @@ def diarize_audio(pipeline: Pipeline, audio_path: str, num_speakers: Optional[in
     with ProgressHook() as hook:
         diarization = pipeline(diarization_input, hook=hook, **kwargs)
 
-    return diarization_to_turns(diarization)
+    return diarization_to_turns(diarization), "waveform_preload"
+
+
+def _is_diarization_memory_error(exc: Exception) -> bool:
+    message = str(exc)
+    return isinstance(exc, MemoryError) or "unable to allocate array data" in message.lower()
+
+
+def plan_diarization_chunks(duration_seconds: float) -> List[Dict[str, float]]:
+    chunk_seconds = DIARIZATION_CHUNK_MINUTES * 60.0
+    overlap_seconds = DIARIZATION_CHUNK_OVERLAP_SECONDS
+    if duration_seconds <= chunk_seconds:
+        return [
+            {
+                "index": 1,
+                "start": 0.0,
+                "end": float(duration_seconds),
+                "core_start": 0.0,
+                "core_end": float(duration_seconds),
+            }
+        ]
+    chunks = []
+    step = max(60.0, chunk_seconds - overlap_seconds)
+    start = 0.0
+    index = 1
+    while start < duration_seconds:
+        end = min(duration_seconds, start + chunk_seconds)
+        chunks.append({"index": index, "start": start, "end": end})
+        if end >= duration_seconds:
+            break
+        start += step
+        index += 1
+    for idx, chunk in enumerate(chunks):
+        prev_end = chunks[idx - 1]["end"] if idx > 0 else chunk["start"]
+        next_start = chunks[idx + 1]["start"] if idx + 1 < len(chunks) else chunk["end"]
+        chunk["core_start"] = chunk["start"] if idx == 0 else max(chunk["start"], (chunk["start"] + prev_end) / 2.0)
+        chunk["core_end"] = chunk["end"] if idx == len(chunks) - 1 else min(chunk["end"], (chunk["end"] + next_start) / 2.0)
+    return chunks
+
+
+def _offset_and_prefix_turns(turns: List[Dict[str, object]], chunk: Dict[str, float]) -> List[Dict[str, object]]:
+    result = []
+    chunk_id = int(chunk["index"])
+    for turn in turns:
+        result.append(
+            {
+                "start": float(turn["start"]) + float(chunk["start"]),
+                "end": float(turn["end"]) + float(chunk["start"]),
+                "speaker": f"chunk{chunk_id:03d}:{turn['speaker']}",
+                "local_speaker": str(turn["speaker"]),
+                "chunk_index": chunk_id,
+            }
+        )
+    return result
+
+
+def turns_in_window(diarized_turns: List[Dict[str, object]], start_seconds: float, end_seconds: float) -> List[Dict[str, object]]:
+    return [
+        turn
+        for turn in diarized_turns
+        if overlap_seconds(float(turn["start"]), float(turn["end"]), start_seconds, end_seconds) > 0.0
+    ]
+
+
+def build_chunk_speaker_embeddings(
+    verifier: Any,
+    audio_path: str,
+    diarized_turns: List[Dict[str, object]],
+    max_seconds: float,
+) -> Dict[str, np.ndarray]:
+    speaker_audio = build_speaker_audio_samples(audio_path, diarized_turns, max_seconds)
+    embeddings = {}
+    for speaker, clip in speaker_audio.items():
+        if clip.numel() == 0:
+            continue
+        clip_seconds = float(clip.shape[0]) / 16000.0
+        if clip_seconds < DIARIZATION_MIN_EMBEDDING_SECONDS:
+            continue
+        try:
+            embeddings[speaker] = compute_embedding(verifier, clip)
+        except RuntimeError as exc:
+            if "Padding size should be less than the corresponding input dimension" in str(exc):
+                continue
+            raise
+    speaker_audio.clear()
+    gc.collect()
+    return embeddings
+
+
+def reconcile_chunk_speakers(
+    verifier: Any,
+    audio_path: str,
+    chunk_payloads: List[Dict[str, object]],
+    max_embedding_seconds: float,
+) -> Tuple[Dict[str, str], Dict[str, int]]:
+    parent: Dict[str, str] = {}
+    ambiguous_count = 0
+    merge_count = 0
+
+    def find(item: str) -> str:
+        root = parent.setdefault(item, item)
+        if root != item:
+            parent[item] = find(root)
+        return parent[item]
+
+    def union(a: str, b: str):
+        nonlocal merge_count
+        root_a = find(a)
+        root_b = find(b)
+        if root_a == root_b:
+            return
+        chosen = min(root_a, root_b)
+        other = root_b if chosen == root_a else root_a
+        parent[other] = chosen
+        merge_count += 1
+
+    for payload in chunk_payloads:
+        for turn in payload["turns"]:
+            parent.setdefault(str(turn["speaker"]), str(turn["speaker"]))
+
+    for idx in range(len(chunk_payloads) - 1):
+        left = chunk_payloads[idx]
+        right = chunk_payloads[idx + 1]
+        overlap_start = max(float(left["chunk"]["start"]), float(right["chunk"]["start"]))
+        overlap_end = min(float(left["chunk"]["end"]), float(right["chunk"]["end"]))
+        if overlap_end <= overlap_start:
+            continue
+        left_overlap = turns_in_window(left["turns"], overlap_start, overlap_end)
+        right_overlap = turns_in_window(right["turns"], overlap_start, overlap_end)
+        if not left_overlap or not right_overlap:
+            continue
+        left_embeddings = build_chunk_speaker_embeddings(verifier, audio_path, left_overlap, min(max_embedding_seconds, 45.0))
+        right_embeddings = build_chunk_speaker_embeddings(verifier, audio_path, right_overlap, min(max_embedding_seconds, 45.0))
+        if not left_embeddings or not right_embeddings:
+            continue
+        score_pairs: List[Tuple[float, str, str]] = []
+        for right_speaker, right_embedding in right_embeddings.items():
+            speaker_scores = []
+            for left_speaker, left_embedding in left_embeddings.items():
+                score = cosine_similarity(left_embedding, right_embedding)
+                speaker_scores.append((score, left_speaker))
+            speaker_scores.sort(reverse=True)
+            if not speaker_scores:
+                continue
+            if len(speaker_scores) > 1 and (speaker_scores[0][0] - speaker_scores[1][0]) < 0.03:
+                ambiguous_count += 1
+            best_score, best_left = speaker_scores[0]
+            if best_score >= DIARIZATION_RECONCILIATION_SIMILARITY:
+                score_pairs.append((best_score, best_left, right_speaker))
+        assigned_left = set()
+        assigned_right = set()
+        for _score, left_speaker, right_speaker in sorted(score_pairs, reverse=True):
+            if left_speaker in assigned_left or right_speaker in assigned_right:
+                continue
+            union(left_speaker, right_speaker)
+            assigned_left.add(left_speaker)
+            assigned_right.add(right_speaker)
+
+    root_to_global: Dict[str, str] = {}
+    next_index = 0
+    for speaker in sorted(parent.keys()):
+        root = find(speaker)
+        if root not in root_to_global:
+            root_to_global[root] = f"SPEAKER_{next_index:02d}"
+            next_index += 1
+    return (
+        {speaker: root_to_global[find(speaker)] for speaker in parent.keys()},
+        {
+            "reconciliation_merge_count": merge_count,
+            "reconciliation_ambiguous_count": ambiguous_count,
+        },
+    )
+
+
+def stitch_chunk_turns(
+    chunk_payloads: List[Dict[str, object]],
+    speaker_mapping: Dict[str, str],
+) -> List[Dict[str, object]]:
+    stitched: List[Dict[str, object]] = []
+    for payload in chunk_payloads:
+        chunk = payload["chunk"]
+        for turn in payload["turns"]:
+            clipped_start = max(float(turn["start"]), float(chunk["core_start"]))
+            clipped_end = min(float(turn["end"]), float(chunk["core_end"]))
+            if clipped_end <= clipped_start:
+                continue
+            stitched.append(
+                {
+                    "start": clipped_start,
+                    "end": clipped_end,
+                    "speaker": speaker_mapping.get(str(turn["speaker"]), str(turn["speaker"])),
+                }
+            )
+    stitched.sort(key=lambda item: (float(item["start"]), float(item["end"])))
+    merged: List[Dict[str, object]] = []
+    for turn in stitched:
+        if (
+            merged
+            and merged[-1]["speaker"] == turn["speaker"]
+            and abs(float(merged[-1]["end"]) - float(turn["start"])) <= 0.25
+        ):
+            merged[-1]["end"] = max(float(merged[-1]["end"]), float(turn["end"]))
+        else:
+            merged.append(dict(turn))
+    return merged
+
+
+def diarize_audio_chunked(
+    pipeline: Pipeline,
+    verifier: Any,
+    audio_path: str,
+    num_speakers: Optional[int],
+    duration_seconds: float,
+    max_embedding_seconds: float,
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    kwargs = diarization_kwargs(num_speakers)
+    chunks = plan_diarization_chunks(duration_seconds)
+    print(f"  diarization mode: chunked fallback ({len(chunks)} chunk(s), overlap {int(DIARIZATION_CHUNK_OVERLAP_SECONDS)}s)")
+    chunk_payloads: List[Dict[str, object]] = []
+    sample_rate, _, _ = get_audio_metadata(audio_path)
+    if sample_rate is None or sample_rate <= 0:
+        sample_rate = 16000
+    resampler = torchaudio.transforms.Resample(sample_rate, 16000) if sample_rate != 16000 else None
+    for chunk in chunks:
+        print(f"    diarization chunk {int(chunk['index'])}/{len(chunks)}")
+        waveform = load_audio_span_mono_16k(
+            audio_path,
+            float(chunk["start"]),
+            float(chunk["end"]),
+            sample_rate=sample_rate,
+            resampler=resampler,
+        )
+        diarization_input = {
+            "waveform": waveform.unsqueeze(0) if waveform.ndim == 1 else waveform,
+            "sample_rate": 16000,
+        }
+        with ProgressHook(hidden=False) as hook:
+            diarization = pipeline(diarization_input, hook=hook, **kwargs)
+        turns = _offset_and_prefix_turns(diarization_to_turns(diarization), chunk)
+        chunk_payloads.append({"chunk": chunk, "turns": turns})
+    print("    reconciling chunk speakers")
+    local_to_global, reconciliation_stats = reconcile_chunk_speakers(
+        verifier,
+        audio_path,
+        chunk_payloads,
+        max_embedding_seconds,
+    )
+    final_turns = stitch_chunk_turns(chunk_payloads, local_to_global)
+    metadata = {
+        "mode": "chunked_fallback_after_failure",
+        "probe": False,
+        "learned_route": False,
+        "reason": "global_memory_error",
+        "failure_floor_seconds": 0.0,
+        "safe_success_ceiling_seconds": 0.0,
+        "chunk_count": len(chunks),
+        "chunk_overlap_seconds": float(DIARIZATION_CHUNK_OVERLAP_SECONDS),
+        **reconciliation_stats,
+    }
+    return final_turns, metadata
+
+
+def diarize_audio(
+    output_dir: Path,
+    pipeline: Pipeline,
+    diarization_model_id: str,
+    verifier: Any,
+    audio_path: str,
+    num_speakers: Optional[int],
+    max_embedding_seconds: float,
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    """Run pyannote diarization and return plain speaker-turn dictionaries plus route metadata."""
+    duration_seconds = get_audio_duration_seconds(audio_path)
+    expected_input_mode = "path_input" if pyannote_path_input_available() else "waveform_preload"
+    runtime_fingerprint = diarization_runtime_fingerprint(diarization_model_id, expected_input_mode)
+    history_state = load_diarization_history(output_dir)
+    route = diarization_route_decision(duration_seconds, history_state, runtime_fingerprint)
+    if route["mode"] == "chunked_preemptive" and duration_seconds:
+        print(
+            "  diarization mode: preemptive chunked "
+            f"(failure_floor={format_timestamp(route['failure_floor_seconds'])}, "
+            f"success_ceiling={format_timestamp(route['safe_success_ceiling_seconds'])}, "
+            f"reason={route['reason']})"
+        )
+        turns, metadata = diarize_audio_chunked(
+            pipeline,
+            verifier,
+            audio_path,
+            num_speakers,
+            duration_seconds,
+            max_embedding_seconds,
+        )
+        metadata.update(route)
+        metadata["mode"] = "chunked_preemptive"
+        update_diarization_history(
+            output_dir,
+            runtime_fingerprint,
+            Path(audio_path),
+            float(duration_seconds or 0.0),
+            "chunked_preemptive",
+            "success",
+            probe=False,
+        )
+        return turns, metadata
+
+    if route.get("probe"):
+        print(
+            "  diarization mode: global diarization probe "
+            f"(failure_floor={format_timestamp(route['failure_floor_seconds'])}, "
+            f"success_ceiling={format_timestamp(route['safe_success_ceiling_seconds'])})"
+        )
+    else:
+        print("  diarization mode: global")
+
+    kwargs = diarization_kwargs(num_speakers)
+    try:
+        turns, actual_input_mode = _call_global_diarization(pipeline, audio_path, kwargs)
+    except Exception as exc:
+        if _is_diarization_memory_error(exc) and duration_seconds:
+            print("  global diarization hit MemoryError; retrying with chunked fallback.")
+            actual_fingerprint = diarization_runtime_fingerprint(diarization_model_id, expected_input_mode)
+            update_diarization_history(
+                output_dir,
+                actual_fingerprint,
+                Path(audio_path),
+                float(duration_seconds or 0.0),
+                "global",
+                "memory_error",
+                probe=bool(route.get("probe")),
+            )
+            turns, metadata = diarize_audio_chunked(
+                pipeline,
+                verifier,
+                audio_path,
+                num_speakers,
+                duration_seconds,
+                max_embedding_seconds,
+            )
+            metadata.update(route)
+            metadata["mode"] = "chunked_fallback_after_failure"
+            metadata["reason"] = "global_memory_error"
+            metadata["probe"] = bool(route.get("probe"))
+            update_diarization_history(
+                output_dir,
+                actual_fingerprint,
+                Path(audio_path),
+                float(duration_seconds or 0.0),
+                "chunked_fallback_after_failure",
+                "success",
+                probe=False,
+            )
+            return turns, metadata
+        raise
+    if duration_seconds:
+        actual_fingerprint = diarization_runtime_fingerprint(diarization_model_id, actual_input_mode)
+        update_diarization_history(
+            output_dir,
+            actual_fingerprint,
+            Path(audio_path),
+            float(duration_seconds or 0.0),
+            "global",
+            "success",
+            probe=bool(route.get("probe")),
+        )
+    route["mode"] = "global"
+    route["chunk_count"] = 0
+    route["chunk_overlap_seconds"] = 0.0
+    route["reconciliation_merge_count"] = 0
+    route["reconciliation_ambiguous_count"] = 0
+    return turns, route
 
 
 def diarization_to_turns(diarization) -> List[Dict[str, object]]:
@@ -1879,6 +2521,16 @@ def build_episode_summary_row(
         "processing_mode": "",
         "tier1_reused_from_existing": False,
         "review_backfilled_from_cleaned_json": False,
+        "diarization_mode": "",
+        "diarization_probe_attempted": False,
+        "diarization_learned_route": False,
+        "diarization_route_reason": "",
+        "diarization_failure_floor_seconds": 0,
+        "diarization_safe_success_ceiling_seconds": 0,
+        "diarization_chunk_count": 0,
+        "diarization_chunk_overlap_seconds": 0,
+        "diarization_reconciliation_merge_count": 0,
+        "diarization_reconciliation_ambiguous_count": 0,
     }
 
 
@@ -1934,6 +2586,8 @@ def write_episode_summary_csv(path: Path, rows: List[Dict[str, object]]):
         "review_skipped_stages",
         "review_input_source",
         "review_episode_qa_mode",
+        "active_learned_rule_ids",
+        "contributing_learned_rule_ids",
         "review_calibration_source",
         "review_local_text_budget",
         "review_local_speaker_budget",
@@ -1957,6 +2611,16 @@ def write_episode_summary_csv(path: Path, rows: List[Dict[str, object]]):
         "processing_mode",
         "tier1_reused_from_existing",
         "review_backfilled_from_cleaned_json",
+        "diarization_mode",
+        "diarization_probe_attempted",
+        "diarization_learned_route",
+        "diarization_route_reason",
+        "diarization_failure_floor_seconds",
+        "diarization_safe_success_ceiling_seconds",
+        "diarization_chunk_count",
+        "diarization_chunk_overlap_seconds",
+        "diarization_reconciliation_merge_count",
+        "diarization_reconciliation_ambiguous_count",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -2039,6 +2703,12 @@ def normalize_episode_summary_row(row: Dict[str, object]) -> Dict[str, object]:
         "review_overridden_change_count",
         "preferred_term_intervention_count",
         "review_guard_intervention_count",
+        "diarization_failure_floor_seconds",
+        "diarization_safe_success_ceiling_seconds",
+        "diarization_chunk_count",
+        "diarization_chunk_overlap_seconds",
+        "diarization_reconciliation_merge_count",
+        "diarization_reconciliation_ambiguous_count",
     }
     bool_fields = {
         "host_detected",
@@ -2053,6 +2723,8 @@ def normalize_episode_summary_row(row: Dict[str, object]) -> Dict[str, object]:
         "host_profile_stability_flag",
         "tier1_reused_from_existing",
         "review_backfilled_from_cleaned_json",
+        "diarization_probe_attempted",
+        "diarization_learned_route",
     }
 
     normalized = dict(row)
@@ -2094,6 +2766,8 @@ def apply_review_metadata_to_summary(summary_row: Dict[str, object], review_resu
     summary_row["review_skipped_stages"] = ";".join(str(item) for item in review_metadata.get("review_skipped_stages") or [])
     summary_row["review_input_source"] = str(review_metadata.get("review_input_source") or "")
     summary_row["review_episode_qa_mode"] = str(review_metadata.get("episode_qa_mode") or "")
+    summary_row["active_learned_rule_ids"] = ";".join(str(item) for item in review_metadata.get("active_learned_rule_ids") or [])
+    summary_row["contributing_learned_rule_ids"] = ";".join(str(item) for item in review_metadata.get("contributing_learned_rule_ids") or [])
     calibration = review_metadata.get("review_calibration") if isinstance(review_metadata.get("review_calibration"), dict) else {}
     families = calibration.get("families") if isinstance(calibration.get("families"), dict) else {}
     summary_row["review_calibration_source"] = (
@@ -3019,11 +3693,14 @@ def process_file(
 
     diarization_started = time.perf_counter()
     print_episode_stage(2, 5, "diarization")
-    diarized_turns, diarization_reused = run_diarization_stage(
+    diarized_turns, diarization_reused, diarization_metadata = run_diarization_stage(
         output_dir=output_dir,
         audio_path=audio_path,
         diarization_pipeline=diarization_pipeline,
+        diarization_model_id=str((runtime_config or {}).get("diarization_model") or ""),
+        verifier=verifier,
         num_speakers=num_speakers,
+        max_embedding_seconds=max_embedding_seconds,
         resume_intermediates=resume_intermediates,
     )
     assign_speakers_to_segments(segments, diarized_turns)
@@ -3301,6 +3978,16 @@ def process_file(
     summary_row["processing_mode"] = "tier1+tier2" if resolve_review_runtime_config(runtime_config or {}).get("any_review_enabled") else "tier1-only"
     summary_row["tier1_reused_from_existing"] = False
     summary_row["review_backfilled_from_cleaned_json"] = False
+    summary_row["diarization_mode"] = str(diarization_metadata.get("mode") or "")
+    summary_row["diarization_probe_attempted"] = bool(diarization_metadata.get("probe"))
+    summary_row["diarization_learned_route"] = bool(diarization_metadata.get("learned_route"))
+    summary_row["diarization_route_reason"] = str(diarization_metadata.get("reason") or "")
+    summary_row["diarization_failure_floor_seconds"] = int(float(diarization_metadata.get("failure_floor_seconds") or 0.0))
+    summary_row["diarization_safe_success_ceiling_seconds"] = int(float(diarization_metadata.get("safe_success_ceiling_seconds") or 0.0))
+    summary_row["diarization_chunk_count"] = int(diarization_metadata.get("chunk_count") or 0)
+    summary_row["diarization_chunk_overlap_seconds"] = int(float(diarization_metadata.get("chunk_overlap_seconds") or 0.0))
+    summary_row["diarization_reconciliation_merge_count"] = int(diarization_metadata.get("reconciliation_merge_count") or 0)
+    summary_row["diarization_reconciliation_ambiguous_count"] = int(diarization_metadata.get("reconciliation_ambiguous_count") or 0)
     stage_timings["total"] = time.perf_counter() - file_started
     outputs = [
         output_dir / f"{base_name}_speaker_transcript.txt",

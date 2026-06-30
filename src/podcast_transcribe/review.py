@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from podcast_transcribe.config import resolve_review_runtime_config
+from podcast_transcribe.learned_rules import active_rules_for_stage
 from podcast_transcribe.models import SegmentItem
 from podcast_transcribe.state import ARTIFACT_DIRNAME
 
@@ -35,6 +37,7 @@ LONG_CONTEXT_ADAPT_UPWARD_GROWTH_FACTOR = 1.03
 LONG_CONTEXT_ADAPT_UPWARD_MAX_STEP = 256
 LONG_CONTEXT_ADAPT_COOLDOWN_SUCCESSES = 20
 UPWARD_FAILURE_LOCK_THRESHOLD = 2
+SYNTHETIC_SEGMENT_ID_FACTOR = 10000
 
 REVIEW_STAGE_FAMILIES = {
     "transcript_cleanup_review": "local_text_review",
@@ -644,6 +647,129 @@ def _split_segments_by_token_budget(
     return windows
 
 
+def _split_text_into_review_chunks(text: str, token_budget: int) -> List[str]:
+    normalized = " ".join(str(text or "").split())
+    if not normalized:
+        return []
+
+    max_words = max(48, token_budget // 4)
+    sentence_parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", normalized) if part.strip()]
+    if not sentence_parts:
+        sentence_parts = [normalized]
+
+    units: List[str] = []
+    for part in sentence_parts:
+        words = part.split()
+        if len(words) <= max_words:
+            units.append(part)
+            continue
+        for index in range(0, len(words), max_words):
+            units.append(" ".join(words[index : index + max_words]).strip())
+
+    chunks: List[str] = []
+    current_words: List[str] = []
+    current_count = 0
+    for unit in units:
+        unit_words = unit.split()
+        unit_count = len(unit_words)
+        if current_words and current_count + unit_count > max_words:
+            chunks.append(" ".join(current_words).strip())
+            current_words = unit_words
+            current_count = unit_count
+            continue
+        current_words.extend(unit_words)
+        current_count += unit_count
+    if current_words:
+        chunks.append(" ".join(current_words).strip())
+    return [chunk for chunk in chunks if chunk]
+
+
+def _synthetic_segment_id(original_id: int, piece_index: int) -> int:
+    return int(original_id) * SYNTHETIC_SEGMENT_ID_FACTOR + piece_index + 1
+
+
+def _split_single_segment_for_review(segment: SegmentItem, token_budget: int) -> List[SegmentItem]:
+    pieces = _split_text_into_review_chunks(segment.text, token_budget)
+    if len(pieces) <= 1:
+        return []
+
+    total_chars = max(1, sum(len(piece) for piece in pieces))
+    duration = max(0.0, float(segment.end) - float(segment.start))
+    cursor = float(segment.start)
+    synthetic_segments: List[SegmentItem] = []
+    for piece_index, piece in enumerate(pieces):
+        if piece_index == len(pieces) - 1:
+            piece_end = float(segment.end)
+        else:
+            share = len(piece) / total_chars
+            piece_end = min(float(segment.end), cursor + duration * share)
+        synthetic_segments.append(
+            SegmentItem(
+                id=_synthetic_segment_id(int(segment.id), piece_index),
+                start=cursor,
+                end=piece_end,
+                text=piece,
+                speaker=segment.speaker,
+                avg_logprob=segment.avg_logprob,
+                no_speech_prob=segment.no_speech_prob,
+                words=[],
+                original_text=piece,
+                cleanup_applied=segment.cleanup_applied,
+                cleanup_level=segment.cleanup_level,
+                manual_correction_applied=segment.manual_correction_applied,
+                original_speaker=segment.original_speaker,
+                llm_reviewed_text=None,
+                review_runtime_profile=segment.review_runtime_profile,
+                review_backend=segment.review_backend,
+                review_model_name=segment.review_model_name,
+                review_stage_flags=deepcopy(segment.review_stage_flags),
+            )
+        )
+        cursor = piece_end
+    return synthetic_segments
+
+
+def _merge_synthetic_segment_updates(
+    original_segment: SegmentItem,
+    synthetic_segments: List[SegmentItem],
+    reviewed_items: List[Dict[str, object]],
+    stage_definition: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    updates_by_id = {
+        str(item.get("id")): item
+        for item in reviewed_items
+        if isinstance(item, dict) and item.get("id") is not None
+    }
+    text_parts: List[str] = []
+    changed = False
+    speaker_candidates: List[str] = []
+
+    for synthetic_segment in synthetic_segments:
+        update = updates_by_id.get(str(synthetic_segment.id), {})
+        piece_text = str(update.get("text") or synthetic_segment.text).strip()
+        if piece_text != str(synthetic_segment.text).strip():
+            changed = True
+        text_parts.append(piece_text)
+        if update.get("speaker") is not None:
+            speaker_candidates.append(str(update.get("speaker") or "").strip())
+
+    merged_text = " ".join(part for part in text_parts if part).strip()
+    merged_update: Dict[str, object] = {"id": original_segment.id}
+    if merged_text and merged_text != str(original_segment.text or "").strip():
+        merged_update["text"] = merged_text
+        changed = True
+
+    if stage_definition.get("edit_scope") != "text_only" and speaker_candidates:
+        unique_speakers = {speaker for speaker in speaker_candidates if speaker}
+        if len(unique_speakers) == 1:
+            merged_speaker = next(iter(unique_speakers))
+            if merged_speaker != str(original_segment.speaker or "").strip():
+                merged_update["speaker"] = merged_speaker
+                changed = True
+
+    return merged_update if changed else None
+
+
 def _normalize_backend_response_text(response: Dict[str, object]) -> str:
     def _coerce_parts(value: object) -> str:
         if isinstance(value, str):
@@ -683,6 +809,38 @@ def _strip_json_code_fences(text: str) -> str:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         return "\n".join(lines).strip()
+    return stripped
+
+
+def _extract_first_json_object(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return stripped
+    start = stripped.find("{")
+    if start < 0:
+        return stripped
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(stripped)):
+        char = stripped[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "\"":
+                in_string = False
+            continue
+        if char == "\"":
+            in_string = True
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return stripped[start : index + 1]
     return stripped
 
 
@@ -827,7 +985,11 @@ def _minimum_size_failure_reason(stage_mode: str) -> str:
     return "invalid_response_at_minimum_size"
 
 
-def _build_stage_system_prompt(stage_definition: Dict[str, object], preferred_terms: Optional[List[str]] = None) -> str:
+def _build_stage_system_prompt(
+    stage_definition: Dict[str, object],
+    preferred_terms: Optional[List[str]] = None,
+    learned_rules: Optional[List[Dict[str, object]]] = None,
+) -> str:
     label = stage_definition["label"]
     description = stage_definition["description"]
     edit_scope = stage_definition["edit_scope"]
@@ -852,6 +1014,17 @@ def _build_stage_system_prompt(stage_definition: Dict[str, object], preferred_te
             "Glossary corrections may move text toward these spellings, but never away from them. "
             f"Reserved preferred terms: {', '.join(protected_terms[:40])}."
         )
+    active_rule_summaries = [
+        str(rule.get("summary") or "").strip()
+        for rule in (learned_rules or [])
+        if str(rule.get("summary") or "").strip()
+    ]
+    if active_rule_summaries:
+        prompt += (
+            " Approved project-specific learned review rules also apply to this stage. "
+            "Treat them as narrow local guidance and prefer the smallest change that satisfies them. "
+            f"Active learned rules: {' | '.join(active_rule_summaries[:8])}."
+        )
     return prompt
 
 
@@ -861,6 +1034,7 @@ def _execute_stage_backend_request(
     stage_definition: Dict[str, object],
     stage_mode: str,
     preferred_terms: Optional[List[str]] = None,
+    learned_rules: Optional[List[Dict[str, object]]] = None,
     debug_context: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     budget = int(backend_capabilities.get("max_context_budget") or 16000)
@@ -890,10 +1064,15 @@ def _execute_stage_backend_request(
         "max_changed_segments_hint": 8 if stage_mode == "local_batch" else 16,
         "preferred_terms": [str(term).strip() for term in (preferred_terms or []) if str(term).strip()],
         "preferred_terms_are_reserved": True,
+        "learned_rules": list(learned_rules or []),
         "segments": _segment_prompt_payload(segments),
     }
     user_prompt = json.dumps(request_payload, ensure_ascii=True)
-    system_prompt = _build_stage_system_prompt(stage_definition, preferred_terms=preferred_terms)
+    system_prompt = _build_stage_system_prompt(
+        stage_definition,
+        preferred_terms=preferred_terms,
+        learned_rules=learned_rules,
+    )
     if _should_force_no_think(backend_capabilities) and not system_prompt.lstrip().startswith("/no_think"):
         system_prompt = f"/no_think {system_prompt}"
     raw_response_text = _openai_compatible_chat_completion(
@@ -952,7 +1131,7 @@ def _execute_stage_backend_request(
         if finish_reason == "length":
             raise RuntimeError("Review backend response was truncated before any usable content was returned.")
         raise RuntimeError("Review backend returned an empty response.")
-    content = _strip_json_code_fences(content)
+    content = _extract_first_json_object(_strip_json_code_fences(content))
     try:
         payload = json.loads(content)
     except json.JSONDecodeError as exc:
@@ -1011,12 +1190,37 @@ def _execute_stage_backend_request(
     return payload
 
 
+def _call_stage_backend_request(
+    window: List[SegmentItem],
+    backend_capabilities: Dict[str, object],
+    stage_definition: Dict[str, object],
+    stage_mode: str,
+    preferred_terms: Optional[List[str]] = None,
+    learned_rules: Optional[List[Dict[str, object]]] = None,
+    debug_context: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    kwargs = {
+        "preferred_terms": preferred_terms,
+        "debug_context": debug_context,
+    }
+    if learned_rules:
+        kwargs["learned_rules"] = learned_rules
+    return _execute_stage_backend_request(
+        window,
+        backend_capabilities,
+        stage_definition,
+        stage_mode,
+        **kwargs,
+    )
+
+
 def _collect_window_updates(
     windows: List[List[SegmentItem]],
     backend_capabilities: Dict[str, object],
     stage_definition: Dict[str, object],
     stage_mode: str,
     preferred_terms: Optional[List[str]] = None,
+    learned_rules: Optional[List[Dict[str, object]]] = None,
     calibration_session: Optional[ReviewCalibrationSession] = None,
     progress_callback: Optional[ReviewProgressCallback] = None,
     debug_context: Optional[Dict[str, object]] = None,
@@ -1034,12 +1238,13 @@ def _collect_window_updates(
     ) -> Tuple[List[Dict[str, object]], List[str], bool]:
         nonlocal split_event_count
         try:
-            payload = _execute_stage_backend_request(
+            payload = _call_stage_backend_request(
                 window,
                 backend_capabilities,
                 stage_definition,
                 stage_mode,
                 preferred_terms=preferred_terms,
+                learned_rules=learned_rules,
                 debug_context=window_context,
             )
         except RuntimeError as exc:
@@ -1089,6 +1294,59 @@ def _collect_window_updates(
                     },
                 )
                 return left_updates + right_updates, split_notes + left_notes + right_notes, True
+            if stage_mode == "local_batch":
+                if calibration_session:
+                    calibration_session.note_truncation(
+                        family_name,
+                        sum(_estimated_segment_tokens(segment) for segment in window),
+                        progress_callback=progress_callback,
+                    )
+                synthetic_split_depth = int(window_context.get("synthetic_split_depth") or 0)
+                synthetic_budget = max(
+                    128,
+                    min(
+                        int(_family_floor_budget(family_name)),
+                        max(128, sum(_estimated_segment_tokens(segment) for segment in window) // 2),
+                    ),
+                )
+                synthetic_segments = _split_single_segment_for_review(window[0], synthetic_budget)
+                if synthetic_split_depth < 3 and len(synthetic_segments) > 1:
+                    split_event_count += 1
+                    split_notes = [
+                        (
+                            f"{stage_definition['name']} window {window_context.get('window_index')}/"
+                            f"{window_context.get('window_total')} hit minimum segment size; retrying as "
+                            f"{len(synthetic_segments)} synthetic text chunks."
+                        )
+                    ]
+                    if progress_callback:
+                        progress_callback(
+                            {
+                                "event": "stage_window_split",
+                                "stage_name": stage_definition["name"],
+                                "stage_label": stage_definition["label"],
+                                "mode": stage_mode,
+                                "split_sizes": [len(synthetic_segments)],
+                            }
+                        )
+                    synthetic_updates, synthetic_notes, _ = collect_with_backoff(
+                        synthetic_segments,
+                        {
+                            **window_context,
+                            "window_index": f"{window_context.get('window_index')}s",
+                            "window_total": len(synthetic_segments),
+                            "synthetic_split_depth": synthetic_split_depth + 1,
+                        },
+                    )
+                    merged_update = _merge_synthetic_segment_updates(
+                        window[0],
+                        synthetic_segments,
+                        synthetic_updates,
+                        stage_definition,
+                    )
+                    if merged_update is None:
+                        return [], split_notes + synthetic_notes, True
+                    return [merged_update], split_notes + synthetic_notes, True
             raise RuntimeError(_minimum_size_failure_reason(stage_mode)) from exc
 
         window_notes = _normalize_episode_notes(payload)
@@ -1280,6 +1538,7 @@ def _run_review_stage(
     backend_capabilities: Dict[str, object],
     stage_definition: Dict[str, object],
     preferred_terms: Optional[List[str]] = None,
+    learned_rules: Optional[List[Dict[str, object]]] = None,
     calibration_session: Optional[ReviewCalibrationSession] = None,
     progress_callback: Optional[ReviewProgressCallback] = None,
     debug_context: Optional[Dict[str, object]] = None,
@@ -1291,6 +1550,7 @@ def _run_review_stage(
         if calibration_session
         else _family_default_budget(backend_capabilities, family_name)
     )
+    stage_learned_rules = active_rules_for_stage(learned_rules or [], stage_definition["name"])
     if progress_callback:
         progress_callback(
             {
@@ -1333,12 +1593,13 @@ def _run_review_stage(
         full_episode_cost = sum(_estimated_segment_tokens(segment) for segment in segments)
         if full_episode_cost <= budget:
             try:
-                payload = _execute_stage_backend_request(
+                payload = _call_stage_backend_request(
                     segments,
                     backend_capabilities,
                     stage_definition,
                     "full_episode",
                     preferred_terms=preferred_terms,
+                    learned_rules=stage_learned_rules,
                     debug_context=debug_context,
                 )
                 updates_by_id = {
@@ -1414,6 +1675,7 @@ def _run_review_stage(
             stage_definition,
             "chunked",
             preferred_terms=preferred_terms,
+            learned_rules=stage_learned_rules,
             calibration_session=calibration_session,
             progress_callback=progress_callback,
             debug_context=debug_context,
@@ -1466,6 +1728,7 @@ def _run_review_stage(
         stage_definition,
         "local_batch",
         preferred_terms=preferred_terms,
+        learned_rules=stage_learned_rules,
         calibration_session=calibration_session,
         progress_callback=progress_callback,
         debug_context=debug_context,
@@ -1606,6 +1869,7 @@ def review_segments(
     calibration_session: Optional[ReviewCalibrationSession] = None,
     progress_callback: Optional[ReviewProgressCallback] = None,
     debug_context: Optional[Dict[str, object]] = None,
+    learned_rules: Optional[List[Dict[str, object]]] = None,
 ) -> Dict[str, object]:
     """Return additive reviewed segments and metadata, or a skipped/fallback result."""
 
@@ -1614,6 +1878,11 @@ def review_segments(
     flags = build_review_stage_flags(backend_capabilities)
     stage_results = {stage["name"]: _disabled_stage_result(stage) for stage in STAGE_DEFINITIONS}
     enabled_stages = [stage["name"] for stage in STAGE_DEFINITIONS if flags.get(stage["name"], False)]
+    active_rule_ids = [
+        str(rule.get("rule_id") or "")
+        for rule in (learned_rules or [])
+        if str(rule.get("status") or "") == "approved" and str(rule.get("rule_id") or "")
+    ]
     metadata = {
         "review_pipeline_version": REVIEW_PIPELINE_VERSION,
         "review_runtime_profile": backend_capabilities["runtime_profile"],
@@ -1637,6 +1906,9 @@ def review_segments(
         "review_change_summary": {},
         "review_stage_value": {},
         "review_guard_interventions": {},
+        "active_learned_rule_ids": active_rule_ids,
+        "learned_rule_stage_summary": {},
+        "contributing_learned_rule_ids": [],
     }
 
     if not backend_capabilities["any_review_enabled"]:
@@ -1718,6 +1990,7 @@ def review_segments(
                 backend_capabilities,
                 stage_definition,
                 preferred_terms=preferred_terms,
+                learned_rules=learned_rules,
                 calibration_session=calibration_session,
                 progress_callback=progress_callback,
                 debug_context=debug_context,
@@ -1762,6 +2035,15 @@ def review_segments(
             metadata["review_skipped_stages"].append(stage_name)
         if stage_name == "episode_qa_review":
             metadata["episode_qa_mode"] = stage_mode
+        stage_rule_ids = [
+            str(rule.get("rule_id") or "")
+            for rule in (learned_rules or [])
+            if str(rule.get("status") or "") == "approved" and str(rule.get("stage_target") or "") == stage_name
+        ]
+        metadata["learned_rule_stage_summary"][stage_name] = {
+            "active_rule_ids": stage_rule_ids,
+            "materially_contributed": bool(stage_rule_ids and int(stage_result.get("corrected_segment_count") or 0) > 0),
+        }
         if stage_notes:
             episode_notes.extend(f"{stage_name}: {note}" for note in stage_notes)
 
@@ -1774,6 +2056,12 @@ def review_segments(
             first_stage = metadata["review_skipped_stages"][0]
             metadata["review_skip_reason"] = metadata["review_stage_results"][first_stage]["skip_reason"]
         metadata["review_calibration"] = calibration_session.metadata_snapshot() if calibration_session else {}
+        metadata["contributing_learned_rule_ids"] = [
+            rule_id
+            for stage_payload in metadata["learned_rule_stage_summary"].values()
+            for rule_id in stage_payload.get("active_rule_ids") or []
+            if stage_payload.get("materially_contributed")
+        ]
         (
             metadata["review_change_summary"],
             metadata["review_stage_value"],

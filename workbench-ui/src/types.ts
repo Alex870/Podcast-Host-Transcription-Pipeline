@@ -60,3 +60,26 @@ export type SessionInfo = {
   projectRoot?: string;
   outputDir?: string;
 };
+
+export type LearnedRule = {
+  rule_id: string;
+  status: string;
+  activation_status: string;
+  rule_family: string;
+  stage_target: string;
+  summary: string;
+  explanation: string;
+  confidence: number;
+  ambiguity_notes: string[];
+  validation: Record<string, unknown>;
+  source_examples: Array<Record<string, unknown>>;
+};
+
+export type TeachMeProposal = {
+  status: string;
+  session_id: string;
+  episode_id: string;
+  segment_id: number;
+  source_example: Record<string, unknown>;
+  rule_candidate: LearnedRule;
+};

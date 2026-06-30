@@ -19,13 +19,19 @@ def _install_cli_test_stubs():
     numpy_stub.linalg = types.SimpleNamespace(norm=lambda value: 1.0)
     sys.modules.setdefault("numpy", numpy_stub)
 
+    scipy_stub = types.ModuleType("scipy")
+    scipy_stub.__version__ = "1.0-test"
+    sys.modules.setdefault("scipy", scipy_stub)
+
     torch_stub = types.ModuleType("torch")
     torch_stub.Tensor = object
+    torch_stub.__version__ = "2.0-test"
     torch_stub.cuda = types.SimpleNamespace(is_available=lambda: False, empty_cache=lambda: None)
     torch_stub.device = lambda value: value
     sys.modules.setdefault("torch", torch_stub)
 
     torchaudio_stub = types.ModuleType("torchaudio")
+    torchaudio_stub.load = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("torchaudio.load stub should not be used in this test"))
     torchaudio_stub.transforms = types.SimpleNamespace(Resample=type("Resample", (), {}))
     sys.modules.setdefault("torchaudio", torchaudio_stub)
 
@@ -66,10 +72,16 @@ def _install_cli_test_stubs():
 _install_cli_test_stubs()
 
 from podcast_transcribe.cli import (
+    build_chunk_speaker_embeddings,
     classify_episode_processing_state,
+    diarization_route_decision,
+    diarization_runtime_fingerprint,
+    diarize_audio,
+    load_diarization_history,
     normalize_episode_summary_row,
     process_audio_batch,
     process_review_backfill_from_cleaned_json,
+    update_diarization_history,
 )
 from podcast_transcribe.outputs import build_episode_metadata, write_json_output, write_text_transcript
 
@@ -610,6 +622,153 @@ class ReviewBackfillTests(unittest.TestCase):
             text = buffer.getvalue()
             self.assertNotIn("Batch progress: file 1 of 1", text)
             self.assertNotIn("Processing mode for Episode 20260512.mp3", text)
+
+    def test_diarization_route_uses_probe_band_and_recent_failure_suppression(self):
+        fingerprint = diarization_runtime_fingerprint("pyannote/test-model", "path_input")
+        history_state = {
+            "records": [
+                {
+                    "audio_file": "fail.mp3",
+                    "duration_seconds": 4 * 3600 + 10 * 60,
+                    "mode": "global",
+                    "outcome": "memory_error",
+                    "probe": False,
+                    "timestamp_epoch_seconds": 100.0,
+                    "runtime_fingerprint": fingerprint,
+                    "invalidated": False,
+                }
+            ]
+        }
+
+        route = diarization_route_decision(4 * 3600 + 28 * 60, history_state, fingerprint)
+        self.assertEqual(route["mode"], "global")
+        self.assertTrue(route["probe"])
+
+        exact_floor_route = diarization_route_decision(4 * 3600 + 10 * 60, history_state, fingerprint)
+        self.assertEqual(exact_floor_route["mode"], "chunked_preemptive")
+        self.assertEqual(exact_floor_route["reason"], "at_or_below_failure_floor")
+
+        history_state["records"].append(
+            {
+                "audio_file": "probe-fail.mp3",
+                "duration_seconds": 4 * 3600 + 24 * 60,
+                "mode": "global",
+                "outcome": "memory_error",
+                "probe": True,
+                "timestamp_epoch_seconds": 200.0,
+                "runtime_fingerprint": fingerprint,
+                "invalidated": False,
+            }
+        )
+        route = diarization_route_decision(4 * 3600 + 28 * 60, history_state, fingerprint)
+        self.assertEqual(route["mode"], "chunked_preemptive")
+        self.assertFalse(route["probe"])
+        self.assertEqual(route["reason"], "recent_nearby_probe_failed")
+
+    def test_diarization_history_invalidates_failure_after_shorter_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            audio_fail = output_dir / "fail.mp3"
+            audio_success = output_dir / "success.mp3"
+            audio_fail.write_bytes(b"fail")
+            audio_success.write_bytes(b"success")
+            fingerprint = diarization_runtime_fingerprint("pyannote/test-model", "path_input")
+
+            update_diarization_history(
+                output_dir,
+                fingerprint,
+                audio_fail,
+                4 * 3600 + 10 * 60,
+                "global",
+                "memory_error",
+                probe=False,
+            )
+            update_diarization_history(
+                output_dir,
+                fingerprint,
+                audio_success,
+                4 * 3600,
+                "global",
+                "success",
+                probe=False,
+            )
+            history = load_diarization_history(output_dir)
+            active_failures = [
+                record for record in history["records"]
+                if record.get("runtime_fingerprint") == fingerprint
+                and record.get("mode") == "global"
+                and record.get("outcome") == "memory_error"
+                and not record.get("invalidated")
+            ]
+            self.assertEqual(active_failures, [])
+
+    def test_diarize_audio_retries_chunked_after_memory_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            audio_path = output_dir / "Episode.mp3"
+            audio_path.write_bytes(b"audio")
+
+            with patch("podcast_transcribe.cli.get_audio_duration_seconds", return_value=4 * 3600 + 20 * 60), patch(
+                "podcast_transcribe.cli.pyannote_path_input_available",
+                return_value=True,
+            ), patch(
+                "podcast_transcribe.cli._call_global_diarization",
+                side_effect=MemoryError("unable to allocate array data"),
+            ), patch(
+                "podcast_transcribe.cli.diarize_audio_chunked",
+                return_value=(
+                    [{"start": 0.0, "end": 5.0, "speaker": "SPEAKER_00"}],
+                    {
+                        "mode": "chunked_fallback_after_failure",
+                        "chunk_count": 3,
+                        "chunk_overlap_seconds": 90.0,
+                        "reconciliation_merge_count": 2,
+                        "reconciliation_ambiguous_count": 1,
+                    },
+                ),
+            ):
+                turns, metadata = diarize_audio(
+                    output_dir=output_dir,
+                    pipeline=object(),
+                    diarization_model_id="pyannote/test-model",
+                    verifier=object(),
+                    audio_path=str(audio_path),
+                    num_speakers=None,
+                    max_embedding_seconds=120.0,
+                )
+
+            self.assertEqual(len(turns), 1)
+            self.assertEqual(metadata["mode"], "chunked_fallback_after_failure")
+            history = load_diarization_history(output_dir)
+            outcomes = [(record["mode"], record["outcome"]) for record in history["records"]]
+            self.assertIn(("global", "memory_error"), outcomes)
+            self.assertIn(("chunked_fallback_after_failure", "success"), outcomes)
+
+    def test_build_chunk_speaker_embeddings_skips_tiny_or_invalid_clips(self):
+        tiny_clip = SimpleNamespace(numel=lambda: 10, shape=(1000,))
+        bad_clip = SimpleNamespace(numel=lambda: 10, shape=(16000,))
+        good_clip = SimpleNamespace(numel=lambda: 10, shape=(32000,))
+        with patch(
+            "podcast_transcribe.cli.build_speaker_audio_samples",
+            return_value={
+                "tiny": tiny_clip,
+                "bad": bad_clip,
+                "good": good_clip,
+            },
+        ), patch(
+            "podcast_transcribe.cli.compute_embedding",
+            side_effect=[
+                RuntimeError("Padding size should be less than the corresponding input dimension"),
+                "good-embedding",
+            ],
+        ):
+            embeddings = build_chunk_speaker_embeddings(
+                verifier=object(),
+                audio_path="episode.mp3",
+                diarized_turns=[],
+                max_seconds=10.0,
+            )
+        self.assertEqual(embeddings, {"good": "good-embedding"})
 
 
 if __name__ == "__main__":

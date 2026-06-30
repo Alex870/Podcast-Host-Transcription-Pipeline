@@ -123,6 +123,94 @@ class ReviewTests(unittest.TestCase):
 
         self.assertIn("truncated", str(context.exception).lower())
 
+    def test_execute_stage_request_extracts_json_object_from_wrapped_response(self):
+        segment = make_segment(1, "HOST", "short text")
+        backend_capabilities = {
+            "runtime_profile": "high_context_5090",
+            "backend_name": "vllm",
+            "review_base_url": "http://127.0.0.1:8000",
+            "review_model_name": "qwen-review",
+            "max_context_budget": 16000,
+            "structured_output_support": True,
+        }
+        stage_definition = {
+            "name": "transcript_cleanup_review",
+            "label": "cleanup",
+            "edit_scope": "text_only",
+            "description": "Conservative transcript cleanup only.",
+        }
+
+        raw_response = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Here is the patch you requested:\n{\"reviewed_segments\":[{\"id\":1,\"text\":\"better text\"}],\"corrected_segment_count\":1,\"episode_notes\":[]}\nDone.",
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+        with patch("podcast_transcribe.review._openai_compatible_chat_completion", return_value=__import__("json").dumps(raw_response)):
+            payload = _execute_stage_backend_request([segment], backend_capabilities, stage_definition, "local_batch")
+
+        self.assertEqual(payload["corrected_segment_count"], 1)
+        self.assertEqual(payload["reviewed_segments"][0]["text"], "better text")
+
+    def test_execute_stage_request_includes_active_learned_rules(self):
+        segment = make_segment(1, "HOST", "short text")
+        backend_capabilities = {
+            "runtime_profile": "high_context_5090",
+            "backend_name": "vllm",
+            "review_base_url": "http://127.0.0.1:8000",
+            "review_model_name": "qwen-review",
+            "max_context_budget": 16000,
+            "structured_output_support": True,
+        }
+        stage_definition = {
+            "name": "glossary_correction_review",
+            "label": "glossary",
+            "edit_scope": "text_only",
+            "description": "Preferred-term consistency only.",
+        }
+        captured = {}
+
+        def fake_chat_completion(backend_capabilities, system_prompt, user_prompt, max_output_tokens):
+            captured["system_prompt"] = system_prompt
+            captured["user_prompt"] = user_prompt
+            return __import__("json").dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "{\"reviewed_segments\":[],\"corrected_segment_count\":0,\"episode_notes\":[]}",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            )
+
+        with patch("podcast_transcribe.review._openai_compatible_chat_completion", side_effect=fake_chat_completion):
+            _execute_stage_backend_request(
+                [segment],
+                backend_capabilities,
+                stage_definition,
+                "local_batch",
+                learned_rules=[
+                    {
+                        "rule_id": "rule_1",
+                        "summary": "Prefer ChromaDB over Chroma DB.",
+                        "directive": "Prefer ChromaDB over Chroma DB.",
+                    }
+                ],
+            )
+
+        self.assertIn("Active learned rules", captured["system_prompt"])
+        self.assertIn("\"learned_rules\"", captured["user_prompt"])
+
     def test_local_batch_request_uses_tighter_output_cap(self):
         segment = make_segment(1, "HOST", "short text")
         backend_capabilities = {
@@ -270,6 +358,45 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(result["segments"][0].text, "alpha revised")
         self.assertEqual(result["segments"][1].text, "beta revised")
         self.assertIn("split retry succeeded", " ".join(result["metadata"]["episode_notes"]))
+
+    def test_cleanup_review_splits_oversized_single_segment_into_synthetic_chunks(self):
+        long_text = " ".join(f"word{i}" for i in range(400))
+        segments = [make_segment(1, "HOST", long_text)]
+        seen_windows = []
+
+        def fake_stage_call(window, backend_capabilities, stage_definition, stage_mode, debug_context=None, preferred_terms=None):
+            seen_windows.append([segment.id for segment in window])
+            if len(window) == 1 and window[0].id == 1:
+                raise RuntimeError("Review backend response was truncated before the JSON payload completed.")
+            reviewed_segments = []
+            for segment in window:
+                if str(segment.text).startswith("word0 "):
+                    reviewed_segments.append({"id": segment.id, "text": f"{segment.text} revised"})
+            return {
+                "reviewed_segments": reviewed_segments,
+                "corrected_segment_count": len(reviewed_segments),
+                "episode_notes": ["synthetic split retry succeeded"],
+            }
+
+        with patch("podcast_transcribe.review._execute_stage_backend_request", side_effect=fake_stage_call):
+            result = review_segments(
+                segments,
+                {
+                    "runtime_profile": "custom",
+                    "backend": "vllm",
+                    "review_base_url": "http://127.0.0.1:8000",
+                    "review_model_name": "qwen-review",
+                    "transcript_cleanup_review": True,
+                    "review_context_budget": 16000,
+                },
+            )
+
+        self.assertEqual(seen_windows[0], [1])
+        self.assertGreater(len(seen_windows[1]), 1)
+        self.assertTrue(result["attempted"])
+        self.assertFalse(result["skipped"])
+        self.assertIn("revised", result["segments"][0].text)
+        self.assertIn("synthetic split retry succeeded", " ".join(result["metadata"]["episode_notes"]))
 
     def test_cleanup_review_uses_minimum_size_failure_reason_at_single_segment(self):
         segments = [make_segment(1, "HOST", "alpha")]
