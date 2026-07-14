@@ -19,6 +19,7 @@ from podcast_transcribe.workbench_core import (
     preview_text_correction,
     propose_teach_me_rule,
     run_semantic_scan,
+    save_gold_segment_annotation,
 )
 
 
@@ -430,6 +431,33 @@ class WorkbenchCoreTests(unittest.TestCase):
                 result = backfill_review_rule(project_root, output_dir, "rule_backfill")
 
             self.assertEqual(result["episode_count"], 2)
+
+    def test_gold_annotation_updates_reference_and_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "project"
+            output_dir = project_root / "output"
+            project_root.mkdir(parents=True)
+            output_dir.mkdir(parents=True)
+            self._write_project_config(project_root)
+            self._write_cleaned_payload(output_dir, "Episode 20260628")
+
+            result = save_gold_segment_annotation(
+                project_root,
+                output_dir,
+                "Episode 20260628",
+                1,
+                "ChromaDB remains the storage layer for this workflow.",
+                "HOST",
+                tags=["glossary", "clean-audio"],
+                notes="Human verified.",
+            )
+
+            self.assertTrue(result["present"])
+            reference = json.loads(Path(result["path"]).read_text(encoding="utf-8"))
+            self.assertEqual(reference["segments"][0]["text"], "ChromaDB remains the storage layer for this workflow.")
+            manifest_path = project_root / "benchmarks" / "pipeline_gold_set" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["entries"][0]["id"], "Episode 20260628")
 
 
 if __name__ == "__main__":

@@ -31,6 +31,14 @@ Directory containing known-speaker reference clips and `speakers.json`.
 
 Persistent host voice profile updated over time to improve host matching across episodes.
 
+### `host_reference`
+
+- Type: `string`
+- Default: `""`
+- Affects: speaker identification, stage-cache compatibility
+
+Optional clean host-reference audio file. Relative paths are resolved from the repository root.
+
 ### `corrections_dir`
 
 - Type: `string`
@@ -53,6 +61,8 @@ Optional override directory for review debug artifacts. When blank and `review_d
 
 ## Hugging Face and FFmpeg
 
+The current validated Windows GPU environment uses PyTorch 2.9.0 with CUDA 12.8, TorchAudio 2.9.0, TorchVision 0.24.0, and TorchCodec 0.8.1. Install those versions through `podcast_transcribe_requirements.txt`; they are environment dependencies rather than config keys. A shared FFmpeg build is still required for TorchCodec path-based audio decoding.
+
 ### `hf_token`
 
 - Type: `string`
@@ -70,6 +80,15 @@ Fallback Hugging Face token if `HF_TOKEN` is not already available through the e
 Directory containing the FFmpeg Windows binaries/DLLs.
 
 ## Whisper and Baseline Transcription
+
+### `asr_provider`
+
+- Type: `string`
+- Allowed values: `faster_whisper`
+- Default: `"faster_whisper"`
+- Affects: baseline transcription, stage-cache compatibility
+
+Selects the ASR provider contract. The initial provider release wraps the established faster-whisper path; candidate ASR providers remain gated on pipeline benchmark results.
 
 ### `model`
 
@@ -120,6 +139,33 @@ Decode beam size.
 
 Whisper transcription batch size.
 
+### `diarization_model`
+
+- Type: `string`
+- Default: `"pyannote/speaker-diarization-community-1"`
+- Affects: diarization, stage-cache compatibility
+
+Hugging Face model id for the pyannote diarization pipeline.
+
+## Word Alignment
+
+### `alignment_provider`
+
+- Type: `string`
+- Allowed values: `timestamp_passthrough`, `whisperx`
+- Default: `"timestamp_passthrough"`
+- Affects: word timing, speaker attribution, stage-cache compatibility
+
+`timestamp_passthrough` preserves the current faster-whisper word timestamps. `whisperx` enables optional forced alignment and requires the separate optional alignment dependency environment.
+
+### `alignment_model`
+
+- Type: `string`
+- Default: `""`
+- Affects: forced alignment
+
+Optional WhisperX alignment model override. Blank uses the language-specific provider default.
+
 ### `isolate_files`
 
 - Type: `boolean`
@@ -137,6 +183,47 @@ When `true`, the launcher prefers isolated child-process handling so native memo
 Preflight/dry benchmark-plan behavior for the baseline runner. This is separate from the dedicated review benchmark mode.
 
 ## Speaker Identification
+
+### `speaker_embedding_provider`
+
+- Type: `string`
+- Allowed values: `speechbrain_ecapa`
+- Default: `"speechbrain_ecapa"`
+- Affects: host profiles, known-speaker matching, stage provenance
+
+Speaker profiles are versioned with this provider and the configured `speaker_model`. Incompatible embedding families are not mixed.
+
+### `speaker_model`
+
+- Type: `string`
+- Default: `"speechbrain/spkrec-ecapa-voxceleb"`
+- Affects: speaker identification, profile compatibility, stage-cache compatibility
+
+Speaker-verification model used by the active embedding provider.
+
+### `min_host_seconds`
+
+- Type: `number`
+- Default: `20`
+- Affects: host-profile updates
+
+Minimum diarized duration required before a speaker can update the host profile.
+
+### `max_embedding_seconds`
+
+- Type: `number`
+- Default: `90`
+- Affects: speaker embeddings, stage-cache compatibility
+
+Maximum speech duration sampled per speaker when building an embedding.
+
+### `num_speakers`
+
+- Type: `integer` or `null`
+- Default: omitted
+- Affects: diarization, stage-cache compatibility
+
+Optional fixed speaker count passed to pyannote. Omit it when the speaker count is unknown.
 
 ### `assume_dominant_speaker_is_host`
 
@@ -191,6 +278,7 @@ Controls deterministic cleanup strength.
 - Affects: review
 
 Advanced inline alternative to a file-based glossary for review/runtime resolution. Normally the file-based path is simpler and preferred.
+The launcher passes each item as a protected preferred term and merges it with `preferred_terms_file`.
 
 ## Runtime Profile and Review Backend
 
@@ -241,6 +329,7 @@ Model identifier exposed by the configured review backend.
 - Affects: review
 
 Enables the cleanup-review stage.
+An explicit `false` overrides stages implied by the selected runtime profile.
 
 ### `glossary_correction_review`
 
@@ -249,6 +338,7 @@ Enables the cleanup-review stage.
 - Affects: review
 
 Enables the glossary-review stage.
+An explicit `false` overrides stages implied by the selected runtime profile.
 
 ### `speaker_consistency_review`
 
@@ -257,6 +347,7 @@ Enables the glossary-review stage.
 - Affects: review
 
 Enables the speaker-consistency stage.
+An explicit `false` overrides stages implied by the selected runtime profile.
 
 ### `episode_qa_review`
 
@@ -265,6 +356,7 @@ Enables the speaker-consistency stage.
 - Affects: review
 
 Enables the episode-QA stage.
+An explicit `false` overrides stages implied by the selected runtime profile.
 
 ## Review Debugging and Adaptation
 
@@ -387,7 +479,7 @@ Allows reuse of `_processing_artifacts` when a prior run completed expensive int
 - Default: `false`
 - Affects: operations/debugging
 
-Preserves intermediate artifacts after successful processing for debugging.
+Preserves review/debug material after successful processing. Reusable stage caches are governed separately by `resume_intermediates`.
 
 ### `child_timeout_seconds`
 

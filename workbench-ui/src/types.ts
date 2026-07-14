@@ -53,6 +53,12 @@ export type EpisodeBundle = {
   semantic_scan?: {
     findings?: Finding[];
   };
+  gold_annotation?: {
+    present: boolean;
+    path: string;
+    segments: TranscriptSegment[];
+    annotation_metadata?: Record<string, unknown>;
+  };
 };
 
 export type SessionInfo = {

@@ -1,6 +1,7 @@
 import argparse
 import csv
 import gc
+import hashlib
 import ctypes
 from ctypes import wintypes
 import inspect
@@ -132,6 +133,13 @@ from podcast_transcribe.outputs import (
     write_text_transcript as output_write_text_transcript,
 )
 from podcast_transcribe.models import SegmentItem, WordItem
+from podcast_transcribe.evaluation import run_pipeline_benchmark, write_pipeline_benchmark_reports
+from podcast_transcribe.orchestration.fingerprints import build_stage_fingerprint
+from podcast_transcribe.providers.alignment import ALIGNMENT_PROVIDERS, create_alignment_provider
+from podcast_transcribe.providers.asr import FasterWhisperASRProvider
+from podcast_transcribe.providers.contracts import ProviderIdentity
+from podcast_transcribe.providers.diarization import pyannote_provider_identity
+from podcast_transcribe.providers.speaker_embedding import SpeechBrainECAPAProvider
 from podcast_transcribe.quality import language_model_warnings
 from podcast_transcribe.review import (
     ReviewCalibrationSession,
@@ -150,6 +158,7 @@ from podcast_transcribe.state import (
     SUMMARY_FILENAME,
     audio_file_fingerprint,
     clear_stage_artifacts as state_clear_stage_artifacts,
+    clear_debug_artifacts as state_clear_debug_artifacts,
     expected_output_paths as state_expected_output_paths,
     is_file_already_processed as state_is_file_already_processed,
     load_diarization_history_state as state_load_diarization_history_state,
@@ -183,6 +192,7 @@ DIARIZATION_PROBE_COOLDOWN_EPISODES = 3
 DIARIZATION_PROBE_COOLDOWN_SECONDS = 24.0 * 60.0 * 60.0
 DIARIZATION_RECONCILIATION_SIMILARITY = 0.72
 DIARIZATION_MIN_EMBEDDING_SECONDS = 0.75
+SPEAKER_PROFILE_SCHEMA_VERSION = 2
 
 
 class ProgressHook:
@@ -581,6 +591,12 @@ def parse_args():
     parser.add_argument("--input-file", help="Optional single audio file to process from input-dir.")
     parser.add_argument("--output-dir", help="Output directory. Defaults to input directory.")
     parser.add_argument("--model", default="large-v3", help="faster-whisper model name.")
+    parser.add_argument(
+        "--asr-provider",
+        choices=["faster_whisper"],
+        default="faster_whisper",
+        help="ASR provider. Additional providers remain experimental until benchmarked.",
+    )
     parser.add_argument("--language", default="en", help="Language code.")
     parser.add_argument("--device", default="auto", help="Whisper device: auto, cpu, or cuda.")
     # "auto" can pick CPU paths or unsupported configs. 5070 Ti → float16 is correct and fastest
@@ -600,6 +616,23 @@ def parse_args():
         help="Speaker verification model id.",
     )
     parser.add_argument(
+        "--alignment-provider",
+        choices=sorted(ALIGNMENT_PROVIDERS),
+        default="timestamp_passthrough",
+        help="Word-alignment provider. timestamp_passthrough preserves current behavior; whisperx enables forced alignment.",
+    )
+    parser.add_argument(
+        "--alignment-model",
+        default="",
+        help="Optional alignment model override. Blank uses the provider's language default.",
+    )
+    parser.add_argument(
+        "--speaker-embedding-provider",
+        choices=["speechbrain_ecapa"],
+        default="speechbrain_ecapa",
+        help="Speaker embedding provider used for host and known-speaker identity.",
+    )
+    parser.add_argument(
         "--host-reference",
         help="Optional audio file containing a clean sample of the host voice. Strongly recommended for stable host labeling.",
     )
@@ -615,6 +648,13 @@ def parse_args():
     parser.add_argument(
         "--preferred-terms-file",
         help="Optional text file with one preferred term per line. Used as prompt/hotword biasing.",
+    )
+    parser.add_argument(
+        "--preferred-term",
+        dest="preferred_terms",
+        action="append",
+        default=[],
+        help="Additional protected preferred term. Repeat for multiple inline terms.",
     )
     parser.add_argument(
         "--replacement-map-json",
@@ -683,6 +723,25 @@ def parse_args():
         "--review-model-name",
         default="",
         help="Model name used for optional transcript review calls.",
+    )
+    parser.add_argument("--review-context-budget", type=int, default=0, help="Custom-profile review context budget.")
+    parser.add_argument(
+        "--review-structured-output-support",
+        dest="review_structured_output_support",
+        action="store_true",
+        help="Declare structured-output support for the custom review profile.",
+    )
+    parser.add_argument(
+        "--review-transcript-qa-available",
+        dest="review_transcript_qa_available",
+        action="store_true",
+        help="Declare transcript-QA capability for the custom review profile.",
+    )
+    parser.add_argument(
+        "--review-episode-wide-correction-available",
+        dest="review_episode_wide_correction_available",
+        action="store_true",
+        help="Declare episode-wide correction capability for the custom review profile.",
     )
     parser.add_argument(
         "--review-debug",
@@ -770,7 +829,7 @@ def parse_args():
         "--no-resume-intermediates",
         dest="resume_intermediates",
         action="store_false",
-        help="Disable reuse of per-episode transcription and diarization artifacts.",
+        help="Disable reuse of fingerprint-compatible per-episode stage artifacts.",
     )
     parser.add_argument(
         "--child-timeout-seconds",
@@ -781,7 +840,7 @@ def parse_args():
     parser.add_argument(
         "--archive-debug-artifacts",
         action="store_true",
-        help="Keep intermediate stage artifacts after successful output writing for debugging.",
+        help="Keep review/debug material after successful output writing.",
     )
     parser.add_argument(
         "--benchmark-only",
@@ -792,6 +851,26 @@ def parse_args():
         "--review-benchmark",
         action="store_true",
         help="Run the dedicated tier-2 review benchmark suite against the checked-in cleaned-transcript fixtures.",
+    )
+    parser.add_argument(
+        "--pipeline-benchmark",
+        action="store_true",
+        help="Evaluate processed transcript outputs against the versioned podcast pipeline gold set.",
+    )
+    parser.add_argument(
+        "--gold-set-dir",
+        default=str(Path(__file__).resolve().parents[2] / "benchmarks" / "pipeline_gold_set"),
+        help="Directory containing the pipeline gold-set manifest and reference transcript JSON files.",
+    )
+    parser.add_argument(
+        "--benchmark-candidate-dir",
+        default="",
+        help="Processed output directory containing candidate cleaned/reviewed transcript JSON files.",
+    )
+    parser.add_argument(
+        "--benchmark-baseline-dir",
+        default="",
+        help="Optional processed-output directory used as the baseline for candidate comparison and promotion gates.",
     )
     parser.add_argument(
         "--assume-dominant-speaker-is-host",
@@ -840,6 +919,9 @@ def parse_args():
         episode_qa_review=None,
         review_auto_calibrate=None,
         review_auto_adapt_upward=None,
+        review_structured_output_support=False,
+        review_transcript_qa_available=False,
+        review_episode_wide_correction_available=False,
     )
     parser.set_defaults(isolate_files=False)
     parser.set_defaults(resume_intermediates=True)
@@ -875,7 +957,18 @@ def resolve_ffprobe_path() -> Optional[str]:
         if candidate.exists():
             return str(candidate)
 
-    return shutil.which("ffprobe")
+    fallback = shutil.which("ffprobe")
+    conda_prefix = os.getenv("CONDA_PREFIX")
+    if fallback and conda_prefix:
+        try:
+            if Path(fallback).resolve().is_relative_to(Path(conda_prefix).resolve()):
+                # Conda's ffprobe can resolve against incompatible GTK DLLs on Windows.
+                # The launcher supplies the supported external FFmpeg build; without it,
+                # returning no probe is safer than opening a native DLL error dialog.
+                return None
+        except (OSError, ValueError):
+            pass
+    return fallback
 
 
 def get_audio_metadata(path: str) -> Tuple[Optional[int], Optional[int], Optional[float]]:
@@ -1004,17 +1097,24 @@ def format_memory_mb(memory_mb: Optional[float]) -> str:
     return f"{memory_mb:.0f} MiB"
 
 
+RESOURCE_USAGE_TRACKER: Dict[str, float] = {}
+
+
 def log_memory_usage(stage_label: str):
     process_memory = get_process_memory_mb()
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / (1024 * 1024)
         reserved = torch.cuda.memory_reserved() / (1024 * 1024)
+        RESOURCE_USAGE_TRACKER["peak_gpu_allocated_mib"] = max(allocated, RESOURCE_USAGE_TRACKER.get("peak_gpu_allocated_mib", 0.0))
+        RESOURCE_USAGE_TRACKER["peak_gpu_reserved_mib"] = max(reserved, RESOURCE_USAGE_TRACKER.get("peak_gpu_reserved_mib", 0.0))
         print(
             f"  memory [{stage_label}]: cpu_working_set={format_memory_mb(process_memory)}, "
             f"gpu_allocated={allocated:.0f} MiB, gpu_reserved={reserved:.0f} MiB"
         )
     else:
         print(f"  memory [{stage_label}]: cpu_working_set={format_memory_mb(process_memory)}")
+    if process_memory is not None:
+        RESOURCE_USAGE_TRACKER["peak_cpu_working_set_mib"] = max(process_memory, RESOURCE_USAGE_TRACKER.get("peak_cpu_working_set_mib", 0.0))
 
 
 def load_preferred_terms(path: Optional[str]) -> List[str]:
@@ -1139,13 +1239,31 @@ def load_audio_span_mono_16k(
     return waveform.squeeze(0).contiguous()
 
 
-def load_host_profile(path: Optional[str]) -> Optional[np.ndarray]:
+def load_host_profile(
+    path: Optional[str],
+    expected_provider: Optional[ProviderIdentity] = None,
+) -> Optional[np.ndarray]:
     if not path:
         return None
     file_path = Path(path)
     if not file_path.exists():
         return None
     payload = json.loads(file_path.read_text(encoding="utf-8"))
+    provider_payload = payload.get("embedding_provider")
+    if expected_provider is not None and isinstance(provider_payload, dict) and provider_payload:
+        if (
+            str(provider_payload.get("provider") or "") != expected_provider.provider
+            or str(provider_payload.get("model") or "") != expected_provider.model
+        ):
+            print(
+                "Host profile provider mismatch; ignoring incompatible profile "
+                f"({provider_payload.get('provider')}:{provider_payload.get('model')} != "
+                f"{expected_provider.provider}:{expected_provider.model})."
+            )
+            return None
+    elif expected_provider is not None and expected_provider.provider != "speechbrain_ecapa":
+        print("Legacy host profile has no provider identity and cannot be used with a non-ECAPA provider.")
+        return None
     vector = payload.get("embedding")
     if not isinstance(vector, list):
         return None
@@ -1186,14 +1304,23 @@ def audio_reference_quality(waveform: torch.Tensor) -> Dict[str, object]:
     return reference_sample_quality(duration_seconds, rms=rms, peak=peak, speech_ratio=speech_ratio)
 
 
-def save_host_profile(path: Optional[str], embedding: Optional[np.ndarray], source: str):
+def save_host_profile(
+    path: Optional[str],
+    embedding: Optional[np.ndarray],
+    source: str,
+    provider: Optional[ProviderIdentity] = None,
+):
     if not path or embedding is None:
         return
     file_path = Path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "profile_schema_version": SPEAKER_PROFILE_SCHEMA_VERSION,
         "source": source,
         "updated_from": source,
+        "embedding_provider": provider.to_payload() if provider else {},
+        "embedding_dimension": int(embedding.shape[0]) if embedding.ndim == 1 else int(embedding.size),
+        "normalization": "l2",
         "embedding": embedding.tolist(),
     }
     file_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -1349,7 +1476,13 @@ def segment_from_payload(payload: Dict[str, object]) -> SegmentItem:
     return segment
 
 
-def save_transcription_artifact(output_dir: Path, audio_path: Path, segments: List[SegmentItem], info_payload: Dict[str, object]):
+def save_transcription_artifact(
+    output_dir: Path,
+    audio_path: Path,
+    segments: List[SegmentItem],
+    info_payload: Dict[str, object],
+    stage_fingerprint: Optional[Dict[str, object]] = None,
+):
     state_save_stage_artifact(
         output_dir,
         audio_path,
@@ -1358,11 +1491,23 @@ def save_transcription_artifact(output_dir: Path, audio_path: Path, segments: Li
             "segments": [segment_to_payload(segment) for segment in segments],
             "info_payload": info_payload,
         },
+        stage_fingerprint=stage_fingerprint,
     )
 
 
-def load_transcription_artifact(output_dir: Path, audio_path: Path) -> Optional[Tuple[List[SegmentItem], Dict[str, object]]]:
-    payload = state_load_stage_artifact(output_dir, audio_path, "transcription")
+def load_transcription_artifact(
+    output_dir: Path,
+    audio_path: Path,
+    stage_fingerprint: Optional[Dict[str, object]] = None,
+    allow_legacy: bool = True,
+) -> Optional[Tuple[List[SegmentItem], Dict[str, object]]]:
+    payload = state_load_stage_artifact(
+        output_dir,
+        audio_path,
+        "transcription",
+        expected_stage_fingerprint=stage_fingerprint,
+        allow_legacy=allow_legacy,
+    )
     if not payload:
         return None
     raw_segments = payload.get("segments")
@@ -1372,12 +1517,34 @@ def load_transcription_artifact(output_dir: Path, audio_path: Path) -> Optional[
     return [segment_from_payload(segment) for segment in raw_segments if isinstance(segment, dict)], info_payload
 
 
-def save_diarization_artifact(output_dir: Path, audio_path: Path, diarized_turns: List[Dict[str, object]]):
-    state_save_stage_artifact(output_dir, audio_path, "diarization", {"diarized_turns": diarized_turns})
+def save_diarization_artifact(
+    output_dir: Path,
+    audio_path: Path,
+    diarized_turns: List[Dict[str, object]],
+    stage_fingerprint: Optional[Dict[str, object]] = None,
+):
+    state_save_stage_artifact(
+        output_dir,
+        audio_path,
+        "diarization",
+        {"diarized_turns": diarized_turns},
+        stage_fingerprint=stage_fingerprint,
+    )
 
 
-def load_diarization_artifact(output_dir: Path, audio_path: Path) -> Optional[List[Dict[str, object]]]:
-    payload = state_load_stage_artifact(output_dir, audio_path, "diarization")
+def load_diarization_artifact(
+    output_dir: Path,
+    audio_path: Path,
+    stage_fingerprint: Optional[Dict[str, object]] = None,
+    allow_legacy: bool = True,
+) -> Optional[List[Dict[str, object]]]:
+    payload = state_load_stage_artifact(
+        output_dir,
+        audio_path,
+        "diarization",
+        expected_stage_fingerprint=stage_fingerprint,
+        allow_legacy=allow_legacy,
+    )
     if not payload or not isinstance(payload.get("diarized_turns"), list):
         return None
     return [turn for turn in payload["diarized_turns"] if isinstance(turn, dict)]
@@ -1386,7 +1553,7 @@ def load_diarization_artifact(output_dir: Path, audio_path: Path) -> Optional[Li
 def run_transcription_stage(
     output_dir: Path,
     audio_path: Path,
-    whisper_model: WhisperModel,
+    asr_provider,
     language: str,
     beam_size: int,
     batch_size: int,
@@ -1394,15 +1561,33 @@ def run_transcription_stage(
     hotwords: Optional[str],
     resume_intermediates: bool,
 ) -> Tuple[List[SegmentItem], Dict[str, object], bool]:
+    stage_fingerprint = build_stage_fingerprint(
+        "transcription",
+        asr_provider.identity,
+        {
+            "language": language,
+            "beam_size": beam_size,
+            "batch_size": batch_size,
+            "initial_prompt": initial_prompt or "",
+            "hotwords": hotwords or "",
+        },
+    )
     if resume_intermediates:
-        cached = load_transcription_artifact(output_dir, audio_path)
+        cached = load_transcription_artifact(
+            output_dir,
+            audio_path,
+            stage_fingerprint,
+            allow_legacy=(
+                asr_provider.identity.provider == "faster_whisper"
+                and asr_provider.identity.model == "distil-large-v3"
+            ),
+        )
         if cached:
             print("  stage: transcription (reused cached artifact)")
             return cached[0], cached[1], True
 
     print("  stage: transcription")
-    segments, info_payload = transcribe_audio(
-        model=whisper_model,
+    result = asr_provider.transcribe(
         audio_path=str(audio_path),
         language=language,
         beam_size=beam_size,
@@ -1410,8 +1595,122 @@ def run_transcription_stage(
         initial_prompt=initial_prompt,
         hotwords=hotwords,
     )
-    save_transcription_artifact(output_dir, audio_path, segments, info_payload)
+    segments = result.value
+    info_payload = {**result.metadata, "provider": result.provider.to_payload(), "stage_fingerprint": stage_fingerprint}
+    save_transcription_artifact(output_dir, audio_path, segments, info_payload, stage_fingerprint)
     return segments, info_payload, False
+
+
+def save_alignment_artifact(
+    output_dir: Path,
+    audio_path: Path,
+    segments: List[SegmentItem],
+    metadata: Dict[str, object],
+    stage_fingerprint: Dict[str, object],
+    dependencies: List[Dict[str, object]],
+):
+    state_save_stage_artifact(
+        output_dir,
+        audio_path,
+        "alignment",
+        {"segments": [segment_to_payload(segment) for segment in segments], "metadata": metadata},
+        stage_fingerprint=stage_fingerprint,
+        dependencies=dependencies,
+    )
+
+
+def load_alignment_artifact(
+    output_dir: Path,
+    audio_path: Path,
+    stage_fingerprint: Dict[str, object],
+) -> Optional[Tuple[List[SegmentItem], Dict[str, object]]]:
+    payload = state_load_stage_artifact(
+        output_dir,
+        audio_path,
+        "alignment",
+        expected_stage_fingerprint=stage_fingerprint,
+        allow_legacy=False,
+    )
+    if not payload or not isinstance(payload.get("segments"), list):
+        return None
+    return (
+        [segment_from_payload(item) for item in payload["segments"] if isinstance(item, dict)],
+        payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
+    )
+
+
+def load_segment_stage_artifact(
+    output_dir: Path,
+    audio_path: Path,
+    stage: str,
+    stage_fingerprint: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    payload = state_load_stage_artifact(
+        output_dir,
+        audio_path,
+        stage,
+        expected_stage_fingerprint=stage_fingerprint,
+        allow_legacy=False,
+    )
+    if not payload or not isinstance(payload.get("segments"), list):
+        return None
+    return {
+        **payload,
+        "segments": [segment_from_payload(item) for item in payload["segments"] if isinstance(item, dict)],
+    }
+
+
+def save_segment_stage_artifact(
+    output_dir: Path,
+    audio_path: Path,
+    stage: str,
+    segments: List[SegmentItem],
+    metadata: Dict[str, object],
+    stage_fingerprint: Dict[str, object],
+    dependencies: List[Dict[str, object]],
+):
+    state_save_stage_artifact(
+        output_dir,
+        audio_path,
+        stage,
+        {"segments": [segment_to_payload(item) for item in segments], "metadata": metadata},
+        stage_fingerprint=stage_fingerprint,
+        dependencies=dependencies,
+    )
+
+
+def run_alignment_stage(
+    output_dir: Path,
+    audio_path: Path,
+    segments: List[SegmentItem],
+    alignment_provider,
+    language: str,
+    transcription_fingerprint: Dict[str, object],
+    resume_intermediates: bool,
+) -> Tuple[List[SegmentItem], Dict[str, object], bool, Dict[str, object]]:
+    stage_fingerprint = build_stage_fingerprint(
+        "alignment",
+        alignment_provider.identity,
+        {"language": language},
+        [transcription_fingerprint],
+    )
+    if resume_intermediates:
+        cached = load_alignment_artifact(output_dir, audio_path, stage_fingerprint)
+        if cached:
+            print("  stage: alignment (reused cached artifact)")
+            return cached[0], cached[1], True, stage_fingerprint
+    print(f"  stage: alignment ({alignment_provider.identity.provider})")
+    result = alignment_provider.align(str(audio_path), segments, language)
+    metadata = {**result.metadata, "provider": result.provider.to_payload()}
+    save_alignment_artifact(
+        output_dir,
+        audio_path,
+        result.value,
+        metadata,
+        stage_fingerprint,
+        [transcription_fingerprint],
+    )
+    return result.value, metadata, False, stage_fingerprint
 
 
 def run_diarization_stage(
@@ -1424,8 +1723,19 @@ def run_diarization_stage(
     max_embedding_seconds: float,
     resume_intermediates: bool,
 ) -> Tuple[List[Dict[str, object]], bool, Dict[str, object]]:
+    diarization_identity = pyannote_provider_identity(diarization_model_id)
+    stage_fingerprint = build_stage_fingerprint(
+        "diarization",
+        diarization_identity,
+        {"num_speakers": num_speakers, "chunk_overlap_seconds": DIARIZATION_CHUNK_OVERLAP_SECONDS},
+    )
     if resume_intermediates:
-        cached = load_diarization_artifact(output_dir, audio_path)
+        cached = load_diarization_artifact(
+            output_dir,
+            audio_path,
+            stage_fingerprint,
+            allow_legacy=(diarization_model_id == "pyannote/speaker-diarization-community-1"),
+        )
         if cached is not None:
             print("  stage: diarization (reused cached artifact)")
             metadata = {
@@ -1439,6 +1749,8 @@ def run_diarization_stage(
                 "chunk_overlap_seconds": 0.0,
                 "reconciliation_merge_count": 0,
                 "reconciliation_ambiguous_count": 0,
+                "provider": diarization_identity.to_payload(),
+                "stage_fingerprint": stage_fingerprint,
             }
             return cached, True, metadata
 
@@ -1452,7 +1764,8 @@ def run_diarization_stage(
         num_speakers=num_speakers,
         max_embedding_seconds=max_embedding_seconds,
     )
-    save_diarization_artifact(output_dir, audio_path, diarized_turns)
+    metadata = {**metadata, "provider": diarization_identity.to_payload(), "stage_fingerprint": stage_fingerprint}
+    save_diarization_artifact(output_dir, audio_path, diarized_turns, stage_fingerprint)
     return diarized_turns, False, metadata
 
 
@@ -2482,7 +2795,11 @@ def build_episode_summary_row(
         "processing_seconds": "",
         "language_model_warnings": "",
         "transcription_artifact_reused": "",
+        "alignment_artifact_reused": "",
         "diarization_artifact_reused": "",
+        "asr_provider": "",
+        "alignment_provider": "",
+        "speaker_embedding_provider": "",
         "review_attempted": False,
         "review_status": "",
         "review_skip_reason": "",
@@ -2531,6 +2848,8 @@ def build_episode_summary_row(
         "diarization_chunk_overlap_seconds": 0,
         "diarization_reconciliation_merge_count": 0,
         "diarization_reconciliation_ambiguous_count": 0,
+        "speaker_attribution_artifact_reused": False,
+        "deterministic_cleanup_artifact_reused": False,
     }
 
 
@@ -2570,7 +2889,13 @@ def write_episode_summary_csv(path: Path, rows: List[Dict[str, object]]):
         "processing_seconds",
         "language_model_warnings",
         "transcription_artifact_reused",
+        "alignment_artifact_reused",
         "diarization_artifact_reused",
+        "asr_provider",
+        "alignment_provider",
+        "speaker_embedding_provider",
+        "speaker_attribution_artifact_reused",
+        "deterministic_cleanup_artifact_reused",
         "review_attempted",
         "review_status",
         "review_skip_reason",
@@ -2713,6 +3038,7 @@ def normalize_episode_summary_row(row: Dict[str, object]) -> Dict[str, object]:
     bool_fields = {
         "host_detected",
         "transcription_artifact_reused",
+        "alignment_artifact_reused",
         "diarization_artifact_reused",
         "review_attempted",
         "reviewed_output_written",
@@ -3144,6 +3470,67 @@ def segment_items_from_cleaned_payload(payload: Dict[str, object]) -> List[Segme
     return rebuilt_segments
 
 
+def provider_configuration_shortfall(
+    cleaned_payload: Optional[Dict[str, object]],
+    runtime_config: Optional[Dict[str, object]],
+) -> List[str]:
+    if not isinstance(cleaned_payload, dict):
+        return []
+    metadata = cleaned_payload.get("metadata")
+    provenance = metadata.get("stage_provenance") if isinstance(metadata, dict) else None
+    config = runtime_config or {}
+    if not isinstance(provenance, dict) or not provenance:
+        legacy_shortfalls = []
+        if str(config.get("asr_provider") or "faster_whisper") != "faster_whisper":
+            legacy_shortfalls.append("transcription:unproven_provider")
+        requested_model = str(config.get("model") or "")
+        recorded_model = str(cleaned_payload.get("pipeline_version") or "")
+        if requested_model and recorded_model and requested_model != recorded_model:
+            legacy_shortfalls.append("transcription:model")
+        if str(config.get("alignment_provider") or "timestamp_passthrough") != "timestamp_passthrough":
+            legacy_shortfalls.append("alignment:unproven_provider")
+        if str(config.get("diarization_model") or "pyannote/speaker-diarization-community-1") != "pyannote/speaker-diarization-community-1":
+            legacy_shortfalls.append("diarization:unproven_model")
+        if str(config.get("speaker_embedding_provider") or "speechbrain_ecapa") != "speechbrain_ecapa":
+            legacy_shortfalls.append("speaker_embedding:unproven_provider")
+        return legacy_shortfalls
+    expectations = {
+        "transcription": (
+            str(config.get("asr_provider") or "faster_whisper"),
+            str(config.get("model") or ""),
+        ),
+        "alignment": (
+            str(config.get("alignment_provider") or "timestamp_passthrough"),
+            str(config.get("alignment_model") or ""),
+        ),
+        "diarization": (
+            "pyannote",
+            str(config.get("diarization_model") or ""),
+        ),
+        "speaker_embedding": (
+            str(config.get("speaker_embedding_provider") or "speechbrain_ecapa"),
+            str(config.get("speaker_model") or ""),
+        ),
+    }
+    shortfalls: List[str] = []
+    for stage_name, (expected_provider, expected_model) in expectations.items():
+        stage_payload = provenance.get(stage_name)
+        if not isinstance(stage_payload, dict):
+            continue
+        provider_payload = stage_payload.get("provider")
+        if not isinstance(provider_payload, dict):
+            continue
+        actual_provider = str(provider_payload.get("provider") or "")
+        actual_model = str(provider_payload.get("model") or "")
+        if expected_provider and actual_provider and expected_provider != actual_provider:
+            shortfalls.append(f"{stage_name}:provider")
+            continue
+        # Blank alignment model means the provider's language default and is not a mismatch.
+        if expected_model and actual_model and expected_model != actual_model:
+            shortfalls.append(f"{stage_name}:model")
+    return shortfalls
+
+
 def classify_episode_processing_state(
     audio_path: Path,
     output_dir: Path,
@@ -3162,18 +3549,22 @@ def classify_episode_processing_state(
     cleaned_json_path = cleaned_json_output_path(audio_path, output_dir)
     cleaned_json_usable = False
     cleaned_json_error = ""
+    cleaned_payload = None
     if cleaned_json_path.exists():
         try:
-            load_cleaned_transcript_payload(cleaned_json_path)
+            cleaned_payload = load_cleaned_transcript_payload(cleaned_json_path)
             cleaned_json_usable = True
         except RuntimeError as exc:
             cleaned_json_error = str(exc)
     reviewed_bundle = reviewed_output_bundle_status(audio_path, output_dir, resolved_review)
     baseline_complete = baseline_resume_complete
+    provider_shortfalls = provider_configuration_shortfall(cleaned_payload, runtime_config)
     if resolved_review["any_review_enabled"]:
         baseline_complete = baseline_bundle_complete and cleaned_json_usable
 
-    if not resolved_review["any_review_enabled"]:
+    if provider_shortfalls:
+        state = "needs_tier1"
+    elif not resolved_review["any_review_enabled"]:
         state = "complete" if baseline_resume_complete and baseline_bundle_complete else "needs_tier1"
     elif baseline_complete and cleaned_json_usable:
         if reviewed_bundle["status"] == "current_review_complete":
@@ -3197,6 +3588,7 @@ def classify_episode_processing_state(
         "completed_review_stages": reviewed_bundle["completed_stages"],
         "missing_review_stages": reviewed_bundle["missing_stages"],
         "review_enabled": bool(resolved_review["any_review_enabled"]),
+        "provider_shortfalls": provider_shortfalls,
     }
 
 
@@ -3505,6 +3897,7 @@ def write_json_output(
 
 def runtime_config_payload(args) -> Dict[str, object]:
     keys = [
+        "asr_provider",
         "model",
         "language",
         "device",
@@ -3512,6 +3905,9 @@ def runtime_config_payload(args) -> Dict[str, object]:
         "beam_size",
         "batch_size",
         "diarization_model",
+        "alignment_provider",
+        "alignment_model",
+        "speaker_embedding_provider",
         "speaker_model",
         "host_threshold",
         "min_host_seconds",
@@ -3531,6 +3927,10 @@ def runtime_config_payload(args) -> Dict[str, object]:
         "backend",
         "review_base_url",
         "review_model_name",
+        "review_context_budget",
+        "review_structured_output_support",
+        "review_transcript_qa_available",
+        "review_episode_wide_correction_available",
         "review_debug",
         "review_debug_dir",
         "review_auto_calibrate",
@@ -3541,7 +3941,9 @@ def runtime_config_payload(args) -> Dict[str, object]:
         "episode_qa_review",
     ]
     payload = {key: getattr(args, key, None) for key in keys}
-    payload["preferred_terms"] = load_preferred_terms(payload.get("preferred_terms_file"))
+    payload["preferred_terms"] = list(dict.fromkeys(
+        load_preferred_terms(payload.get("preferred_terms_file")) + list(getattr(args, "preferred_terms", []) or [])
+    ))
     payload["filename_date"] = {
         "preset": getattr(args, "filename_date_preset", "strict_iso"),
         "position": getattr(args, "filename_date_position", "last"),
@@ -3624,12 +4026,119 @@ def build_historical_similarity_scores(rows: List[Dict[str, object]]) -> Dict[st
     return dict(history)
 
 
+def run_speaker_attribution_stage(
+    *, output_dir: Path, audio_path: Path, segments: List[SegmentItem], diarized_turns: List[Dict[str, object]],
+    verifier: Any, speaker_embedding_identity: ProviderIdentity, host_reference: Optional[str],
+    host_profile_path: Optional[str], known_speaker_profiles: Dict[str, Dict[str, object]], host_threshold: float,
+    assume_dominant: bool, max_embedding_seconds: float, min_host_seconds: float,
+    historical_similarity_scores: Dict[str, List[float]], alignment_fingerprint: Dict[str, object],
+    diarization_fingerprint: Dict[str, object], resume_intermediates: bool,
+) -> Tuple[Optional[str], Optional[np.ndarray], Dict[str, float], Dict[str, float], Dict[str, Dict[str, object]], Dict[str, str], List[Dict[str, object]], Dict[str, object], bool]:
+    def file_revision(value: Optional[str]) -> Dict[str, object]:
+        if not value:
+            return {}
+        path = Path(value)
+        if not path.exists() or not path.is_file():
+            return {"path": str(path), "missing": True}
+        stat = path.stat()
+        return {"path": str(path.resolve()), "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+    known_profile_sources = {
+        name: [file_revision(str(path)) for path in profile.get("sample_files") or []]
+        for name, profile in sorted(known_speaker_profiles.items())
+    }
+    def build_fingerprint() -> Dict[str, object]:
+        return build_stage_fingerprint(
+            "speaker_attribution", speaker_embedding_identity,
+            {"host_threshold": host_threshold, "assume_dominant": assume_dominant, "max_embedding_seconds": max_embedding_seconds,
+             "min_host_seconds": min_host_seconds, "known_profile_sources": known_profile_sources,
+             "host_reference": file_revision(host_reference), "host_profile": file_revision(host_profile_path)},
+            [alignment_fingerprint, diarization_fingerprint],
+        )
+
+    fingerprint = build_fingerprint()
+    cached = load_segment_stage_artifact(output_dir, audio_path, "speaker_attribution", fingerprint) if resume_intermediates else None
+    if cached:
+        print("  speaker attribution: reused cached artifact")
+        segments[:] = cached["segments"]
+        metadata = cached.get("metadata") if isinstance(cached.get("metadata"), dict) else {}
+        return (metadata.get("host_speaker"), None, dict(metadata.get("durations") or {}),
+                dict(metadata.get("similarity_scores") or {}), dict(metadata.get("known_assignments") or {}),
+                dict(metadata.get("speaker_mapping") or {}), list(metadata.get("drift_alerts") or []), fingerprint, True)
+    existing_profile = load_host_profile(host_profile_path, speaker_embedding_identity)
+    host_speaker, speaker_embeddings, updated_profile, durations, similarity_scores = choose_host_speaker(
+        verifier=verifier, audio_path=str(audio_path), diarized_turns=diarized_turns, host_reference_path=host_reference,
+        existing_profile=existing_profile, host_threshold=host_threshold, assume_dominant=assume_dominant,
+        max_embedding_seconds=max_embedding_seconds, min_host_seconds=min_host_seconds,
+    )
+    known_assignments = match_known_speakers(speaker_embeddings, known_speaker_profiles, host_threshold)
+    known_host = next((speaker_id for speaker_id, assignment in known_assignments.items() if assignment.get("is_host")), None)
+    if known_host:
+        host_speaker = known_host
+    updated_profile = final_host_profile_update(existing_profile, speaker_embeddings, host_speaker, updated_profile)
+    speaker_mapping = rename_speakers(segments, diarized_turns, host_speaker, durations, known_assignments=known_assignments)
+    current_scores = {speaker_mapping.get(speaker_id, speaker_id): score for speaker_id, score in similarity_scores.items()}
+    drift_alerts = detect_speaker_similarity_drift(current_scores, historical_similarity_scores)
+    if updated_profile is not None and host_speaker is not None:
+        save_host_profile(host_profile_path, updated_profile, str(audio_path), speaker_embedding_identity)
+        fingerprint = build_fingerprint()
+    save_segment_stage_artifact(
+        output_dir, audio_path, "speaker_attribution", segments,
+        {"host_speaker": host_speaker, "durations": durations, "similarity_scores": similarity_scores,
+         "known_assignments": known_assignments, "speaker_mapping": speaker_mapping, "drift_alerts": drift_alerts},
+        fingerprint, [alignment_fingerprint, diarization_fingerprint],
+    )
+    return host_speaker, updated_profile, durations, similarity_scores, known_assignments, speaker_mapping, drift_alerts, fingerprint, False
+
+
+def run_deterministic_cleanup_stage(
+    *, output_dir: Path, audio_path: Path, segments: List[SegmentItem], replacement_map: Dict[str, List[str]],
+    correction_path: Optional[Path], cleanup_level: str, speaker_attribution_fingerprint: Dict[str, object],
+    resume_intermediates: bool,
+) -> Tuple[List[SegmentItem], List[SegmentItem], List[Dict[str, object]], int, List[object], Dict[str, object], bool]:
+    correction_revision = ""
+    if correction_path and Path(correction_path).exists():
+        correction_revision = hashlib.sha256(Path(correction_path).read_bytes()).hexdigest()
+    cleanup_identity = ProviderIdentity(stage="deterministic_cleanup", provider="builtin", model="cleanup_rules", version="2")
+    fingerprint = build_stage_fingerprint(
+        "deterministic_cleanup", cleanup_identity,
+        {"cleanup_level": cleanup_level, "replacement_map": replacement_map, "correction_revision": correction_revision},
+        [speaker_attribution_fingerprint],
+    )
+    cached = load_segment_stage_artifact(output_dir, audio_path, "deterministic_cleanup", fingerprint) if resume_intermediates else None
+    if cached:
+        print("  deterministic cleanup: reused cached artifact")
+        metadata = cached.get("metadata") if isinstance(cached.get("metadata"), dict) else {}
+        normalized = [segment_from_payload(item) for item in metadata.get("normalized_segments") or [] if isinstance(item, dict)]
+        cleaned = cached["segments"]
+        if not normalized:
+            normalized = [segment_from_payload(segment_to_payload(item)) for item in cleaned]
+        return (
+            normalized, cleaned, list(metadata.get("replacement_events") or []),
+            int(metadata.get("manual_corrections") or 0), list(metadata.get("cleanup_edits") or []), fingerprint, True,
+        )
+    normalized, replacement_events = coalesce_segments(segments, replacement_map)
+    manual_corrections = apply_manual_corrections(normalized, correction_path)
+    if correction_path:
+        print(f"  manual corrections applied: {manual_corrections} from {correction_path}")
+    cleaned, cleanup_edits = build_cleaned_segments(normalized, level=cleanup_level)
+    save_segment_stage_artifact(
+        output_dir, audio_path, "deterministic_cleanup", cleaned,
+        {"replacement_events": replacement_events, "manual_corrections": manual_corrections,
+         "cleanup_edits": cleanup_edits, "normalized_segments": [segment_to_payload(item) for item in normalized]},
+        fingerprint, [speaker_attribution_fingerprint],
+    )
+    return normalized, cleaned, replacement_events, manual_corrections, cleanup_edits, fingerprint, False
+
+
 def process_file(
     audio_path: Path,
     output_dir: Path,
-    whisper_model: WhisperModel,
+    asr_provider,
+    alignment_provider,
     diarization_pipeline: Pipeline,
     verifier: Any,
+    speaker_embedding_identity: ProviderIdentity,
     language: str,
     beam_size: int,
     batch_size: int,
@@ -3655,6 +4164,7 @@ def process_file(
     """Process one audio file through all model stages and write its output bundle."""
 
     file_started = time.perf_counter()
+    RESOURCE_USAGE_TRACKER.clear()
     stage_timings: Dict[str, float] = {}
     print(f"Processing {audio_path.name}")
     print_episode_mode("tier1+tier2" if resolve_review_runtime_config(runtime_config or {}).get("any_review_enabled") else "tier1-only")
@@ -3663,11 +4173,11 @@ def process_file(
     log_memory_usage("before_transcription")
 
     transcription_started = time.perf_counter()
-    print_episode_stage(1, 5, "transcription")
+    print_episode_stage(1, 6, "transcription")
     segments, info_payload, transcription_reused = run_transcription_stage(
         output_dir=output_dir,
         audio_path=audio_path,
-        whisper_model=whisper_model,
+        asr_provider=asr_provider,
         language=language,
         beam_size=beam_size,
         batch_size=batch_size,
@@ -3691,8 +4201,38 @@ def process_file(
     )
     log_memory_usage("after_transcription")
 
+    alignment_started = time.perf_counter()
+    print_episode_stage(2, 6, "alignment")
+    transcription_fingerprint = info_payload.get("stage_fingerprint")
+    if not isinstance(transcription_fingerprint, dict) or not transcription_fingerprint:
+        transcription_fingerprint = build_stage_fingerprint(
+            "transcription",
+            asr_provider.identity,
+            {
+                "language": language,
+                "beam_size": beam_size,
+                "batch_size": batch_size,
+                "initial_prompt": initial_prompt or "",
+                "hotwords": hotwords or "",
+            },
+        )
+    segments, alignment_metadata, alignment_reused, alignment_fingerprint = run_alignment_stage(
+        output_dir=output_dir,
+        audio_path=audio_path,
+        segments=segments,
+        alignment_provider=alignment_provider,
+        language=language,
+        transcription_fingerprint=transcription_fingerprint,
+        resume_intermediates=resume_intermediates,
+    )
+    stage_timings["alignment"] = time.perf_counter() - alignment_started
+    print(
+        f"  alignment complete: {sum(len(segment.words) for segment in segments)} words "
+        f"in {stage_timings['alignment']:.1f}s"
+    )
+
     diarization_started = time.perf_counter()
-    print_episode_stage(2, 5, "diarization")
+    print_episode_stage(3, 6, "diarization")
     diarized_turns, diarization_reused, diarization_metadata = run_diarization_stage(
         output_dir=output_dir,
         audio_path=audio_path,
@@ -3720,64 +4260,26 @@ def process_file(
     )
     log_memory_usage("after_diarization")
 
-    print_episode_stage(3, 5, "speaker matching")
+    print_episode_stage(4, 6, "speaker matching")
     matching_started = time.perf_counter()
-    existing_profile = load_host_profile(host_profile_path)
-    host_speaker, speaker_embeddings, updated_profile, durations, similarity_scores = choose_host_speaker(
-        verifier=verifier,
-        audio_path=str(audio_path),
-        diarized_turns=diarized_turns,
-        host_reference_path=host_reference,
-        existing_profile=existing_profile,
-        host_threshold=host_threshold,
-        assume_dominant=assume_dominant,
-        max_embedding_seconds=max_embedding_seconds,
-        min_host_seconds=min_host_seconds,
-    )
-
-    known_assignments = match_known_speakers(
-        speaker_embeddings=speaker_embeddings,
-        known_profiles=known_speaker_profiles,
-        threshold=host_threshold,
-    )
-    known_host_speaker = next(
-        (speaker_id for speaker_id, assignment in known_assignments.items() if assignment.get("is_host")),
-        None,
-    )
-    if known_host_speaker:
-        host_speaker = known_host_speaker
-    updated_profile = final_host_profile_update(
-        existing_profile,
-        speaker_embeddings,
-        host_speaker,
-        updated_profile,
-    )
-
-    speaker_mapping = rename_speakers(
-        segments,
-        diarized_turns,
-        host_speaker,
-        durations,
-        known_assignments=known_assignments,
-    )
-    current_label_scores = {
-        speaker_mapping.get(speaker_id, speaker_id): score
-        for speaker_id, score in similarity_scores.items()
-    }
-    drift_alerts = detect_speaker_similarity_drift(
-        current_label_scores,
-        historical_similarity_scores or {},
+    host_speaker, updated_profile, durations, similarity_scores, known_assignments, speaker_mapping, drift_alerts, speaker_attribution_fingerprint, speaker_attribution_reused = run_speaker_attribution_stage(
+        output_dir=output_dir, audio_path=audio_path, segments=segments, diarized_turns=diarized_turns,
+        verifier=verifier, speaker_embedding_identity=speaker_embedding_identity, host_reference=host_reference,
+        host_profile_path=host_profile_path, known_speaker_profiles=known_speaker_profiles, host_threshold=host_threshold,
+        assume_dominant=assume_dominant, max_embedding_seconds=max_embedding_seconds, min_host_seconds=min_host_seconds,
+        historical_similarity_scores=historical_similarity_scores or {}, alignment_fingerprint=alignment_fingerprint,
+        diarization_fingerprint=diarization_metadata.get("stage_fingerprint", {}), resume_intermediates=resume_intermediates,
     )
     filename_date_config = (runtime_config or {}).get("filename_date", {})
     episode_metadata_for_review = build_episode_metadata(str(audio_path), filename_date_config)
-    normalized_segments, replacement_events = coalesce_segments(segments, replacement_map)
     correction_path = correction_path_for_audio(corrections_dir, audio_path)
-    manual_corrections = apply_manual_corrections(normalized_segments, correction_path)
-    if correction_path:
-        print(f"  manual corrections applied: {manual_corrections} from {correction_path}")
-    cleaned_segments, cleanup_edits = build_cleaned_segments(normalized_segments, level=cleanup_level)
+    normalized_segments, cleaned_segments, replacement_events, manual_corrections, cleanup_edits, cleanup_fingerprint, cleanup_reused = run_deterministic_cleanup_stage(
+        output_dir=output_dir, audio_path=audio_path, segments=segments, replacement_map=replacement_map,
+        correction_path=correction_path, cleanup_level=cleanup_level,
+        speaker_attribution_fingerprint=speaker_attribution_fingerprint, resume_intermediates=resume_intermediates,
+    )
     runtime_review_config = resolve_review_runtime_config(runtime_config or {})
-    print_episode_stage(4, 5, "review")
+    print_episode_stage(5, 6, "review")
     review_debug_dir = review_debug_directory(
         runtime_review_config,
         {
@@ -3849,11 +4351,29 @@ def process_file(
     )
     log_memory_usage("after_speaker_matching")
 
-    print_episode_stage(5, 5, "writing outputs")
+    print_episode_stage(6, 6, "writing outputs")
     writing_started = time.perf_counter()
     base_name = audio_path.stem
     filename_date_config = (runtime_config or {}).get("filename_date", {})
-    episode_metadata = build_episode_metadata(str(audio_path), filename_date_config)
+    stage_provenance = {
+        "transcription": {"provider": asr_provider.identity.to_payload(), "fingerprint": transcription_fingerprint},
+        "alignment": {
+            "provider": alignment_provider.identity.to_payload(),
+            "fingerprint": alignment_fingerprint,
+            **alignment_metadata,
+        },
+        "diarization": {
+            "provider": diarization_metadata.get("provider", {}),
+            "fingerprint": diarization_metadata.get("stage_fingerprint", {}),
+        },
+        "speaker_embedding": {"provider": speaker_embedding_identity.to_payload()},
+        "speaker_attribution": {"provider": speaker_embedding_identity.to_payload(), "fingerprint": speaker_attribution_fingerprint},
+        "deterministic_cleanup": {"provider": {"stage": "deterministic_cleanup", "provider": "builtin", "model": "cleanup_rules", "version": "2"}, "fingerprint": cleanup_fingerprint},
+    }
+    episode_metadata = {
+        **build_episode_metadata(str(audio_path), filename_date_config),
+        "stage_provenance": stage_provenance,
+    }
     output_write_text_transcript(
         output_dir / f"{base_name}_speaker_transcript.txt",
         normalized_segments,
@@ -3940,8 +4460,6 @@ def process_file(
         text_version="cleaned",
         pipeline_version=runtime_config.get("model", "") if runtime_config else "",
     )
-    if updated_profile is not None and host_speaker is not None:
-        save_host_profile(host_profile_path, updated_profile, str(audio_path))
     stage_timings["writing"] = time.perf_counter() - writing_started
     print(f"  writing complete in {stage_timings['writing']:.1f}s")
     log_memory_usage("after_writing")
@@ -3970,6 +4488,12 @@ def process_file(
     summary_row["manual_correction_count"] = manual_corrections
     summary_row["processing_seconds"] = round(time.perf_counter() - file_started, 2)
     summary_row["transcription_artifact_reused"] = transcription_reused
+    summary_row["alignment_artifact_reused"] = alignment_reused
+    summary_row["asr_provider"] = asr_provider.identity.provider
+    summary_row["alignment_provider"] = alignment_provider.identity.provider
+    summary_row["speaker_embedding_provider"] = speaker_embedding_identity.provider
+    summary_row["speaker_attribution_artifact_reused"] = speaker_attribution_reused
+    summary_row["deterministic_cleanup_artifact_reused"] = cleanup_reused
     summary_row["diarization_artifact_reused"] = diarization_reused
     warnings_for_language = language_model_warnings(info_payload, language)
     summary_row["language_model_warnings"] = "; ".join(warnings_for_language)
@@ -4008,10 +4532,15 @@ def process_file(
         outputs=outputs,
         timings=stage_timings,
         summary=summary_row,
+        stage_provenance=stage_provenance,
+        resource_usage=dict(RESOURCE_USAGE_TRACKER),
     )
     clear_processing_checkpoint(output_dir, audio_path)
     if not archive_debug_artifacts:
-        state_clear_stage_artifacts(output_dir, audio_path)
+        if resume_intermediates:
+            state_clear_debug_artifacts(output_dir, audio_path)
+        else:
+            state_clear_stage_artifacts(output_dir, audio_path)
     return summary_row
 
 
@@ -4083,6 +4612,28 @@ def run_review_benchmark_mode(args, output_dir: Path):
     print(f"  report markdown: {md_path}")
 
 
+def run_pipeline_benchmark_mode(args, output_dir: Path):
+    gold_set_dir = Path(args.gold_set_dir).resolve()
+    candidate_dir = Path(args.benchmark_candidate_dir).resolve() if args.benchmark_candidate_dir else output_dir.resolve()
+    print("Pipeline quality benchmark mode")
+    print(f"  gold set: {gold_set_dir}")
+    print(f"  candidate outputs: {candidate_dir}")
+    baseline_dir = Path(args.benchmark_baseline_dir).resolve() if args.benchmark_baseline_dir else None
+    if baseline_dir:
+        print(f"  baseline outputs: {baseline_dir}")
+    report = run_pipeline_benchmark(gold_set_dir, candidate_dir, baseline_dir)
+    json_path, md_path = write_pipeline_benchmark_reports(output_dir, report)
+    aggregate = report.get("aggregate") or {}
+    print(f"  completed entries: {report.get('gold_set', {}).get('entry_count', 0)}")
+    print(f"  WER: {(aggregate.get('wer') or {}).get('wer', 0.0):.4f}")
+    print(
+        "  speaker-attributed WER: "
+        f"{(aggregate.get('speaker_attributed_wer') or {}).get('speaker_attributed_wer', 0.0):.4f}"
+    )
+    print(f"  report json: {json_path}")
+    print(f"  report markdown: {md_path}")
+
+
 def estimate_audio_eta(processed_audio_seconds: float, elapsed_seconds: float, remaining_audio_seconds: float) -> Optional[float]:
     if processed_audio_seconds <= 0 or elapsed_seconds <= 0:
         return None
@@ -4102,6 +4653,12 @@ def build_child_process_command(args, audio_path: Path, output_dir: Path) -> Lis
         str(output_dir.resolve()),
         "--model",
         args.model,
+        "--asr-provider",
+        args.asr_provider,
+        "--alignment-provider",
+        args.alignment_provider,
+        "--speaker-embedding-provider",
+        args.speaker_embedding_provider,
         "--language",
         args.language,
         "--device",
@@ -4137,6 +4694,9 @@ def build_child_process_command(args, audio_path: Path, output_dir: Path) -> Lis
         "--no-isolate-files",
     ]
 
+    if args.alignment_model:
+        command.extend(["--alignment-model", args.alignment_model])
+
     if args.hf_token:
         command.extend(["--hf-token", args.hf_token])
     if args.host_reference:
@@ -4145,6 +4705,8 @@ def build_child_process_command(args, audio_path: Path, output_dir: Path) -> Lis
         command.extend(["--known-speakers-dir", args.known_speakers_dir])
     if args.preferred_terms_file:
         command.extend(["--preferred-terms-file", args.preferred_terms_file])
+    for preferred_term in args.preferred_terms or []:
+        command.extend(["--preferred-term", preferred_term])
     if args.replacement_map_json:
         command.extend(["--replacement-map-json", args.replacement_map_json])
     if args.filename_date_preset:
@@ -4183,6 +4745,14 @@ def build_child_process_command(args, audio_path: Path, output_dir: Path) -> Lis
         command.append("--review-auto-adapt-upward")
     elif args.review_auto_adapt_upward is False:
         command.append("--no-review-auto-adapt-upward")
+    if args.review_context_budget:
+        command.extend(["--review-context-budget", str(args.review_context_budget)])
+    if args.review_structured_output_support:
+        command.append("--review-structured-output-support")
+    if args.review_transcript_qa_available:
+        command.append("--review-transcript-qa-available")
+    if args.review_episode_wide_correction_available:
+        command.append("--review-episode-wide-correction-available")
     if not args.resume_intermediates:
         command.append("--no-resume-intermediates")
     if args.archive_debug_artifacts:
@@ -4278,6 +4848,11 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
                 f"Review shortfall for {audio_path.name}: "
                 f"{', '.join(state_info['missing_review_stages'])}"
             )
+        if state_info.get("provider_shortfalls"):
+            print(
+                f"Provider delta for {audio_path.name}: "
+                f"{', '.join(state_info['provider_shortfalls'])}; compatible stage artifacts will be reused."
+            )
         print(
             f"Processing mode for {audio_path.name}: "
             f"{'tier2-only backfill' if state_info['state'] == 'needs_tier2_only' else 'tier1+tier2'}"
@@ -4325,6 +4900,12 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
 
 def load_models(args, device: str):
     whisper_model = WhisperModel(args.model, device=device, compute_type=args.compute_type)
+    asr_provider = FasterWhisperASRProvider(whisper_model, args.model, transcribe_audio)
+    alignment_provider = create_alignment_provider(
+        args.alignment_provider,
+        device,
+        args.alignment_model,
+    )
 
     try:
         diarization_pipeline, resolved_diarization_model = load_diarization_pipeline(
@@ -4360,11 +4941,19 @@ def load_models(args, device: str):
         diarization_pipeline.to(torch.device(normalize_runtime_device(device)))
 
     verifier = load_speaker_verifier(args.speaker_model, device)
+    speaker_embedding_provider = SpeechBrainECAPAProvider(verifier, args.speaker_model)
     known_speaker_profiles = load_known_speaker_profiles(
         verifier=verifier,
         known_speakers_dir=args.known_speakers_dir,
     )
-    return whisper_model, diarization_pipeline, verifier, known_speaker_profiles
+    return (
+        asr_provider,
+        alignment_provider,
+        diarization_pipeline,
+        verifier,
+        speaker_embedding_provider,
+        known_speaker_profiles,
+    )
 
 
 def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: List[Path]):
@@ -4403,14 +4992,21 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
     hotwords = None
     replacement_map: Dict[str, List[str]] = {}
     device = None
-    whisper_model = diarization_pipeline = verifier = known_speaker_profiles = None
+    asr_provider = alignment_provider = diarization_pipeline = verifier = speaker_embedding_provider = known_speaker_profiles = None
     if needs_tier1:
-        preferred_terms = load_preferred_terms(args.preferred_terms_file)
+        preferred_terms = list(dict.fromkeys(load_preferred_terms(args.preferred_terms_file) + list(args.preferred_terms or [])))
         initial_prompt, hotwords = build_prompt_bias(preferred_terms)
         replacement_map = load_replacement_map(args.replacement_map_json)
         device = get_device(args.device)
         print(f"Using device: {device}")
-        whisper_model, diarization_pipeline, verifier, known_speaker_profiles = load_models(args, device)
+        (
+            asr_provider,
+            alignment_provider,
+            diarization_pipeline,
+            verifier,
+            speaker_embedding_provider,
+            known_speaker_profiles,
+        ) = load_models(args, device)
     else:
         print("No tier-1 work required; running review backfill from existing cleaned JSON outputs only.")
 
@@ -4471,6 +5067,11 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
                     f"Review shortfall for {audio_path.name}: "
                     f"{', '.join(state_info['missing_review_stages'])}"
                 )
+            if state_info.get("provider_shortfalls"):
+                print(
+                    f"Provider delta for {audio_path.name}: "
+                    f"{', '.join(state_info['provider_shortfalls'])}; compatible stage artifacts will be reused."
+                )
             print(
                 f"Processing mode for {audio_path.name}: "
                 f"{'tier2-only backfill' if state_info['state'] == 'needs_tier2_only' else 'tier1+tier2'}"
@@ -4488,9 +5089,11 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
             episode_summary = process_file(
                 audio_path=audio_path,
                 output_dir=output_dir,
-                whisper_model=whisper_model,
+                asr_provider=asr_provider,
+                alignment_provider=alignment_provider,
                 diarization_pipeline=diarization_pipeline,
                 verifier=verifier,
+                speaker_embedding_identity=speaker_embedding_provider.identity,
                 language=args.language,
                 beam_size=args.beam_size,
                 batch_size=args.batch_size,
@@ -4546,8 +5149,13 @@ def main():
         run_review_benchmark_mode(args, output_dir)
         return
 
+    if args.pipeline_benchmark:
+        output_dir = Path(args.output_dir) if args.output_dir else Path.cwd() / "output"
+        run_pipeline_benchmark_mode(args, output_dir)
+        return
+
     if not args.input_dir:
-        raise RuntimeError("--input-dir is required unless --review-benchmark is used.")
+        raise RuntimeError("--input-dir is required unless a benchmark mode is used.")
 
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir) if args.output_dir else input_dir

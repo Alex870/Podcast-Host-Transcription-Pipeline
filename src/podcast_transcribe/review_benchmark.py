@@ -81,6 +81,9 @@ def load_benchmark_fixtures(fixture_dir: Optional[Path] = None) -> List[Dict[str
             raise RuntimeError(f"Benchmark fixture definition is not an object: {path}")
         cleaned_payload = payload.get("cleaned_payload")
         expected = payload.get("expected")
+        if "fixtures" in payload and cleaned_payload is None and expected is None:
+            # Teach-Me validation controls share this directory but use a separate schema.
+            continue
         if not isinstance(cleaned_payload, dict) or not isinstance(expected, dict):
             raise RuntimeError(f"Benchmark fixture is missing cleaned_payload or expected: {path}")
         transcript_errors = validate_transcript_payload(cleaned_payload)

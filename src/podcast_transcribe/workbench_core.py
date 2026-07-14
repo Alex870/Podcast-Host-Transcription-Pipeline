@@ -48,6 +48,8 @@ ISSUE_RESOLUTION_SUBDIR = "issue_resolution"
 DEFAULT_CORRECTIONS_DIRNAME = "corrections"
 TEACH_ME_SUBDIR = "teach_me"
 TEACH_ME_CONTROL_FIXTURE_PATH = Path(__file__).resolve().parents[2] / "benchmarks" / "review_fixtures" / "teach_me_controls.json"
+PIPELINE_GOLD_SET_DIR = Path("benchmarks") / "pipeline_gold_set"
+PIPELINE_GOLD_ANNOTATIONS_DIRNAME = "annotations"
 
 _GLOSSARY_WRITE_LOCK = threading.Lock()
 
@@ -539,7 +541,118 @@ def load_episode_bundle(project_root: Path, output_dir: Path, episode_id: str) -
         "speaker_workflow_report": speaker_workflow_report,
         "deterministic_findings": deterministic_findings,
         "semantic_scan": scan_cache,
+        "gold_annotation": load_gold_annotation(project_root, episode_id),
     }
+
+
+def _gold_set_paths(project_root: Path, episode_id: Optional[str] = None) -> Dict[str, Path]:
+    gold_root = (project_root / PIPELINE_GOLD_SET_DIR).resolve()
+    _assert_within_root(project_root, gold_root)
+    paths = {
+        "root": gold_root,
+        "manifest": gold_root / "manifest.json",
+        "annotations": gold_root / PIPELINE_GOLD_ANNOTATIONS_DIRNAME,
+    }
+    if episode_id:
+        safe_episode_id = Path(episode_id).name
+        paths["annotation"] = paths["annotations"] / f"{safe_episode_id}.reference.json"
+    return paths
+
+
+def load_gold_annotation(project_root: Path, episode_id: str) -> Dict[str, object]:
+    annotation_path = _gold_set_paths(project_root, episode_id)["annotation"]
+    if not annotation_path.exists():
+        return {"present": False, "episode_id": episode_id, "path": str(annotation_path), "segments": []}
+    payload = _load_json(annotation_path)
+    return {
+        "present": True,
+        "episode_id": episode_id,
+        "path": str(annotation_path),
+        "segments": payload.get("segments") or [],
+        "annotation_metadata": payload.get("annotation_metadata") or {},
+    }
+
+
+def save_gold_segment_annotation(
+    project_root: Path,
+    output_dir: Path,
+    episode_id: str,
+    segment_id: int,
+    reference_text: str,
+    reference_speaker: str,
+    tags: Optional[List[str]] = None,
+    notes: str = "",
+) -> Dict[str, object]:
+    cleaned_path = output_dir / f"{episode_id}_cleaned_speaker_transcript.json"
+    if not cleaned_path.exists():
+        raise RuntimeError(f"Episode cleaned transcript not found: {cleaned_path.name}")
+    cleaned_payload = _load_json(cleaned_path)
+    errors = validate_transcript_payload(cleaned_payload)
+    if errors:
+        raise RuntimeError(f"Cannot annotate invalid cleaned transcript: {'; '.join(errors[:5])}")
+    paths = _gold_set_paths(project_root, episode_id)
+    paths["annotations"].mkdir(parents=True, exist_ok=True)
+    if paths["annotation"].exists():
+        reference_payload = _load_json(paths["annotation"])
+    else:
+        reference_payload = deepcopy(cleaned_payload)
+        reference_payload["text_version"] = "human_reference"
+        reference_payload["annotation_metadata"] = {
+            "gold_set_version": 1,
+            "created_at_epoch_seconds": int(time.time()),
+            "source_cleaned_path": str(cleaned_path),
+            "annotated_segment_ids": [],
+            "tags": [],
+            "notes": {},
+        }
+    target = next(
+        (segment for segment in reference_payload.get("segments") or [] if int(segment.get("id", -1)) == int(segment_id)),
+        None,
+    )
+    if not isinstance(target, dict):
+        raise RuntimeError(f"Segment {segment_id} was not found in {episode_id}.")
+    target["text"] = str(reference_text).strip()
+    target["speaker"] = str(reference_speaker).strip() or str(target.get("speaker") or "UNKNOWN")
+    metadata = reference_payload.setdefault("annotation_metadata", {})
+    annotated_ids = {int(value) for value in metadata.get("annotated_segment_ids") or []}
+    annotated_ids.add(int(segment_id))
+    metadata["annotated_segment_ids"] = sorted(annotated_ids)
+    metadata["updated_at_epoch_seconds"] = int(time.time())
+    metadata["tags"] = sorted({str(item).strip() for item in (metadata.get("tags") or []) + list(tags or []) if str(item).strip()})
+    notes_payload = metadata.get("notes") if isinstance(metadata.get("notes"), dict) else {}
+    if notes.strip():
+        notes_payload[str(segment_id)] = notes.strip()
+    metadata["notes"] = notes_payload
+    paths["annotation"].write_text(json.dumps(reference_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    if paths["manifest"].exists():
+        manifest = _load_json(paths["manifest"])
+    else:
+        manifest = {"gold_set_version": 1, "name": "Podcast Pipeline Gold Set", "entries": []}
+    entries = manifest.setdefault("entries", [])
+    entry = next((item for item in entries if isinstance(item, dict) and str(item.get("id")) == episode_id), None)
+    relative_reference = str(paths["annotation"].relative_to(paths["root"])).replace("\\", "/")
+    if entry is None:
+        entry = {"id": episode_id, "audio_stem": episode_id, "reference": relative_reference, "enabled": True}
+        entries.append(entry)
+    entry["reference"] = relative_reference
+    entry["tags"] = metadata["tags"]
+    entry["segment_ids"] = metadata["annotated_segment_ids"]
+    manifest["entries"] = sorted(entries, key=lambda item: str(item.get("id") or ""))
+    paths["manifest"].parent.mkdir(parents=True, exist_ok=True)
+    paths["manifest"].write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    _append_audit_log(
+        project_root,
+        output_dir,
+        {
+            "timestamp_epoch_seconds": int(time.time()),
+            "action": "gold_segment_annotation_saved",
+            "episode_id": episode_id,
+            "segment_id": int(segment_id),
+            "target_path": str(paths["annotation"]),
+        },
+    )
+    return load_gold_annotation(project_root, episode_id)
 
 
 def _workbench_scan_system_prompt() -> str:

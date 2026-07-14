@@ -28,3 +28,4 @@ _workbench/
 
 workbench-ui/node_modules/
 workbench-ui/dist/
+workbench-ui/*.tsbuildinfo

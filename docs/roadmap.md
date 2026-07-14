@@ -1,18 +1,11 @@
 # Roadmap Mirror
 
-The current roadmap now lives at the repository root:
+The maintained project roadmap lives at the repository root:
 
 - [`../roadmap.md`](../roadmap.md)
-- [`workbench-implementation-plan.md`](workbench-implementation-plan.md)
 
-That file is the maintained version and is organized around:
-
-- completed work
-- active work
-- next likely phases
-
-The workbench implementation plan lives here:
+The transcript review workbench has a separate implementation detail document:
 
 - [`workbench-implementation-plan.md`](workbench-implementation-plan.md)
 
-This document remains only as a lightweight pointer so the repo does not maintain two diverging roadmap narratives.
+This file is intentionally a pointer so the repository keeps one authoritative product roadmap.

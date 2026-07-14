@@ -1,0 +1,11 @@
+{
+  "gold_set_version": 1,
+  "name": "Podcast Pipeline Gold Set",
+  "description": "Human-approved podcast excerpts used to compare pipeline providers.",
+  "promotion_thresholds": {
+    "max_wer_regression": 0.0,
+    "max_speaker_attributed_wer_regression": 0.0,
+    "minimum_completion_rate": 1.0
+  },
+  "entries": []
+}

@@ -1,6 +1,9 @@
 param(
-    [switch]$ReviewBenchmark
+    [switch]$ReviewBenchmark,
+    [switch]$PipelineBenchmark
 )
+
+$AnyBenchmark = $ReviewBenchmark -or $PipelineBenchmark
 
 $CommonScript = Join-Path $PSScriptRoot "PodcastTranscribeLauncher.Common.ps1"
 . $CommonScript
@@ -274,7 +277,7 @@ if (-not (Test-Path -LiteralPath $PythonScript)) {
 Add-Type -AssemblyName System.Windows.Forms
 
 $tokenResolution = $null
-if (-not $ReviewBenchmark) {
+if (-not $AnyBenchmark) {
     $tokenResolution = Resolve-HfToken -ConfigObject $Config -EnvFilePath $EnvPath -ConfigFilePath $ConfigPath
     Write-Host "HF_TOKEN lookup details:"
     foreach ($attempt in $tokenResolution.Attempts) {
@@ -306,7 +309,7 @@ if (-not $ReviewBenchmark) {
 
 $ConfiguredSourceFolder = Resolve-ConfigPathValue $(if ($Config.default_source_dir) { $Config.default_source_dir } else { $null })
 $SourceFolder = $null
-if (-not $ReviewBenchmark) {
+if (-not $AnyBenchmark) {
     if ($ConfiguredSourceFolder -and (Test-Path -LiteralPath $ConfiguredSourceFolder)) {
         $SourceFolder = $ConfiguredSourceFolder
         Write-Host "Using configured source folder: $SourceFolder"
@@ -338,7 +341,7 @@ if (-not $ReviewBenchmark) {
 $ConfiguredFfmpegBinDir = Resolve-ConfigPathValue $(if ($Config.ffmpeg_bin_dir) { $Config.ffmpeg_bin_dir } else { $null })
 $FfmpegBinDir = $null
 $PersistFfmpegBinDir = $false
-if (-not $ReviewBenchmark) {
+if (-not $AnyBenchmark) {
     if ($ConfiguredFfmpegBinDir -and (Test-Path -LiteralPath $ConfiguredFfmpegBinDir)) {
         $FfmpegBinDir = $ConfiguredFfmpegBinDir
         Write-Host "Using configured ffmpeg bin directory: $FfmpegBinDir"
@@ -366,7 +369,13 @@ $DefaultKnownSpeakersDir = Join-Path $ProjectRoot "speaker_reference_samples"
 $ConfiguredKnownSpeakersDir = Resolve-ConfigPathValue $(if ($Config.known_speakers_dir) { $Config.known_speakers_dir } else { $null })
 $KnownSpeakersDir = $null
 
-if ($ConfiguredKnownSpeakersDir -and (Test-Path -LiteralPath $ConfiguredKnownSpeakersDir)) {
+if ($AnyBenchmark) {
+    if ($ConfiguredKnownSpeakersDir -and (Test-Path -LiteralPath $ConfiguredKnownSpeakersDir)) {
+        $KnownSpeakersDir = $ConfiguredKnownSpeakersDir
+    } elseif (Test-Path -LiteralPath $DefaultKnownSpeakersDir) {
+        $KnownSpeakersDir = $DefaultKnownSpeakersDir
+    }
+} elseif ($ConfiguredKnownSpeakersDir -and (Test-Path -LiteralPath $ConfiguredKnownSpeakersDir)) {
     $KnownSpeakersDir = $ConfiguredKnownSpeakersDir
     Write-Host "Using configured speaker reference samples directory: $KnownSpeakersDir"
 } elseif (Test-Path -LiteralPath $DefaultKnownSpeakersDir) {
@@ -396,8 +405,18 @@ $ReplacementMapJson = Resolve-ConfigPathValue $(if ($Config.replacement_map_json
 $HostProfileJson = Resolve-ConfigPathValue $(if ($Config.host_profile_json) { $Config.host_profile_json } else { "host_profile.json" })
 $ConfiguredHostReference = Resolve-ConfigPathValue $(if ($Config.host_reference) { $Config.host_reference } else { $null })
 
-$WhisperModel = Select-WhisperModel -CurrentValue $(if ($null -ne $Config.model) { [string]$Config.model } else { $null })
-if ([string]::IsNullOrWhiteSpace($(if ($null -ne $Config.model) { [string]$Config.model } else { $null }))) {
+$WhisperModel = if ($AnyBenchmark) {
+    if ($Config.model) { [string]$Config.model } else { "distil-large-v3" }
+} else {
+    Select-WhisperModel -CurrentValue $(if ($null -ne $Config.model) { [string]$Config.model } else { $null })
+}
+$AsrProvider = if ($Config.asr_provider) { [string]$Config.asr_provider } else { "faster_whisper" }
+$AlignmentProvider = if ($Config.alignment_provider) { [string]$Config.alignment_provider } else { "timestamp_passthrough" }
+$AlignmentModel = if ($Config.alignment_model) { [string]$Config.alignment_model } else { "" }
+$SpeakerEmbeddingProvider = if ($Config.speaker_embedding_provider) { [string]$Config.speaker_embedding_provider } else { "speechbrain_ecapa" }
+$DiarizationModel = if ($Config.diarization_model) { [string]$Config.diarization_model } else { "pyannote/speaker-diarization-community-1" }
+$SpeakerModel = if ($Config.speaker_model) { [string]$Config.speaker_model } else { "speechbrain/spkrec-ecapa-voxceleb" }
+if (-not $AnyBenchmark -and [string]::IsNullOrWhiteSpace($(if ($null -ne $Config.model) { [string]$Config.model } else { $null }))) {
     Set-ConfigValue -ConfigObject $Config -Name "model" -Value $WhisperModel
     Save-Config -ConfigObject $Config
     Write-Host "Saved model selection to $ConfigPath"
@@ -409,12 +428,22 @@ $BeamSize = if ($null -ne $Config.beam_size) { [int]$Config.beam_size } else { 5
 $BatchSize = if ($null -ne $Config.batch_size) { [int]$Config.batch_size } else { 8 }
 $AssumeDominantSpeakerIsHost = if ($null -ne $Config.assume_dominant_speaker_is_host) { [bool]$Config.assume_dominant_speaker_is_host } else { $true }
 $HostThreshold = if ($null -ne $Config.host_threshold) { [double]$Config.host_threshold } else { 0.45 }
+$MinHostSeconds = if ($null -ne $Config.min_host_seconds) { [double]$Config.min_host_seconds } else { 20.0 }
+$MaxEmbeddingSeconds = if ($null -ne $Config.max_embedding_seconds) { [double]$Config.max_embedding_seconds } else { 90.0 }
+$NumSpeakers = if ($null -ne $Config.num_speakers) { [int]$Config.num_speakers } else { 0 }
 $IsolateFiles = if ($null -ne $Config.isolate_files) { [bool]$Config.isolate_files } else { $true }
-$CleanupLevel = if ($Config.cleanup_level) { [string]$Config.cleanup_level } else { "conservative" }
+$CleanupLevel = if ($Config.cleanup_level) { [string]$Config.cleanup_level } else { "normal" }
 $RuntimeProfile = if ($Config.runtime_profile) { [string]$Config.runtime_profile } else { "baseline_16gb" }
 $ReviewBackend = if ($Config.backend) { [string]$Config.backend } else { "none" }
 $ReviewBaseUrl = if ($Config.review_base_url) { [string]$Config.review_base_url } else { "" }
 $ReviewModelName = if ($Config.review_model_name) { [string]$Config.review_model_name } else { "" }
+$ReviewAutoCalibrate = if ($null -ne $Config.review_auto_calibrate) { [bool]$Config.review_auto_calibrate } else { $null }
+$ReviewAutoAdaptUpward = if ($null -ne $Config.review_auto_adapt_upward) { [bool]$Config.review_auto_adapt_upward } else { $null }
+$ReviewContextBudget = if ($null -ne $Config.review_context_budget) { [int]$Config.review_context_budget } else { 0 }
+$ReviewStructuredOutputSupport = if ($null -ne $Config.review_structured_output_support) { [bool]$Config.review_structured_output_support } else { $false }
+$ReviewTranscriptQaAvailable = if ($null -ne $Config.review_transcript_qa_available) { [bool]$Config.review_transcript_qa_available } else { $false }
+$ReviewEpisodeWideCorrectionAvailable = if ($null -ne $Config.review_episode_wide_correction_available) { [bool]$Config.review_episode_wide_correction_available } else { $false }
+$InlinePreferredTerms = @($Config.preferred_terms | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
 $ReviewDebug = if ($null -ne $Config.review_debug) { [bool]$Config.review_debug } else { $false }
 $ReviewDebugDir = if ($Config.review_debug_dir) { [string](Resolve-ConfigPathValue $Config.review_debug_dir) } else { "" }
 $TranscriptCleanupReview = if ($null -ne $Config.transcript_cleanup_review) { [bool]$Config.transcript_cleanup_review } else { $false }
@@ -441,6 +470,9 @@ $BenchmarkOnly = if ($null -ne $Config.benchmark_only) { [bool]$Config.benchmark
 conda activate podcast-transcribe
 $env:PYTHONNOUSERSITE = "1"
 $env:PODCAST_TRANSCRIBE_FFMPEG_BIN_DIR = $FfmpegBinDir
+if ($FfmpegBinDir) {
+    $env:PATH = "$FfmpegBinDir;$env:PATH"
+}
 
 $dependencyCheckOutput = Test-PythonDependencies 2>&1
 if ($LASTEXITCODE -ne 0) {
@@ -483,11 +515,16 @@ if ($BenchmarkOnly) {
 Write-Host "PYTHONNOUSERSITE: $env:PYTHONNOUSERSITE"
 if ($ReviewBenchmark) {
     Write-Host "Mode: review benchmark"
+} elseif ($PipelineBenchmark) {
+    Write-Host "Mode: pipeline quality benchmark"
 }
 if (-not [string]::IsNullOrWhiteSpace($FfmpegBinDir)) {
     Write-Host "ffmpeg bin directory: $FfmpegBinDir"
 }
-if ($ReviewBenchmark) {
+if ($PipelineBenchmark -and $ConfiguredSourceFolder) {
+    $OutputRoot = Split-Path -Path $ConfiguredSourceFolder -Parent
+    $OutputFolder = Join-Path $OutputRoot "output"
+} elseif ($AnyBenchmark) {
     $OutputFolder = Join-Path $ProjectRoot "output"
 } else {
     Write-Host "Processing Folder: $SourceFolder"
@@ -495,21 +532,26 @@ if ($ReviewBenchmark) {
     $OutputFolder = Join-Path $OutputRoot "output"
 }
 Write-Host "Output folder: $OutputFolder"
-if (-not $ReviewBenchmark -and $ConfiguredHostReference -and (Test-Path -LiteralPath $ConfiguredHostReference)) {
+if (-not $AnyBenchmark -and $ConfiguredHostReference -and (Test-Path -LiteralPath $ConfiguredHostReference)) {
     Write-Host "Using configured host reference sample: $ConfiguredHostReference"
-} elseif (-not $ReviewBenchmark -and $KnownSpeakersDir -and (Test-Path -LiteralPath (Join-Path $KnownSpeakersDir "speakers.json"))) {
+} elseif (-not $AnyBenchmark -and $KnownSpeakersDir -and (Test-Path -LiteralPath (Join-Path $KnownSpeakersDir "speakers.json"))) {
     Write-Host "Host reference sample: using speaker reference samples from $KnownSpeakersDir"
-} elseif (-not $ReviewBenchmark) {
+} elseif (-not $AnyBenchmark) {
     Write-Host "Host reference sample: not configured"
 }
 
 $args = @($PythonScript)
-if (-not $ReviewBenchmark) {
+if (-not $AnyBenchmark) {
     $args += @("--input-dir", $SourceFolder)
 }
 $args += @(
     "--output-dir", $OutputFolder
     "--model", $WhisperModel
+    "--asr-provider", $AsrProvider
+    "--alignment-provider", $AlignmentProvider
+    "--speaker-embedding-provider", $SpeakerEmbeddingProvider
+    "--diarization-model", $DiarizationModel
+    "--speaker-model", $SpeakerModel
     "--language", $Language
     "--device", $Device
     "--compute-type", $ComputeType
@@ -527,9 +569,20 @@ $args += @(
     "--review-model-name", $ReviewModelName
     "--corrections-dir", $ConfiguredCorrectionsDir
     "--host-threshold", "$HostThreshold"
+    "--min-host-seconds", "$MinHostSeconds"
+    "--max-embedding-seconds", "$MaxEmbeddingSeconds"
 )
+if (-not [string]::IsNullOrWhiteSpace($AlignmentModel)) {
+    $args += @("--alignment-model", $AlignmentModel)
+}
 if ($ReviewBenchmark) {
     $args += "--review-benchmark"
+} elseif ($PipelineBenchmark) {
+    $args += @(
+        "--pipeline-benchmark"
+        "--gold-set-dir", (Join-Path $ProjectRoot "benchmarks\pipeline_gold_set")
+        "--benchmark-candidate-dir", $OutputFolder
+    )
 } else {
     $args += @("--hf-token", $tokenResolution.Token)
 }
@@ -537,18 +590,38 @@ if ($ReviewBenchmark) {
 if ($AssumeDominantSpeakerIsHost) {
     $args += "--assume-dominant-speaker-is-host"
 }
-if ($TranscriptCleanupReview) {
+if ($null -ne $Config.transcript_cleanup_review -and -not $TranscriptCleanupReview) {
+    $args += "--no-transcript-cleanup-review"
+} elseif ($TranscriptCleanupReview) {
     $args += "--transcript-cleanup-review"
 }
-if ($GlossaryCorrectionReview) {
+if ($null -ne $Config.glossary_correction_review -and -not $GlossaryCorrectionReview) {
+    $args += "--no-glossary-correction-review"
+} elseif ($GlossaryCorrectionReview) {
     $args += "--glossary-correction-review"
 }
-if ($SpeakerConsistencyReview) {
+if ($null -ne $Config.speaker_consistency_review -and -not $SpeakerConsistencyReview) {
+    $args += "--no-speaker-consistency-review"
+} elseif ($SpeakerConsistencyReview) {
     $args += "--speaker-consistency-review"
 }
-if ($EpisodeQaReview) {
+if ($null -ne $Config.episode_qa_review -and -not $EpisodeQaReview) {
+    $args += "--no-episode-qa-review"
+} elseif ($EpisodeQaReview) {
     $args += "--episode-qa-review"
 }
+if ($null -ne $ReviewAutoCalibrate) {
+    $args += $(if ($ReviewAutoCalibrate) { "--review-auto-calibrate" } else { "--no-review-auto-calibrate" })
+}
+if ($null -ne $ReviewAutoAdaptUpward) {
+    $args += $(if ($ReviewAutoAdaptUpward) { "--review-auto-adapt-upward" } else { "--no-review-auto-adapt-upward" })
+}
+if ($ReviewContextBudget -gt 0) { $args += @("--review-context-budget", "$ReviewContextBudget") }
+if ($ReviewStructuredOutputSupport) { $args += "--review-structured-output-support" }
+if ($ReviewTranscriptQaAvailable) { $args += "--review-transcript-qa-available" }
+if ($ReviewEpisodeWideCorrectionAvailable) { $args += "--review-episode-wide-correction-available" }
+foreach ($term in $InlinePreferredTerms) { $args += @("--preferred-term", [string]$term) }
+if ($NumSpeakers -gt 0) { $args += @("--num-speakers", "$NumSpeakers") }
 if ($ReviewDebug) {
     $args += "--review-debug"
 }
@@ -578,7 +651,7 @@ if ($BenchmarkOnly) {
     $args += "--benchmark-only"
 }
 
-if (-not $ReviewBenchmark -and $ConfiguredHostReference -and (Test-Path -LiteralPath $ConfiguredHostReference)) {
+if (-not $AnyBenchmark -and $ConfiguredHostReference -and (Test-Path -LiteralPath $ConfiguredHostReference)) {
     $args += @("--host-reference", $ConfiguredHostReference)
 }
 

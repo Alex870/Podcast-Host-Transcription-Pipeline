@@ -28,7 +28,14 @@
   "child_timeout_seconds": 0,
   "benchmark_only": false,
   "host_profile_json": "host_profile.json",
+  "host_reference": "",
+  "asr_provider": "faster_whisper",
   "model": "distil-large-v3",
+  "diarization_model": "pyannote/speaker-diarization-community-1",
+  "alignment_provider": "timestamp_passthrough",
+  "alignment_model": "",
+  "speaker_embedding_provider": "speechbrain_ecapa",
+  "speaker_model": "speechbrain/spkrec-ecapa-voxceleb",
   "language": "en",
   "device": "auto",
   "compute_type": "auto",
@@ -36,5 +43,8 @@
   "batch_size": 8,
   "isolate_files": true,
   "assume_dominant_speaker_is_host": true,
-  "host_threshold": 0.45
+  "host_threshold": 0.45,
+  "min_host_seconds": 20,
+  "max_embedding_seconds": 90,
+  "num_speakers": null
 }

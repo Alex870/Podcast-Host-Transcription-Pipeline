@@ -34,6 +34,20 @@ export function loadEpisode(episodeId: string) {
   return request<EpisodeBundle>(`/api/episodes/${encodeURIComponent(episodeId)}`);
 }
 
+export function saveGoldSegmentAnnotation(
+  episodeId: string,
+  segmentId: number,
+  referenceText: string,
+  referenceSpeaker: string,
+  tags: string[],
+  notes: string,
+) {
+  return request<Record<string, unknown>>(`/api/episodes/${encodeURIComponent(episodeId)}/gold-annotation`, {
+    method: "POST",
+    body: JSON.stringify({ segmentId, referenceText, referenceSpeaker, tags, notes }),
+  });
+}
+
 export function runScan(episodeId: string, force = false) {
   return request<{ findings: unknown[] }>(`/api/episodes/${encodeURIComponent(episodeId)}/scan?force=${force ? "true" : "false"}`, {
     method: "POST",

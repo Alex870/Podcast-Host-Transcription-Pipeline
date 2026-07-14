@@ -13,6 +13,7 @@ You will need:
   - `pyannote/speaker-diarization-community-1`
   - `pyannote/segmentation-3.0`
 - FFmpeg installed with a usable `bin` directory such as `C:/ffmpeg/bin`
+- the validated Windows GPU stack: PyTorch 2.9, TorchAudio 2.9, TorchVision 0.24, and TorchCodec 0.8.1
 - Node.js with a working `npm` if you want to use the transcript review workbench
 - enough local compute for Whisper, pyannote, and PyTorch-based audio processing
 
@@ -30,10 +31,12 @@ cd Podcast-Host-Transcription-Pipeline
 The PowerShell launchers assume a conda environment named `podcast-transcribe`, so using that name is the easiest path.
 
 ```powershell
-conda create -n podcast-transcribe python=3.11 -y
+conda create -n podcast-transcribe python=3.10 -y
 conda activate podcast-transcribe
 pip install -r podcast_transcribe_requirements.txt
 ```
+
+The requirements file installs CUDA 12.8 PyTorch wheels and the matching TorchCodec version. The active environment should report `torch.cuda.is_available() == True` on a supported NVIDIA system.
 
 If you prefer a different environment name, update the scripts under `scripts/`.
 
@@ -181,6 +184,7 @@ The validation script checks:
 - Hugging Face token discovery and pyannote access
 - FFmpeg path resolution
 - Python dependencies and CUDA visibility
+- TorchCodec and pyannote `AudioDecoder` availability for path-based audio decoding
 - speaker reference config discovery
 - effective runtime profile and review settings
 - review backend reachability when review is enabled
@@ -226,7 +230,14 @@ Benchmark mode runs the checked-in cleaned-transcript fixtures through the stage
 - `review_benchmark_report.json`
 - `review_benchmark_report.md`
 
-These reports include speed, stability, quality, and usable-capacity information for the configured review model/backend.
+The option `4` reports include review-model speed, stability, quality, and usable-context capacity.
+
+After you have saved human-approved gold-set references in the workbench, bootstrap option `6` writes separate full-pipeline reports:
+
+- `pipeline_quality_benchmark_report.json`
+- `pipeline_quality_benchmark_report.md`
+
+The option `6` reports cover transcript and speaker quality, timing, glossary preservation, completion, and available processing/resource metrics. They do not run review-model capacity probes.
 
 ## 13. Optional: Launch the Transcript Review Workbench
 
@@ -247,7 +258,7 @@ Option `5` now handles frontend setup for you:
 
 You still need Node.js/npm available on the machine the first time that setup is required.
 
-The first time you open it, provide:
+The launcher pre-fills the project root from the running repository and the output folder from the configured output location when available. You can confirm or change both values on first use:
 
 - the project root
 - the processed output folder

@@ -2,6 +2,19 @@
 
 This plan turns the workbench roadmap into a concrete execution sequence. It is intentionally scoped to the workbench itself, while reusing the existing pipeline contracts, reviewed artifacts, and correction/glossary write-back paths.
 
+## Current Implementation Baseline
+
+The initial workbench foundation described by this plan is now implemented:
+
+- React/TypeScript/Vite frontend with a FastAPI local backend
+- launcher-provided project/output defaults and automatic dependency/build handling
+- cleaned/reviewed transcript comparison and semantic scan caching
+- correction CSV, preferred-term, and replacement-map preview/apply flows
+- gold-set segment annotation for pipeline-quality benchmarking
+- project-local Teach-Me rule induction, bounded validation, approval, current-episode rerun, and optional backfill APIs/UI
+
+The phases below are therefore forward-looking maturity work. They should not be read as prerequisites for the current workbench to launch or process existing outputs.
+
 ## Implementation Strategy
 
 Build the workbench in five practical phases:

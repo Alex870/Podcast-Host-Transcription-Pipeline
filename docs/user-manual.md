@@ -17,6 +17,7 @@ The menu options are:
 3. `Migrate settings and state from a legacy directory`
 4. `Run review benchmark`
 5. `Launch transcript review workbench`
+6. `Run pipeline quality benchmark`
 
 ## Normal Transcription Workflow
 
@@ -63,6 +64,16 @@ It checks:
 
 Use it whenever the environment, CUDA stack, FFmpeg install, or backend settings change.
 
+### Long-file diarization
+
+Global pyannote diarization remains the default. If global clustering raises a memory failure, the pipeline retries the episode using overlapping chunked diarization and reconciles adjacent local speaker labels. It records the outcome under the output folder and learns a runtime-specific routing frontier:
+
+- known-safe durations continue through global diarization
+- clearly risky durations use preemptive chunking
+- the narrow frontier band is probed only after the cooldown and recent-failure checks permit it
+
+The routing history is scoped by diarization model, PyTorch/pyannote/SciPy versions, and audio input mode, so changing the runtime does not blindly reuse old memory limits. Summary and manifest metadata identify `global`, `chunked_fallback_after_failure`, and `chunked_preemptive` modes.
+
 ## Migration Workflow
 
 Option `3` helps move a new checkout onto the state of an older working directory.
@@ -78,6 +89,14 @@ It can migrate:
 - `host_profile.json`
 - pretrained speaker model directories
 - corrections directory contents
+- configured source directory contents when that source directory lives inside the legacy repo
+
+Important migration behavior:
+
+- the script warns once before overwriting existing target files
+- it prints a pass/warn checklist at the end
+- it pauses for Enter so the result stays visible
+- repo-local absolute paths in the migrated config are rewritten to fit the new repository layout
 - prior output directory contents
 
 ## Transcript Review Workbench
@@ -100,7 +119,7 @@ The launcher now tries to keep the frontend bundle current automatically:
 
 Node.js/npm still needs to be installed on the machine for that automatic setup to work.
 
-The first run asks for:
+The launcher pre-fills the project root from the running repository and the output folder from the configured output location when available. You can confirm or change both values on first use:
 
 - the project root
 - the processed output folder
@@ -112,14 +131,10 @@ Approved write-back actions in v1 are intentionally narrow:
 - alias/replacement updates -> `preferred_replacements.json`
 
 The workbench writes semantic scan cache files under `_workbench/` and audit entries under `.workbench/`.
-- configured source directory contents when that source directory lives inside the legacy repo
 
-Important migration behavior:
+The Teach-Me workflow lets an operator edit a reviewed segment, ask the configured local model to propose a narrow reusable rule, inspect bounded validation results, and explicitly approve or reject it. Approved rules are project-local, apply only to the LLM review layer, and can rerun the current episode before an optional backfill. They do not mutate deterministic cleanup code or raw/cleaned transcript outputs.
 
-- the script warns once before overwriting existing target files
-- it prints a pass/warn checklist at the end
-- it pauses for Enter so the result stays visible
-- repo-local absolute paths in the migrated config are rewritten to fit the new repository layout
+The workbench also supports gold-set reference annotations. These are human-approved segment references used by option `6` for pipeline quality benchmarking.
 
 ## Review-Enabled Workflow
 
@@ -238,6 +253,38 @@ The benchmark reports on:
 - usable structured-review capacity per stage
 
 Capacity profiling uses the real prompt and parser path, so it is much closer to practical usable space than a model's advertised context length.
+
+## Pipeline Quality Benchmark
+
+Option `6` evaluates full pipeline outputs against human-approved reference spans in `benchmarks/pipeline_gold_set`.
+
+It is separate from option `4`:
+
+- option `4` compares optional LLM review behavior
+- option `6` measures ASR, timing, speaker attribution, host identity, diarization, and glossary preservation
+
+The workbench Gold-set reference action creates or updates approved segment references. Only explicitly annotated segments are scored. Reports are written to:
+
+- `pipeline_quality_benchmark_report.json`
+- `pipeline_quality_benchmark_report.md`
+
+## Provider and Alignment Workflow
+
+The production defaults remain:
+
+- `asr_provider = "faster_whisper"`
+- `alignment_provider = "timestamp_passthrough"`
+- `speaker_embedding_provider = "speechbrain_ecapa"`
+
+To experiment with forced alignment, set `alignment_provider` to `whisperx` and install the optional dependencies from `podcast_transcribe_alignment_requirements.txt` in a compatible environment. Changing alignment invalidates only the alignment-dependent work; reusable ASR and independent diarization artifacts remain available.
+
+### Comparing a Candidate with a Baseline
+
+Option 6 evaluates the selected output directory against the versioned gold set. For an explicit promotion decision, run the Python entrypoint with both `--benchmark-candidate-dir` and `--benchmark-baseline-dir`. The report includes score deltas, taxonomy slices, resource evidence from output manifests, and a pass/fail result using `promotion_thresholds` from the gold-set manifest.
+
+The benchmark uses permutation-aware diarization scoring with a configurable boundary collar. Speaker labels such as `SPEAKER_00` and `HOST` are mapped optimally before DER is calculated, avoiding false errors caused only by anonymous label names.
+
+Host profiles now record their embedding provider/model. A profile from an incompatible embedding family is ignored rather than silently compared.
 
 ## How to Read Reviewed Outputs
 

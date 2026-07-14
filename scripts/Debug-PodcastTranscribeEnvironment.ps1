@@ -366,6 +366,7 @@ try {
     }
     if ($FfmpegBinDir) {
         $env:PODCAST_TRANSCRIBE_FFMPEG_BIN_DIR = $FfmpegBinDir
+        $env:PATH = "$FfmpegBinDir;$env:PATH"
     }
     Write-CheckResult "Activated env" $true $CondaEnvironmentName
 } catch {

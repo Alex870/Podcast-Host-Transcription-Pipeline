@@ -20,6 +20,7 @@ import {
   rejectReviewRule,
   rerunReviewRule,
   runScan,
+  saveGoldSegmentAnnotation,
 } from "./api";
 import type { EpisodeBundle, Finding, LearnedRule, TeachMeProposal, TranscriptSegment } from "./types";
 
@@ -69,6 +70,10 @@ export default function App() {
   const [replacementAlias, setReplacementAlias] = useState("");
   const [selectedRuleId, setSelectedRuleId] = useState("");
   const [statusMessage, setStatusMessage] = useState("");
+  const [goldReferenceText, setGoldReferenceText] = useState("");
+  const [goldReferenceSpeaker, setGoldReferenceSpeaker] = useState("");
+  const [goldTags, setGoldTags] = useState("");
+  const [goldNotes, setGoldNotes] = useState("");
 
   const sessionQuery = useQuery({
     queryKey: ["session"],
@@ -157,6 +162,30 @@ export default function App() {
         queryClient.invalidateQueries({ queryKey: ["audit"] }),
       ]);
       setStatusMessage("Text correction applied.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const goldAnnotationMutation = useMutation({
+    mutationFn: () => {
+      if (!activeSegment) {
+        throw new Error("Select a transcript segment first.");
+      }
+      return saveGoldSegmentAnnotation(
+        selectedEpisodeId,
+        activeSegment.id,
+        goldReferenceText,
+        goldReferenceSpeaker,
+        goldTags.split(",").map((item) => item.trim()).filter(Boolean),
+        goldNotes,
+      );
+    },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["episode", selectedEpisodeId] }),
+        queryClient.invalidateQueries({ queryKey: ["audit"] }),
+      ]);
+      setStatusMessage("Gold-set reference annotation saved.");
     },
     onError: (error: Error) => setStatusMessage(error.message),
   });
@@ -309,6 +338,17 @@ export default function App() {
     }
     const reviewedSegment = episodeQuery.data?.reviewed.segments.find((segment) => segment.id === activeSegment.id);
     setTeachMeText(reviewedSegment?.text ?? activeSegment.text);
+  }, [activeSegment, episodeQuery.data]);
+
+  useEffect(() => {
+    if (!activeSegment) {
+      setGoldReferenceText("");
+      setGoldReferenceSpeaker("");
+      return;
+    }
+    const annotated = episodeQuery.data?.gold_annotation?.segments.find((segment) => segment.id === activeSegment.id);
+    setGoldReferenceText(annotated?.text ?? activeSegment.text);
+    setGoldReferenceSpeaker(annotated?.speaker ?? activeSegment.speaker);
   }, [activeSegment, episodeQuery.data]);
 
   return (
@@ -529,6 +569,46 @@ export default function App() {
                   </div>
                 </div>
               ) : null}
+            </div>
+
+            <div className="action-block">
+              <h3>Gold-set reference</h3>
+              <div className="hint-text">
+                Save a human-approved text and speaker reference for full-pipeline quality benchmarking.
+              </div>
+              <div className="action-meta">
+                Segment: {activeSegment?.id ?? "—"} | {episodeQuery.data?.gold_annotation?.present ? "Reference exists" : "Not annotated"}
+              </div>
+              <textarea
+                value={goldReferenceText}
+                onChange={(event) => setGoldReferenceText(event.target.value)}
+                placeholder="Human-approved reference text"
+                rows={4}
+              />
+              <input
+                value={goldReferenceSpeaker}
+                onChange={(event) => setGoldReferenceSpeaker(event.target.value)}
+                placeholder="Reference speaker label"
+              />
+              <input
+                value={goldTags}
+                onChange={(event) => setGoldTags(event.target.value)}
+                placeholder="Tags, comma separated (crosstalk, noise, short-turn)"
+              />
+              <textarea
+                value={goldNotes}
+                onChange={(event) => setGoldNotes(event.target.value)}
+                placeholder="Annotation notes"
+                rows={2}
+              />
+              <div className="button-row">
+                <button
+                  onClick={() => goldAnnotationMutation.mutate()}
+                  disabled={!activeSegment || !goldReferenceText.trim() || !goldReferenceSpeaker.trim() || goldAnnotationMutation.isPending}
+                >
+                  Save reference
+                </button>
+              </div>
             </div>
 
             <div className="action-block">

@@ -1,6 +1,8 @@
 import tempfile
 import unittest
 import io
+import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -73,16 +75,26 @@ _install_cli_test_stubs()
 
 from podcast_transcribe.cli import (
     build_chunk_speaker_embeddings,
+    build_child_process_command,
     classify_episode_processing_state,
     diarization_route_decision,
     diarization_runtime_fingerprint,
     diarize_audio,
     load_diarization_history,
     normalize_episode_summary_row,
+    parse_args,
     process_audio_batch,
     process_review_backfill_from_cleaned_json,
+    resolve_ffprobe_path,
+    run_alignment_stage,
+    run_deterministic_cleanup_stage,
+    run_speaker_attribution_stage,
+    runtime_config_payload,
     update_diarization_history,
+    write_episode_summary_csv,
 )
+from podcast_transcribe.models import SegmentItem, WordItem
+from podcast_transcribe.providers.contracts import ProviderIdentity, StageResult
 from podcast_transcribe.outputs import build_episode_metadata, write_json_output, write_text_transcript
 
 
@@ -95,6 +107,187 @@ class Word:
 
 
 class ReviewBackfillTests(unittest.TestCase):
+    def test_ffprobe_resolution_rejects_conda_binary_when_no_external_build_is_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conda_prefix = Path(tmp) / "conda"
+            conda_ffprobe = conda_prefix / "Library" / "bin" / "ffprobe.exe"
+            conda_ffprobe.parent.mkdir(parents=True)
+            conda_ffprobe.write_bytes(b"test")
+            with patch.dict(os.environ, {
+                "PODCAST_TRANSCRIBE_FFMPEG_BIN_DIR": "",
+                "FFMPEG_BIN_DIR": "",
+                "CONDA_PREFIX": str(conda_prefix),
+            }, clear=False), patch(
+                "podcast_transcribe.cli.shutil.which", return_value=str(conda_ffprobe)
+            ):
+                self.assertIsNone(resolve_ffprobe_path())
+
+    def test_cli_accepts_provider_and_pipeline_benchmark_options(self):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "podcast_transcribe_host.py",
+                "--pipeline-benchmark",
+                "--asr-provider",
+                "faster_whisper",
+                "--alignment-provider",
+                "whisperx",
+                "--speaker-embedding-provider",
+                "speechbrain_ecapa",
+                "--benchmark-baseline-dir",
+                "baseline-output",
+                "--review-context-budget",
+                "64000",
+                "--preferred-term",
+                "ChromaDB",
+            ],
+        ):
+            args = parse_args()
+        self.assertTrue(args.pipeline_benchmark)
+        self.assertEqual(args.alignment_provider, "whisperx")
+        self.assertEqual(args.benchmark_baseline_dir, "baseline-output")
+        self.assertEqual(args.review_context_budget, 64000)
+        self.assertEqual(args.preferred_terms, ["ChromaDB"])
+        runtime = runtime_config_payload(args)
+        self.assertEqual(runtime["review_context_budget"], 64000)
+        self.assertEqual(runtime["preferred_terms"], ["ChromaDB"])
+
+    def test_isolated_worker_preserves_explicit_review_and_custom_profile_controls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "Episode.mp3"
+            audio.write_bytes(b"audio")
+            with patch.object(sys, "argv", [
+                "podcast_transcribe_host.py", "--input-dir", str(root),
+                "--no-transcript-cleanup-review", "--no-review-auto-calibrate",
+                "--review-context-budget", "64000", "--review-structured-output-support",
+                "--preferred-term", "ChromaDB",
+            ]):
+                args = parse_args()
+            command = build_child_process_command(args, audio, root / "output")
+            self.assertIn("--no-transcript-cleanup-review", command)
+            self.assertIn("--no-review-auto-calibrate", command)
+            self.assertIn("--review-context-budget", command)
+            self.assertIn("--review-structured-output-support", command)
+            self.assertEqual(command[command.index("--preferred-term") + 1], "ChromaDB")
+            self.assertNotIn("--alignment-model", command)
+
+    def test_isolated_worker_forwards_alignment_model_only_when_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "Episode.mp3"
+            audio.write_bytes(b"audio")
+            with patch.object(sys, "argv", [
+                "podcast_transcribe_host.py",
+                "--input-dir", str(root),
+                "--alignment-model", "large-v3",
+            ]):
+                args = parse_args()
+            command = build_child_process_command(args, audio, root / "output")
+            self.assertEqual(command[command.index("--alignment-model") + 1], "large-v3")
+
+    def test_speaker_attribution_cache_reuses_matching_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "Episode.mp3"
+            audio.write_bytes(b"audio")
+            reference = root / "guest.wav"
+            reference.write_bytes(b"reference-a")
+            host_profile = root / "host_profile.json"
+            host_profile.write_text("{}", encoding="utf-8")
+            segment = SegmentItem(1, 0.0, 1.0, "Hello", "SPEAKER_00", -0.1, 0.0, [])
+            identity = ProviderIdentity("speaker_embedding", "speechbrain_ecapa", "test-model")
+            kwargs = dict(
+                output_dir=root, audio_path=audio, segments=[segment],
+                diarized_turns=[{"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"}], verifier=object(),
+                speaker_embedding_identity=identity, host_reference=None, host_profile_path=str(host_profile),
+                known_speaker_profiles={"Guest": {"sample_files": [str(reference)]}}, host_threshold=0.45, assume_dominant=True,
+                max_embedding_seconds=90.0, min_host_seconds=20.0, historical_similarity_scores={},
+                alignment_fingerprint={"hash": "alignment"}, diarization_fingerprint={"hash": "diarization"},
+                resume_intermediates=True,
+            )
+            with patch("podcast_transcribe.cli.choose_host_speaker", return_value=("SPEAKER_00", {}, None, {"SPEAKER_00": 1.0}, {})) as choose, \
+                 patch("podcast_transcribe.cli.match_known_speakers", return_value={}), \
+                 patch("podcast_transcribe.cli.final_host_profile_update", return_value=None), \
+                 patch("podcast_transcribe.cli.load_host_profile", return_value=None), \
+                 patch("podcast_transcribe.cli.rename_speakers", return_value={"SPEAKER_00": "HOST"}):
+                first = run_speaker_attribution_stage(**kwargs)
+                second_kwargs = {**kwargs, "segments": [SegmentItem(1, 0.0, 1.0, "Hello", "SPEAKER_00", -0.1, 0.0, [])]}
+                second = run_speaker_attribution_stage(**second_kwargs)
+                reference.write_bytes(b"reference-b")
+                third = run_speaker_attribution_stage(**second_kwargs)
+                host_profile.write_text('{"changed": true}', encoding="utf-8")
+                fourth = run_speaker_attribution_stage(**second_kwargs)
+            self.assertFalse(first[-1])
+            self.assertTrue(second[-1])
+            self.assertFalse(third[-1])
+            self.assertFalse(fourth[-1])
+            self.assertEqual(choose.call_count, 3)
+
+    def test_alignment_cache_reuses_then_invalidates_when_asr_dependency_changes(self):
+        class FakeAlignment:
+            identity = ProviderIdentity("alignment", "fake", "fake-model")
+
+            def __init__(self):
+                self.calls = 0
+
+            def align(self, audio_path, segments, language):
+                self.calls += 1
+                return StageResult(segments, self.identity, {"aligned": True})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "Episode.mp3"
+            audio.write_bytes(b"audio")
+            provider = FakeAlignment()
+            segment = SegmentItem(1, 0.0, 1.0, "Hello", None, -0.1, 0.0, [])
+            first = run_alignment_stage(root, audio, [segment], provider, "en", {"hash": "asr-a"}, True)
+            second = run_alignment_stage(root, audio, [segment], provider, "en", {"hash": "asr-a"}, True)
+            changed = run_alignment_stage(root, audio, [segment], provider, "en", {"hash": "asr-b"}, True)
+            self.assertFalse(first[2])
+            self.assertTrue(second[2])
+            self.assertFalse(changed[2])
+            self.assertEqual(provider.calls, 2)
+
+    def test_cleanup_cache_reuses_and_invalidates_on_config_and_correction_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "Episode.mp3"
+            audio.write_bytes(b"audio")
+            correction = root / "Episode_corrections.csv"
+            correction.write_text("segment_id,corrected_text\n", encoding="utf-8")
+            segment = SegmentItem(1, 0.0, 1.0, "you know, hello", "HOST", -0.1, 0.0, [])
+            base = dict(output_dir=root, audio_path=audio, replacement_map={}, correction_path=correction,
+                        speaker_attribution_fingerprint={"hash": "speaker"}, resume_intermediates=True)
+            first = run_deterministic_cleanup_stage(segments=[segment], cleanup_level="normal", **base)
+            second = run_deterministic_cleanup_stage(segments=[segment], cleanup_level="normal", **base)
+            aggressive = run_deterministic_cleanup_stage(segments=[segment], cleanup_level="aggressive", **base)
+            correction.write_text("segment_id,corrected_text\n1,Hello there\n", encoding="utf-8")
+            corrected = run_deterministic_cleanup_stage(segments=[segment], cleanup_level="normal", **base)
+            self.assertFalse(first[-1])
+            self.assertTrue(second[-1])
+            self.assertFalse(aggressive[-1])
+            self.assertFalse(corrected[-1])
+
+    def test_summary_csv_accepts_provider_and_alignment_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "summary.csv"
+            row = {
+                "episode": "Episode.mp3",
+                "asr_provider": "faster_whisper",
+                "alignment_provider": "timestamp_passthrough",
+                "speaker_embedding_provider": "speechbrain_ecapa",
+                "alignment_artifact_reused": True,
+                "speaker_attribution_artifact_reused": True,
+                "deterministic_cleanup_artifact_reused": True,
+            }
+            write_episode_summary_csv(path, [row])
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("alignment_provider", text)
+            self.assertIn("timestamp_passthrough", text)
+            self.assertIn("speaker_attribution_artifact_reused", text)
+
     def _episode_qa_only_runtime_config(self):
         return {
             "runtime_profile": "high_context_5090",
@@ -313,6 +506,57 @@ class ReviewBackfillTests(unittest.TestCase):
             )
 
             self.assertEqual(state["state"], "complete")
+
+    def test_classifier_requests_tier1_delta_when_alignment_provider_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_baseline_bundle(root, "Episode 20260512.mp3")
+            audio = root / "Episode 20260512.mp3"
+            audio.write_bytes(b"audio")
+            cleaned_path = root / "Episode 20260512_cleaned_speaker_transcript.json"
+            payload = json.loads(cleaned_path.read_text(encoding="utf-8"))
+            payload.setdefault("metadata", {})["stage_provenance"] = {
+                "alignment": {
+                    "provider": {
+                        "provider": "timestamp_passthrough",
+                        "model": "asr_native_word_timestamps",
+                    }
+                }
+            }
+            cleaned_path.write_text(json.dumps(payload), encoding="utf-8")
+            processed = {audio.name: {"size_bytes": audio.stat().st_size, "mtime_ns": audio.stat().st_mtime_ns}}
+            summary = {audio.name: {"episode": audio.name}}
+
+            state = classify_episode_processing_state(
+                audio,
+                root,
+                processed,
+                summary,
+                {"alignment_provider": "whisperx", "backend": "none"},
+            )
+
+            self.assertEqual(state["state"], "needs_tier1")
+            self.assertEqual(state["provider_shortfalls"], ["alignment:provider"])
+
+    def test_classifier_requests_alignment_delta_for_legacy_unproven_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_baseline_bundle(root, "Episode 20260512.mp3")
+            audio = root / "Episode 20260512.mp3"
+            audio.write_bytes(b"audio")
+            processed = {audio.name: {"size_bytes": audio.stat().st_size, "mtime_ns": audio.stat().st_mtime_ns}}
+            summary = {audio.name: {"episode": audio.name}}
+
+            state = classify_episode_processing_state(
+                audio,
+                root,
+                processed,
+                summary,
+                {"alignment_provider": "whisperx", "backend": "none"},
+            )
+
+            self.assertEqual(state["state"], "needs_tier1")
+            self.assertEqual(state["provider_shortfalls"], ["alignment:unproven_provider"])
 
     def test_classifier_treats_current_reviewed_bundle_as_complete_even_with_stale_summary(self):
         with tempfile.TemporaryDirectory() as tmp:

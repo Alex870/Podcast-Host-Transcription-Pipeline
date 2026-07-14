@@ -29,6 +29,7 @@ Basic podcast transcribers usually stop at "faithfully capture the words." That 
 - `examples/`: example config, glossary, and replacement files
 - `docs/`: Quick Start, user docs, config reference, architecture, and contract docs
 - `benchmarks/review_fixtures/`: checked-in cleaned-transcript fixtures for review benchmarking
+- `benchmarks/pipeline_gold_set/`: human-approved reference spans for full-pipeline quality measurement
 
 ## Launcher Menu
 
@@ -45,6 +46,7 @@ Current bootstrap options:
 3. Migrate settings and state from a legacy directory
 4. Run review benchmark
 5. Launch transcript review workbench
+6. Run pipeline quality benchmark
 
 All PowerShell entrypoints pause at the end so the console window stays open long enough to read the result.
 Option `5` will also install workbench frontend dependencies and rebuild the bundled UI automatically when needed.
@@ -86,6 +88,7 @@ Engineering/supporting docs:
 
 - [`docs/architecture.md`](docs/architecture.md)
 - [`docs/podcast_pipeline_contract.md`](docs/podcast_pipeline_contract.md)
+- [`docs/state-of-the-art-comparison.md`](docs/state-of-the-art-comparison.md)
 - [`roadmap.md`](roadmap.md)
 - [`docs/workbench-implementation-plan.md`](docs/workbench-implementation-plan.md)
 
@@ -93,14 +96,19 @@ Engineering/supporting docs:
 
 At a high level, each episode goes through:
 
-1. transcription with `faster-whisper`
-2. diarization with `pyannote.audio`
-3. speaker matching with `speechbrain`
-4. deterministic cleanup and glossary normalization
-5. optional additive local-LLM review
-6. output writing, manifests, and batch summaries
+1. transcription with the configured ASR provider
+2. word alignment, using timestamp passthrough by default
+3. diarization with `pyannote.audio`
+4. speaker matching with the configured embedding provider
+5. deterministic cleanup and glossary normalization
+6. optional additive local-LLM review
+7. output writing, manifests, and batch summaries
+
+Expensive stages now record provider-aware fingerprints. The default provider set preserves the established behavior, while optional forced alignment and future model adapters can be evaluated without blindly rerunning every independent stage.
 
 The optional review layer can also backfill reviewed outputs from existing `*_cleaned_speaker_transcript.json` files, so legacy tier-1 work does not need to be rerun just to add tier-2 review artifacts.
+
+The validated Windows GPU environment uses PyTorch 2.9 with TorchCodec 0.8.1 and a shared FFmpeg build. When the native decoder is available, pyannote can receive path-based audio; learned long-file routing still provides a chunked fallback for global diarization memory failures.
 
 ## Supported Audio Formats
 

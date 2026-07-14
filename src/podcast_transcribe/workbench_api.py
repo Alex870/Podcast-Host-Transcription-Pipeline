@@ -7,7 +7,7 @@ import json
 import os
 import webbrowser
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +31,7 @@ from podcast_transcribe.workbench_core import (
     rerun_review_with_approved_rules,
     resolve_workbench_paths,
     run_semantic_scan,
+    save_gold_segment_annotation,
 )
 
 
@@ -61,6 +62,14 @@ class PreferredTermRequest(BaseModel):
 class ReplacementMapRequest(BaseModel):
     preferred_term: str = Field(..., alias="preferredTerm")
     alias: str
+
+
+class GoldSegmentAnnotationRequest(BaseModel):
+    segment_id: int = Field(..., alias="segmentId")
+    reference_text: str = Field(..., alias="referenceText")
+    reference_speaker: str = Field(..., alias="referenceSpeaker")
+    tags: List[str] = Field(default_factory=list)
+    notes: str = ""
 
 
 def _frontend_dist_dir() -> Path:
@@ -158,6 +167,24 @@ def get_episode(episode_id: str):
     try:
         project_root, output_dir = SESSION.require()
         return load_episode_bundle(project_root, output_dir, episode_id)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/episodes/{episode_id}/gold-annotation")
+def save_gold_annotation_endpoint(episode_id: str, payload: GoldSegmentAnnotationRequest):
+    try:
+        project_root, output_dir = SESSION.require()
+        return save_gold_segment_annotation(
+            project_root,
+            output_dir,
+            episode_id,
+            payload.segment_id,
+            payload.reference_text,
+            payload.reference_speaker,
+            tags=payload.tags,
+            notes=payload.notes,
+        )
     except Exception as exc:
         raise _json_error(exc) from exc
 

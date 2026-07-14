@@ -16,6 +16,7 @@ from podcast_transcribe.contract import (
     validate_transcript_payload,
 )
 from podcast_transcribe.quality import classify_segment_text, summarize_content_quality
+from podcast_transcribe.state import atomic_write_text
 
 DATE_FORMAT_SPECS = {
     "YYYYMMDD": {"regex": r"(?<!\d)(\d{8})(?!\d)", "parser": "%Y%m%d"},
@@ -437,6 +438,8 @@ def write_output_manifest(
     outputs: List[Path],
     timings: Dict[str, float],
     summary: Dict[str, object],
+    stage_provenance: Optional[Dict[str, object]] = None,
+    resource_usage: Optional[Dict[str, object]] = None,
 ):
     """Write a manifest that fingerprints inputs, config, outputs, timings, and summary state."""
 
@@ -463,9 +466,11 @@ def write_output_manifest(
         "config": config,
         "timings_seconds": {key: round(float(value), 3) for key, value in timings.items()},
         "summary": summary,
+        "stage_provenance": stage_provenance or {},
+        "resource_usage": resource_usage or {},
         "outputs": output_records,
     }
-    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    atomic_write_text(path, json.dumps(manifest, indent=2))
 
 
 def write_batch_report_md(path: Path, rows: List[Dict[str, object]], elapsed_seconds: Optional[float] = None):

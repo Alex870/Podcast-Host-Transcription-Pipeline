@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("Prompt", "Run", "Debug", "Migrate", "Benchmark", "Workbench")]
+    [ValidateSet("Prompt", "Run", "Debug", "Migrate", "Benchmark", "PipelineBenchmark", "Workbench")]
     [string]$Action = "Prompt"
 )
 
@@ -12,7 +12,8 @@ $WorkbenchScript = Join-Path $ScriptRoot "scripts\Launch-PodcastTranscribeWorkbe
 function Invoke-LauncherScript {
     param(
         [string]$Path,
-        [switch]$ReviewBenchmark
+        [switch]$ReviewBenchmark,
+        [switch]$PipelineBenchmark
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -21,6 +22,8 @@ function Invoke-LauncherScript {
 
     if ($ReviewBenchmark) {
         & $Path -ReviewBenchmark
+    } elseif ($PipelineBenchmark) {
+        & $Path -PipelineBenchmark
     } else {
         & $Path
     }
@@ -35,8 +38,9 @@ if ($Action -eq "Prompt") {
     Write-Host "  3. Migrate settings and state from a legacy directory"
     Write-Host "  4. Run review benchmark"
     Write-Host "  5. Launch transcript review workbench"
+    Write-Host "  6. Run pipeline quality benchmark"
     Write-Host "  Q. Quit"
-    $selection = (Read-Host "Enter 1, 2, 3, 4, 5, or Q").Trim()
+    $selection = (Read-Host "Enter 1, 2, 3, 4, 5, 6, or Q").Trim()
 
     switch ($selection.ToUpperInvariant()) {
         "1" { $Action = "Debug" }
@@ -44,6 +48,7 @@ if ($Action -eq "Prompt") {
         "3" { $Action = "Migrate" }
         "4" { $Action = "Benchmark" }
         "5" { $Action = "Workbench" }
+        "6" { $Action = "PipelineBenchmark" }
         "Q" { return }
         default {
             Write-Host "Unrecognized selection. Exiting."
@@ -57,5 +62,6 @@ switch ($Action) {
     "Run" { Invoke-LauncherScript -Path $RunScript }
     "Migrate" { Invoke-LauncherScript -Path $MigrateScript }
     "Benchmark" { Invoke-LauncherScript -Path $RunScript -ReviewBenchmark }
+    "PipelineBenchmark" { Invoke-LauncherScript -Path $RunScript -PipelineBenchmark }
     "Workbench" { Invoke-LauncherScript -Path $WorkbenchScript }
 }

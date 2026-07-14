@@ -1,273 +1,93 @@
 # Roadmap
 
-This roadmap reflects the current state of `podcast-host-transcription-pipeline` as it exists now: a stable baseline transcription system with an optional, increasingly capable tier-2 review layer, plus a new local transcript review workbench for inspecting processed outputs and feeding approved fixes back into the pipeline.
-
-The project is no longer at the stage of "add optional review at all." That foundation is already in place. The roadmap now has two connected tracks:
-
-- continue hardening review quality, benchmarking, and operational clarity in the pipeline itself
-- grow the workbench into a practical operator console for episode review, issue triage, and reproducible write-back
-
-## Guiding Principles
-
-- Keep Whisper + diarization + speaker identification as the default baseline workflow.
-- Keep optional review additive and opt-in.
-- Preserve raw and deterministically cleaned outputs as source-of-truth artifacts.
-- Let stronger local rigs do more without forcing that complexity onto smaller-GPU users.
-- Prefer trustworthy, measurable review behavior over flashy but brittle long-context claims.
-- Keep the workbench local-first, operator-focused, and tied to reproducible pipeline inputs rather than direct transcript mutation.
-
-## Completed
-
-These are the major roadmap items that are effectively implemented.
-
-### Baseline Pipeline Foundation
-
-- Batch transcription with `faster-whisper`
-- Speaker diarization with `pyannote.audio`
-- Speaker matching with `speechbrain`
-- Host matching from reference samples and persistent profile data
-- Known-speaker reference support through `speaker_reference_samples`
-- Batch-friendly isolated child-process workflow
-
-### Output Contracts and Provenance
-
-- Transcript JSON schema/version metadata and validation
-- Executable transcript contract helpers
-- Per-episode manifests with source/config fingerprints, timings, and output hashes
-- Batch-level reporting through `_episode_review_summary.csv` and `_batch_report.md`
-- Episode date extraction with configurable filename-date parsing
-
-### Deterministic Cleanup and QA
-
-- Cleanup levels: `disabled`, `conservative`, `normal`, `aggressive`
-- Deterministic cleanup provenance in cleaned JSON
-- Manual correction CSV ingestion through `corrections_dir`
-- Deterministic `content_quality` tagging for sponsor/boilerplate/music/silence-like spans
-- Reference-sample quality checks for known speakers
-- Speaker-review CSVs and batch-level speaker aggregates
-
-### Resume and Operational Safety
-
-- `_processing_artifacts` for transcription/diarization resume
-- Intra-episode resume on partial failure
-- Debug artifact preservation controls
-- Child timeout support for isolated workers
-- Disk-space preflight
-- Audio-duration-aware progress and ETA reporting
-
-### Optional Tier-2 Review Layer
-
-- `runtime_profile` model:
-  - `baseline_16gb`
-  - `high_context_5090`
-  - `custom`
-- `backend` model:
-  - `none`
-  - `lm_studio`
-  - `vllm`
-- Additive reviewed transcript outputs:
-  - `*_reviewed_speaker_transcript.txt`
-  - `*_reviewed_host_only.txt`
-  - `*_reviewed_speaker_transcript.json`
-- Reviewed-schema metadata and stage provenance
-- Staged review pipeline:
-  - transcript cleanup review
-  - glossary correction review
-  - speaker consistency review
-  - episode QA review
+`podcast-host-transcription-pipeline` is a mature local-first system for speaker-aware podcast transcripts and optional review. The next stage is measurable transcript/speaker quality, safe human feedback, and durable downstream contracts rather than more unconstrained LLM review.
 
-### Smart Tier-2 Backfill
-
-- Mixed-batch behavior where:
-  - new episodes can run `tier1+tier2`
-  - legacy tier-1-complete episodes can run `tier2-only backfill`
-  - already-complete episodes can be skipped
-- Review backfill from `*_cleaned_speaker_transcript.json`
-- Stage-aware reviewed-output classification
+## Principles
 
-### Review Calibration and Benchmarking
-
-- Run-scoped review calibration
-- Warm-start reuse as hints only
-- Adaptive review budgets with downward and conservative upward adjustment
-- Backend/model-aware runtime fingerprinting
-- Dedicated review benchmark mode against checked-in cleaned-transcript fixtures
-- Benchmark scoring for:
-  - speed
-  - stability
-  - quality
-  - usable capacity per review stage
-
-### Preferred-Term Protection
+- Keep faster-whisper, diarization, speaker matching, and deterministic cleanup as the dependable baseline.
+- Keep LLM review optional, evidence-preserving, and auditable.
+- Preserve raw, cleaned, reviewed, and human-corrected artifacts with provenance.
+- Measure review benefit against labeled data, not fluency alone.
+- Keep output compatible with the downstream RAG/import/chat contract.
 
-- `preferred_terms.txt` treated as reserved spellings for review
-- Prompt-level glossary invariants
-- Post-review protected-term checks
-- Benchmark visibility for glossary safety / protected-term regressions
+## Current Foundation
 
-### Transcript Review Workbench Foundation
+- Batch transcription, diarization, known-speaker matching, host extraction, cleanup, manifests, resume support, review backfill, and reports.
+- Optional LM Studio/vLLM review, calibration, benchmark mode, glossary protection, and preferred-term safeguards.
+- React/FastAPI review workbench with comparison, findings, and controlled write-back.
+- Provider contracts for ASR, alignment, diarization provenance, and speaker embeddings.
+- Provider-aware stage fingerprints with selective intermediate reuse.
+- Optional WhisperX forced-alignment adapter with timestamp passthrough as the stable default.
+- Versioned speaker profiles that prevent incompatible embedding families from being mixed.
+- Full-pipeline gold-set benchmark and workbench reference annotation path.
+- Atomic, dependency-validated stage caches through speaker attribution and deterministic cleanup.
+- Permutation-aware diarization scoring, error-taxonomy slices, resource metrics, baseline comparisons, and promotion gates.
+- Learned long-file diarization routing with same-run chunked fallback and runtime-scoped probe history.
+- Staged review calibration/adaptation, protected preferred-term enforcement, practical capacity profiling, and project-local Teach-Me rules.
 
-- FastAPI backend and React + Vite frontend
-- Root bootstrap option `5` to launch the workbench
-- Automatic frontend dependency install/build when needed
-- Session-aware launch with project-root and output-folder defaults
-- Episode loading from cleaned and reviewed transcript bundles
-- Cleaned vs reviewed transcript comparison surface
-- On-demand semantic scan through the configured review backend
-- Approved write-back into:
-  - episode correction CSVs
-  - `preferred_terms.txt`
-  - `preferred_replacements.json`
-- Workbench scan cache and audit-log persistence
+## Completed Modernization Phases 0-2
 
-## Active Work
+- **Phase 0, foundations:** provider contracts, stage-oriented orchestration boundaries within the current CLI, lazy optional alignment dependencies, stable provenance, and interruption-safe state persistence. Further decomposition of the large CLI remains a maintainability track rather than a prerequisite for provider experimentation.
+- **Phase 1, measurement:** versioned workbench-authored gold references, WER, speaker-attributed WER, permutation-aware DER, host and glossary metrics, timing/resource evidence, taxonomy reporting, and baseline/candidate promotion decisions.
+- **Phase 2, selective recomputation:** provider/config/dependency fingerprints for transcription, alignment, diarization, speaker attribution, and deterministic cleanup, with strict corruption rejection and legacy-baseline compatibility rules.
+- **Phase 3, operational resilience:** atomic stage caches, provider-aware manifests, long-file diarization fallback/routing, run-scoped review calibration, adaptive overflow recovery, and review/debug reporting.
+- **Structural Phase 5 work:** React/FastAPI workbench, gold-set annotation path, pipeline-quality benchmark reports, controlled write-back, learned review rules, and frontend build automation are implemented as additive foundations. Broader library-level triage remains future work.
 
-These are the areas that best describe the current living roadmap.
+Populating the gold set with representative human-approved excerpts is ongoing dataset stewardship rather than an unfinished software phase.
 
-### 1. Review Quality Hardening
+## Current Product Surface
 
-Current focus:
+The implemented system now has three connected operator loops:
 
-- improve speaker-consistency correction reliability
-- improve episode-QA usefulness on long real-world episodes
-- reduce missed edits without encouraging over-editing
-- keep patch behavior compact and conservative
+1. **Production loop:** tier-1 transcription through deterministic cleanup, with optional tier-2 review and cleaned-JSON backfill.
+2. **Measurement loop:** option `4` for review-model fixtures/capacity and option `6` for full-pipeline gold-set quality measurement.
+3. **Human-feedback loop:** option `5` for transcript inspection, semantic scans, controlled write-back, gold annotations, and Teach-Me review-rule induction.
 
-### 2. Better Model Selection and Evaluation
+The next work should improve evidence quality and operator leverage rather than add another unmeasured model stage.
 
-Current focus:
+## Priority 1: Quality Measurement
 
-- compare review models on practical structured-review behavior, not just published context sizes
-- keep evaluating speed vs quality tradeoffs across local vLLM candidates
-- make production model choice more evidence-based
+- Build a gold set with audio, speaker labels, timestamps, glossary terms, and human-reviewed transcripts.
+- Report ASR word accuracy where references exist, diarization/speaker attribution, host precision/recall, glossary preservation, and review-change precision.
+- Track quality by crosstalk, noise, accents, music, sponsor reads, and long-form discussions.
+- Separate deterministic cleanup changes from LLM review changes.
+- Use an error taxonomy instead of one overall score.
+- Grow the initial versioned gold-set structure into representative, human-approved podcast excerpts and use option `6` for baseline/candidate comparisons.
 
-### 3. Operational Clarity
+## Priority 2: Speaker Identity And Human Feedback
 
-Current focus:
+- Add cross-episode speaker drift detection with confidence and evidence clips.
+- Support approved promotion of recurring unknown speakers with rollback.
+- Improve multi-host/co-host support and profile versioning.
+- Treat accepted/rejected workbench corrections as supervised feedback data, but validate before activating rules.
+- Keep write-back append-only and auditable.
 
-- clearer summaries of what review actually changed
-- better visibility into whether review meaningfully helped on a given run
-- continued improvement to console/report language so batch progress and review status are easy to read
+## Priority 3: Safer Review Intelligence
 
-### 4. Workbench Usability
+- Use server/model capability discovery instead of machine-specific profiles.
+- Budget review prompts from actual context limits and reserve output tokens.
+- Require schema validation, bounded retries, and change summaries for review.
+- Add no-op regression tests to prevent over-editing good transcripts.
+- Surface uncertainty and evidence for proposed corrections.
 
-Current focus:
+## Priority 4: Operations And Contracts
 
-- make the episode review flow faster and less click-heavy
-- improve transcript navigation and findings triage
-- make semantic-scan results more understandable and actionable
-- keep write-back behavior safe, visible, and reproducible
+- Publish and enforce the shared transcript contract.
+- Record audio hash, model versions, speaker-profile version, cleanup/review config, and output hashes.
+- Improve batch reports with risk ranking, review yield, elapsed time, and operator action links.
+- Test health checks, resumability, idempotency, and partial-failure recovery.
 
-## Next Likely Phases
+## Priority 5: Workbench Maturity
 
-These are the most plausible next roadmap steps from here.
+- Improve changed-only/speaker-only views, triage, write preview, and conflicts.
+- Add cross-episode issue views and grouped approvals.
+- Keep broad analytics in RAGScope.
 
-### Pipeline Phase 1: Review Precision and Utility
+## Sequencing
 
-- strengthen prompts and reconciliation logic for speaker-consistency review
-- improve long-context episode-QA behavior on genuinely long transcripts
-- add more real-world fixtures that stress:
-  - speaker drift
-  - glossary pressure
-  - long-context contradictions
-  - false-positive over-edit temptation
-
-### Pipeline Phase 2: Model Benchmarking Maturity
-
-- turn benchmark results into a clearer production recommendation workflow
-- add more explicit reporting around:
-  - quality-per-second
-  - correction yield
-  - stage usefulness by model
-- continue capacity profiling so model swaps are less guessy
-
-### Pipeline Phase 3: Richer Run Reporting
-
-- add stronger run-level summaries or dashboards combining:
-  - processing time
-  - audio duration
-  - review changes
-  - confidence/risk indicators
-  - speaker-match uncertainty
-- make it easier to see which episodes most deserve human review
-
-### Pipeline Phase 4: Speaker Workflow Expansion
-
-- stronger cross-episode speaker drift detection
-- better recurring unnamed-speaker promotion workflow
-- possible multi-host / co-host profile support
-
-### Pipeline Phase 5: Broader Integration and Test Depth
-
-- expand fixture and integration coverage further
-- keep transcript-contract compatibility tight with downstream repos
-- add more shared validation assumptions across the podcast toolchain
-
-### Workbench Phase 1: Stabilize the Core Review Surface
-
-- polish session/open flow, recent paths, and current-target visibility
-- improve loading, empty, and backend-unavailable states
-- improve transcript readability with sticky headers, row focus, and jump-to-finding
-- strengthen audit/log visibility so operators can see what changed and where it was written
-
-### Workbench Phase 2: Better Review Ergonomics
-
-- add transcript filtering, sorting, speaker-only views, changed-only views, and findings-only views
-- improve cleaned-vs-reviewed diff presentation
-- add saved view preferences and stronger transcript navigation shortcuts
-- surface episode-list quality signals such as unresolved findings and prior corrections
-
-### Workbench Phase 3: Smarter Semantic Review Assistance
-
-- define a clearer issue taxonomy for semantic scan findings
-- add scan modes such as lightweight, glossary-focused, and deep semantic pass
-- show stronger evidence, confidence, and deduplication for findings
-- make preferred-term preservation visible in the review surface
-
-### Workbench Phase 4: Write-Back Intelligence and Pipeline Feedback
-
-- add stronger write-preview and conflict handling for corrections
-- promote repeated episode fixes into glossary/replacement suggestions
-- explain the downstream effect of each action more clearly
-- add grouped approval flows and per-episode history of applied actions
-
-### Workbench Phase 5: Cross-Episode and Run-Level Insight
-
-- show `_episode_review_summary.csv`, `_review_run_report.*`, and `_speaker_workflow_report.*` in the UI
-- rank episodes by likely review value or unresolved risk
-- add cross-episode views for recurring issue patterns, glossary candidates, and speaker instability
-- make the workbench useful as a library-level triage console, not just a single-episode viewer
-
-### Workbench Phase 6: Teach-Me Review Learning
-
-- manual reviewed-text editing as supervised teaching input
-- project-local learned review-rule library
-- LLM-based rule induction with bounded validation and refinement
-- explicit approval before activation
-- current-episode rerun plus optional batch backfill
-- rule management, auditability, and review-stage integration
-
-## Deprioritized or Reframed Work
-
-These are ideas that still matter, but no longer define the center of the roadmap.
-
-- "Add optional review" is no longer a future item; it is implemented.
-- "Add benchmarking" is no longer a future item; the benchmark now exists and the real work is improving how it is used.
-- "Add cleanup levels" is done; the active question is how far deterministic cleanup should go while remaining trustworthy.
-- "Make the workbench possible at all" is done; the active question is how quickly and safely it can support real operator review workflows.
-
-## Summary
-
-The project now has:
-
-- a strong baseline transcription pipeline
-- a real optional tier-2 review system
-- a practical first-generation local review workbench
-
-The roadmap from here is mostly about refinement and leverage:
-
-- make review quality better
-- make model choice more evidence-based
-- make runs easier to understand
-- make the workbench faster and safer for human review
-- preserve compatibility for smaller and simpler setups
+1. Populate the implemented gold-set framework and establish baseline metrics.
+2. Evaluate forced alignment against timing and speaker-attributed WER before changing defaults.
+3. Add an isolated Parakeet provider and compare it against faster-whisper.
+4. Calibrate a candidate speaker embedder using the versioned profile contract.
+5. Harden speaker drift, correction audit trails, and cross-episode triage using measured failures.
+6. Feed contract-validated outputs into end-to-end downstream tests.
