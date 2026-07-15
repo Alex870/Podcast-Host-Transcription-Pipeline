@@ -17,6 +17,7 @@ from podcast_transcribe.evaluation.metrics import (
     timestamp_error,
     word_error_rate,
 )
+from podcast_transcribe.evaluation.stage7 import condition_report, gold_set_readiness
 
 
 GOLD_SET_VERSION = 1
@@ -35,7 +36,7 @@ def load_gold_manifest(gold_set_dir: Path) -> Dict[str, object]:
     if not manifest_path.exists():
         raise FileNotFoundError(f"Gold-set manifest not found: {manifest_path}")
     payload = _load_json(manifest_path)
-    if int(payload.get("gold_set_version") or 0) != GOLD_SET_VERSION:
+    if int(payload.get("gold_set_version") or 0) not in {1, 2}:
         raise RuntimeError(f"Unsupported gold_set_version in {manifest_path}")
     if not isinstance(payload.get("entries"), list):
         raise RuntimeError(f"Gold-set manifest is missing entries: {manifest_path}")
@@ -151,6 +152,14 @@ def run_pipeline_benchmark(
         for item in results
         if float((item.get("performance", {}).get("timings_seconds") or {}).get("total") or 0.0) > 0
     ]
+    resource_summary = {}
+    for key in ("peak_cpu_working_set_mib", "peak_gpu_allocated_mib", "peak_gpu_reserved_mib"):
+        values = [
+            float((item.get("performance", {}).get("resource_usage") or {}).get(key))
+            for item in results
+            if (item.get("performance", {}).get("resource_usage") or {}).get(key) not in (None, "")
+        ]
+        resource_summary[key] = {"max": max(values) if values else None, "mean": sum(values) / len(values) if values else None}
     taxonomy: Dict[str, Dict[str, object]] = {}
     for tag in sorted({tag for item in results for tag in item.get("error_taxonomy") or []}):
         tagged = [item for item in results if tag in (item.get("error_taxonomy") or [])]
@@ -179,8 +188,11 @@ def run_pipeline_benchmark(
             "diarization_error_rate": diarization_errors / diarization_scored if diarization_scored else None,
             "completion_rate": len(results) / (len(results) + len(failures)) if results or failures else 0.0,
             "mean_processing_seconds": sum(total_timings) / len(total_timings) if total_timings else None,
+            "resource_usage": resource_summary,
         },
         "error_taxonomy": taxonomy,
+        "condition_report": condition_report({"results": results}),
+        "gold_set_readiness": gold_set_readiness(gold_set_dir),
         "results": results,
         "failures": failures,
     }
@@ -253,6 +265,15 @@ def write_pipeline_benchmark_reports(output_dir: Path, report: Dict[str, object]
         lines.extend(["", "## Error Taxonomy", "", "| Category | Entries | WER |", "|---|---:|---:|"])
         for name, values in report["error_taxonomy"].items():
             lines.append(f"| {name} | {values.get('entry_count', 0)} | {float(values.get('wer') or 0.0):.4f} |")
+    if report.get("condition_report"):
+        lines.extend(["", "## Condition Report", "", "| Condition | Entries | WER | Mean timing error |", "|---|---:|---:|---:|"])
+        for name, values in report["condition_report"].items():
+            timing = values.get("mean_timestamp_error_seconds")
+            lines.append(
+                f"| {name} | {values.get('entry_count', 0)} | {float(values.get('wer') or 0.0):.4f} | "
+                f"{float(timing):.4f} |" if timing is not None else
+                f"| {name} | {values.get('entry_count', 0)} | {float(values.get('wer') or 0.0):.4f} | — |"
+            )
     if failures:
         lines.extend(["", "## Failures", ""])
         lines.extend(f"- {item.get('id')}: {item.get('error')}" for item in failures)

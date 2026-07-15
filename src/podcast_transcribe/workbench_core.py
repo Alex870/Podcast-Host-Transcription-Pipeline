@@ -38,6 +38,11 @@ from podcast_transcribe.outputs import (
     write_text_transcript,
 )
 from podcast_transcribe.review import review_segments
+from podcast_transcribe.speaker_workflow import (
+    assert_write_revision,
+    build_cross_episode_speaker_view,
+    file_revision,
+)
 
 
 WORKBENCH_DIRNAME = "_workbench"
@@ -522,6 +527,7 @@ def load_episode_bundle(project_root: Path, output_dir: Path, episode_id: str) -
         "episode_id": episode_id,
         "cleaned": {
             "path": str(cleaned_path),
+            "source_revision": file_revision(cleaned_path),
             "metadata": cleaned_payload.get("metadata") or {},
             "segments": cleaned_segments,
             "host_detected": bool(cleaned_payload.get("host_detected")),
@@ -582,6 +588,8 @@ def save_gold_segment_annotation(
     reference_speaker: str,
     tags: Optional[List[str]] = None,
     notes: str = "",
+    reviewer_id: str = "",
+    approval_status: str = "pending_review",
 ) -> Dict[str, object]:
     cleaned_path = output_dir / f"{episode_id}_cleaned_speaker_transcript.json"
     if not cleaned_path.exists():
@@ -604,6 +612,8 @@ def save_gold_segment_annotation(
             "annotated_segment_ids": [],
             "tags": [],
             "notes": {},
+            "reviewer_id": str(reviewer_id).strip(),
+            "approval_status": str(approval_status or "pending_review").strip().lower(),
         }
     target = next(
         (segment for segment in reference_payload.get("segments") or [] if int(segment.get("id", -1)) == int(segment_id)),
@@ -623,6 +633,10 @@ def save_gold_segment_annotation(
     if notes.strip():
         notes_payload[str(segment_id)] = notes.strip()
     metadata["notes"] = notes_payload
+    if reviewer_id.strip():
+        metadata["reviewer_id"] = reviewer_id.strip()
+    metadata["approval_status"] = str(approval_status or metadata.get("approval_status") or "pending_review").strip().lower()
+    metadata["version"] = int(metadata.get("version") or 1)
     paths["annotation"].write_text(json.dumps(reference_payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     if paths["manifest"].exists():
@@ -638,6 +652,9 @@ def save_gold_segment_annotation(
     entry["reference"] = relative_reference
     entry["tags"] = metadata["tags"]
     entry["segment_ids"] = metadata["annotated_segment_ids"]
+    entry["reviewer_id"] = metadata.get("reviewer_id", "")
+    entry["approval_status"] = metadata.get("approval_status", "pending_review")
+    entry["condition_tags"] = metadata["tags"]
     manifest["entries"] = sorted(entries, key=lambda item: str(item.get("id") or ""))
     paths["manifest"].parent.mkdir(parents=True, exist_ok=True)
     paths["manifest"].write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1440,6 +1457,7 @@ def preview_text_correction(project_root: Path, output_dir: Path, episode_id: st
         "original_text": segment["text"],
         "corrected_text": new_text,
         "changes": [{"field": "corrected_text", "before": segment["text"], "after": new_text}],
+        "source_revision": file_revision(output_dir / f"{episode_id}_cleaned_speaker_transcript.json"),
     }
 
 
@@ -1464,8 +1482,17 @@ def _append_audit_log(project_root: Path, output_dir: Path, entry: Dict[str, obj
         handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def apply_text_correction(project_root: Path, output_dir: Path, episode_id: str, segment_id: int, corrected_text: str) -> Dict[str, object]:
+def apply_text_correction(
+    project_root: Path,
+    output_dir: Path,
+    episode_id: str,
+    segment_id: int,
+    corrected_text: str,
+    expected_revision: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
     preview = preview_text_correction(project_root, output_dir, episode_id, segment_id, corrected_text)
+    cleaned_path = output_dir / f"{episode_id}_cleaned_speaker_transcript.json"
+    assert_write_revision(cleaned_path, expected_revision)
     corrections_dir = resolve_workbench_paths(project_root, output_dir)["corrections_dir"]
     _assert_within_root(project_root, corrections_dir)
     corrections_dir.mkdir(parents=True, exist_ok=True)

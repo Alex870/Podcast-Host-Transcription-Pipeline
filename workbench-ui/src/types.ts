@@ -16,6 +16,7 @@ export type TranscriptSegment = {
   text: string;
   original_text?: string | null;
   llm_reviewed_text?: string | null;
+  source_revision?: Record<string, unknown>;
 };
 
 export type Finding = {
@@ -32,6 +33,7 @@ export type EpisodeBundle = {
   episode_id: string;
   cleaned: {
     path: string;
+    source_revision?: Record<string, unknown>;
     metadata: Record<string, unknown>;
     segments: TranscriptSegment[];
     host_detected: boolean;

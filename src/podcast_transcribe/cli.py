@@ -136,10 +136,10 @@ from podcast_transcribe.models import SegmentItem, WordItem
 from podcast_transcribe.evaluation import run_pipeline_benchmark, write_pipeline_benchmark_reports
 from podcast_transcribe.orchestration.fingerprints import build_stage_fingerprint
 from podcast_transcribe.providers.alignment import ALIGNMENT_PROVIDERS, create_alignment_provider
-from podcast_transcribe.providers.asr import FasterWhisperASRProvider
+from podcast_transcribe.providers.asr import FasterWhisperASRProvider, ParakeetASRProvider
 from podcast_transcribe.providers.contracts import ProviderIdentity
 from podcast_transcribe.providers.diarization import pyannote_provider_identity
-from podcast_transcribe.providers.speaker_embedding import SpeechBrainECAPAProvider
+from podcast_transcribe.providers.speaker_embedding import SpeechBrainECAPAProvider, SpeechBrainXVectorProvider
 from podcast_transcribe.quality import language_model_warnings
 from podcast_transcribe.review import (
     ReviewCalibrationSession,
@@ -593,7 +593,7 @@ def parse_args():
     parser.add_argument("--model", default="large-v3", help="faster-whisper model name.")
     parser.add_argument(
         "--asr-provider",
-        choices=["faster_whisper"],
+        choices=["faster_whisper", "parakeet"],
         default="faster_whisper",
         help="ASR provider. Additional providers remain experimental until benchmarked.",
     )
@@ -628,7 +628,7 @@ def parse_args():
     )
     parser.add_argument(
         "--speaker-embedding-provider",
-        choices=["speechbrain_ecapa"],
+        choices=["speechbrain_ecapa", "speechbrain_xvector"],
         default="speechbrain_ecapa",
         help="Speaker embedding provider used for host and known-speaker identity.",
     )
@@ -1126,7 +1126,15 @@ def load_preferred_terms(path: Optional[str]) -> List[str]:
     return [line.strip() for line in file_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def load_speaker_verifier(model_id: str, device: str):
+def load_speaker_verifier(model_id: str, device: str, provider_name: str = "speechbrain_ecapa"):
+    if provider_name == "speechbrain_xvector":
+        from speechbrain.inference.classifiers import EncoderClassifier
+
+        return EncoderClassifier.from_hparams(
+            source=model_id or "speechbrain/spkrec-xvect-voxceleb",
+            savedir="pretrained_speaker_model_xvector",
+            run_opts={"device": normalize_runtime_device(device)},
+        )
     from speechbrain.inference.speaker import SpeakerRecognition
 
     return SpeakerRecognition.from_hparams(
@@ -4899,8 +4907,11 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
 
 
 def load_models(args, device: str):
-    whisper_model = WhisperModel(args.model, device=device, compute_type=args.compute_type)
-    asr_provider = FasterWhisperASRProvider(whisper_model, args.model, transcribe_audio)
+    if args.asr_provider == "parakeet":
+        asr_provider = ParakeetASRProvider(args.model, device=device)
+    else:
+        whisper_model = WhisperModel(args.model, device=device, compute_type=args.compute_type)
+        asr_provider = FasterWhisperASRProvider(whisper_model, args.model, transcribe_audio)
     alignment_provider = create_alignment_provider(
         args.alignment_provider,
         device,
@@ -4940,8 +4951,15 @@ def load_models(args, device: str):
     if device == "cuda":
         diarization_pipeline.to(torch.device(normalize_runtime_device(device)))
 
-    verifier = load_speaker_verifier(args.speaker_model, device)
-    speaker_embedding_provider = SpeechBrainECAPAProvider(verifier, args.speaker_model)
+    speaker_model = args.speaker_model
+    if args.speaker_embedding_provider == "speechbrain_xvector" and "xvect" not in speaker_model.lower():
+        speaker_model = "speechbrain/spkrec-xvect-voxceleb"
+    verifier = load_speaker_verifier(speaker_model, device, args.speaker_embedding_provider)
+    speaker_embedding_provider = (
+        SpeechBrainXVectorProvider(verifier, speaker_model)
+        if args.speaker_embedding_provider == "speechbrain_xvector"
+        else SpeechBrainECAPAProvider(verifier, speaker_model)
+    )
     known_speaker_profiles = load_known_speaker_profiles(
         verifier=verifier,
         known_speakers_dir=args.known_speakers_dir,

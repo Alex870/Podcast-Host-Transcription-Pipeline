@@ -33,6 +33,12 @@ from podcast_transcribe.workbench_core import (
     run_semantic_scan,
     save_gold_segment_annotation,
 )
+from podcast_transcribe.speaker_workflow import build_cross_episode_speaker_view
+from podcast_transcribe.speakers import (
+    approve_speaker_profile_promotion,
+    rollback_speaker_profile_promotion,
+    stage_speaker_profile_promotion,
+)
 
 
 class SessionOpenRequest(BaseModel):
@@ -43,6 +49,7 @@ class SessionOpenRequest(BaseModel):
 class TextCorrectionRequest(BaseModel):
     segment_id: int = Field(..., alias="segmentId")
     corrected_text: str = Field(..., alias="correctedText")
+    expected_revision: Optional[Dict[str, object]] = Field(default=None, alias="expectedRevision")
 
 
 class TeachMeRequest(BaseModel):
@@ -70,6 +77,15 @@ class GoldSegmentAnnotationRequest(BaseModel):
     reference_speaker: str = Field(..., alias="referenceSpeaker")
     tags: List[str] = Field(default_factory=list)
     notes: str = ""
+    reviewer_id: str = Field("", alias="reviewerId")
+    approval_status: str = Field("pending_review", alias="approvalStatus")
+
+
+class SpeakerProfilePromotionRequest(BaseModel):
+    profile_path: str = Field(..., alias="profilePath")
+    candidate_profile: Dict[str, object] = Field(default_factory=dict, alias="candidateProfile")
+    evaluation_report: Dict[str, object] = Field(default_factory=dict, alias="evaluationReport")
+    reviewer_id: str = Field("", alias="reviewerId")
 
 
 def _frontend_dist_dir() -> Path:
@@ -184,6 +200,8 @@ def save_gold_annotation_endpoint(episode_id: str, payload: GoldSegmentAnnotatio
             payload.reference_speaker,
             tags=payload.tags,
             notes=payload.notes,
+            reviewer_id=payload.reviewer_id,
+            approval_status=payload.approval_status,
         )
     except Exception as exc:
         raise _json_error(exc) from exc
@@ -223,7 +241,14 @@ def preview_text_correction_endpoint(episode_id: str, payload: TextCorrectionReq
 def apply_text_correction_endpoint(episode_id: str, payload: TextCorrectionRequest):
     try:
         project_root, output_dir = SESSION.require()
-        return apply_text_correction(project_root, output_dir, episode_id, payload.segment_id, payload.corrected_text)
+        return apply_text_correction(
+            project_root,
+            output_dir,
+            episode_id,
+            payload.segment_id,
+            payload.corrected_text,
+            expected_revision=payload.expected_revision,
+        )
     except Exception as exc:
         raise _json_error(exc) from exc
 
@@ -273,6 +298,55 @@ def get_audit(limit: int = 200):
     try:
         project_root, output_dir = SESSION.require()
         return {"entries": load_audit_log(project_root, output_dir, limit=limit)}
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.get("/api/speaker-workflow")
+def speaker_workflow(view: str = "all"):
+    try:
+        _project_root, output_dir = SESSION.require()
+        return build_cross_episode_speaker_view(output_dir, view=view)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+def _profile_path(profile_path: str, project_root: Path) -> Path:
+    candidate = Path(profile_path).resolve()
+    try:
+        candidate.relative_to(project_root.resolve())
+    except ValueError as exc:
+        raise RuntimeError("Speaker profile path must remain inside the opened project root.") from exc
+    return candidate
+
+
+@app.post("/api/speaker-profile/stage")
+def stage_speaker_profile(payload: SpeakerProfilePromotionRequest):
+    try:
+        project_root, _output_dir = SESSION.require()
+        path = _profile_path(payload.profile_path, project_root)
+        staged = stage_speaker_profile_promotion(path, payload.candidate_profile, payload.evaluation_report)
+        return {"status": "pending_review", "candidate_path": str(staged)}
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/speaker-profile/approve")
+def approve_speaker_profile(payload: SpeakerProfilePromotionRequest):
+    try:
+        project_root, _output_dir = SESSION.require()
+        path = _profile_path(payload.profile_path, project_root)
+        return approve_speaker_profile_promotion(path, payload.reviewer_id)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/speaker-profile/rollback")
+def rollback_speaker_profile(payload: SpeakerProfilePromotionRequest):
+    try:
+        project_root, _output_dir = SESSION.require()
+        path = _profile_path(payload.profile_path, project_root)
+        return rollback_speaker_profile_promotion(path, payload.reviewer_id)
     except Exception as exc:
         raise _json_error(exc) from exc
 

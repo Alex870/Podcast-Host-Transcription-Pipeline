@@ -12,6 +12,7 @@ import {
   listReviewRules,
   loadAudit,
   loadEpisode,
+  loadSpeakerWorkflow,
   openSession,
   previewPreferredTerm,
   previewReplacement,
@@ -39,17 +40,20 @@ function formatTimestamp(value: number | undefined) {
   return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
-function transcriptRows(bundle: EpisodeBundle | undefined, mode: "cleaned" | "compare") {
+function transcriptRows(bundle: EpisodeBundle | undefined, mode: "cleaned" | "compare" | "changed" | "speaker") {
   if (!bundle) {
     return [];
   }
   const reviewedById = new Map(bundle.reviewed.segments.map((segment) => [segment.id, segment]));
-  return bundle.cleaned.segments.map((segment) => ({
+  const rows = bundle.cleaned.segments.map((segment) => ({
     ...segment,
     reviewedText: reviewedById.get(segment.id)?.text ?? "",
     changed: bundle.reviewed.present && reviewedById.get(segment.id)?.text && reviewedById.get(segment.id)?.text !== segment.text,
     compareMode: mode === "compare",
   }));
+  if (mode === "changed") return rows.filter((row) => row.changed);
+  if (mode === "speaker") return rows.filter((row) => !["", "HOST"].includes(String(row.speaker || "").toUpperCase()));
+  return rows;
 }
 
 export default function App() {
@@ -57,8 +61,8 @@ export default function App() {
   const [projectRoot, setProjectRoot] = useState(localStorage.getItem(LOCAL_STORAGE_PROJECT_KEY) ?? "");
   const [outputDir, setOutputDir] = useState(localStorage.getItem(LOCAL_STORAGE_OUTPUT_KEY) ?? "");
   const [selectedEpisodeId, setSelectedEpisodeId] = useState("");
-  const [viewMode, setViewMode] = useState<"cleaned" | "compare">(
-    (localStorage.getItem(LOCAL_STORAGE_VIEW_KEY) as "cleaned" | "compare") || "compare",
+  const [viewMode, setViewMode] = useState<"cleaned" | "compare" | "changed" | "speaker">(
+    (localStorage.getItem(LOCAL_STORAGE_VIEW_KEY) as "cleaned" | "compare" | "changed" | "speaker") || "compare",
   );
   const [activeFinding, setActiveFinding] = useState<Finding | null>(null);
   const [selectedTranscriptSegmentId, setSelectedTranscriptSegmentId] = useState<number | null>(null);
@@ -74,6 +78,8 @@ export default function App() {
   const [goldReferenceSpeaker, setGoldReferenceSpeaker] = useState("");
   const [goldTags, setGoldTags] = useState("");
   const [goldNotes, setGoldNotes] = useState("");
+  const [goldReviewerId, setGoldReviewerId] = useState("");
+  const [goldApprovalStatus, setGoldApprovalStatus] = useState("pending_review");
 
   const sessionQuery = useQuery({
     queryKey: ["session"],
@@ -132,6 +138,12 @@ export default function App() {
     enabled: sessionQuery.data?.sessionOpen === true,
   });
 
+  const speakerWorkflowQuery = useQuery({
+    queryKey: ["speakerWorkflow"],
+    queryFn: () => loadSpeakerWorkflow("all"),
+    enabled: sessionQuery.data?.sessionOpen === true,
+  });
+
   const rulesQuery = useQuery({
     queryKey: ["reviewRules"],
     queryFn: listReviewRules,
@@ -156,7 +168,8 @@ export default function App() {
   });
 
   const applyCorrectionMutation = useMutation({
-    mutationFn: (payload: { segmentId: number; correctedText: string }) => applyTextCorrection(selectedEpisodeId, payload.segmentId, payload.correctedText),
+    mutationFn: (payload: { segmentId: number; correctedText: string }) =>
+      applyTextCorrection(selectedEpisodeId, payload.segmentId, payload.correctedText, episodeQuery.data?.cleaned.source_revision),
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["audit"] }),
@@ -178,6 +191,8 @@ export default function App() {
         goldReferenceSpeaker,
         goldTags.split(",").map((item) => item.trim()).filter(Boolean),
         goldNotes,
+        goldReviewerId,
+        goldApprovalStatus,
       );
     },
     onSuccess: async () => {
@@ -349,6 +364,8 @@ export default function App() {
     const annotated = episodeQuery.data?.gold_annotation?.segments.find((segment) => segment.id === activeSegment.id);
     setGoldReferenceText(annotated?.text ?? activeSegment.text);
     setGoldReferenceSpeaker(annotated?.speaker ?? activeSegment.speaker);
+    setGoldReviewerId(String(episodeQuery.data?.gold_annotation?.annotation_metadata?.reviewer_id ?? ""));
+    setGoldApprovalStatus(String(episodeQuery.data?.gold_annotation?.annotation_metadata?.approval_status ?? "pending_review"));
   }, [activeSegment, episodeQuery.data]);
 
   return (
@@ -419,6 +436,8 @@ export default function App() {
             <div className="segmented-control">
               <button className={viewMode === "cleaned" ? "active" : ""} onClick={() => setViewMode("cleaned")}>Cleaned</button>
               <button className={viewMode === "compare" ? "active" : ""} onClick={() => setViewMode("compare")}>Compare</button>
+              <button className={viewMode === "changed" ? "active" : ""} onClick={() => setViewMode("changed")}>Changed</button>
+              <button className={viewMode === "speaker" ? "active" : ""} onClick={() => setViewMode("speaker")}>Speakers</button>
             </div>
           </div>
           <div className="transcript-table-wrap">
@@ -463,6 +482,16 @@ export default function App() {
               <div><strong>Review stages</strong><span>{String(episodeQuery.data?.summary_row?.review_completed_stages ?? "—")}</span></div>
               <div><strong>Host detected</strong><span>{episodeQuery.data?.cleaned.host_detected ? "Yes" : "No"}</span></div>
             </div>
+          </section>
+
+          <section className="panel metadata-panel">
+            <div className="panel-header"><h2>Speaker workflow</h2></div>
+            <div className="meta-grid">
+              <div><strong>Evidence rows</strong><span>{speakerWorkflowQuery.data?.row_count ?? 0}</span></div>
+              <div><strong>Changed rows</strong><span>{speakerWorkflowQuery.data?.changed_count ?? 0}</span></div>
+              <div><strong>Recurring unknowns</strong><span>{speakerWorkflowQuery.data?.recurring_unknown_speakers?.length ?? 0}</span></div>
+            </div>
+            <div className="hint-text">Unknown-speaker groups include evidence clips for human review; profile promotion remains explicit and reversible.</div>
           </section>
 
           <section className="panel findings-panel">
@@ -590,6 +619,16 @@ export default function App() {
                 onChange={(event) => setGoldReferenceSpeaker(event.target.value)}
                 placeholder="Reference speaker label"
               />
+              <input
+                value={goldReviewerId}
+                onChange={(event) => setGoldReviewerId(event.target.value)}
+                placeholder="Reviewer pseudonym"
+              />
+              <select value={goldApprovalStatus} onChange={(event) => setGoldApprovalStatus(event.target.value)}>
+                <option value="pending_review">Pending review</option>
+                <option value="human_approved">Human approved</option>
+                <option value="adjudication_required">Adjudication required</option>
+              </select>
               <input
                 value={goldTags}
                 onChange={(event) => setGoldTags(event.target.value)}

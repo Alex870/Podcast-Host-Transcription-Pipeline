@@ -41,10 +41,12 @@ export function saveGoldSegmentAnnotation(
   referenceSpeaker: string,
   tags: string[],
   notes: string,
+  reviewerId = "",
+  approvalStatus = "pending_review",
 ) {
   return request<Record<string, unknown>>(`/api/episodes/${encodeURIComponent(episodeId)}/gold-annotation`, {
     method: "POST",
-    body: JSON.stringify({ segmentId, referenceText, referenceSpeaker, tags, notes }),
+    body: JSON.stringify({ segmentId, referenceText, referenceSpeaker, tags, notes, reviewerId, approvalStatus }),
   });
 }
 
@@ -64,10 +66,10 @@ export function previewTextCorrection(episodeId: string, segmentId: number, corr
   );
 }
 
-export function applyTextCorrection(episodeId: string, segmentId: number, correctedText: string) {
+export function applyTextCorrection(episodeId: string, segmentId: number, correctedText: string, expectedRevision?: Record<string, unknown>) {
   return request<{ status: string }>(`/api/episodes/${encodeURIComponent(episodeId)}/text-corrections/apply`, {
     method: "POST",
-    body: JSON.stringify({ segmentId, correctedText }),
+    body: JSON.stringify({ segmentId, correctedText, expectedRevision }),
   });
 }
 
@@ -107,6 +109,17 @@ export function applyReplacement(preferredTerm: string, alias: string) {
 
 export function loadAudit() {
   return request<{ entries: Array<Record<string, unknown>> }>("/api/audit");
+}
+
+export function loadSpeakerWorkflow(view = "all") {
+  return request<{
+    workflow_version: number;
+    view: string;
+    row_count: number;
+    rows: Array<Record<string, unknown>>;
+    recurring_unknown_speakers: Array<Record<string, unknown>>;
+    changed_count: number;
+  }>(`/api/speaker-workflow?view=${encodeURIComponent(view)}`);
 }
 
 export function proposeTeachMeRule(episodeId: string, segmentId: number, desiredReviewedText: string, supersedesRuleId = "") {

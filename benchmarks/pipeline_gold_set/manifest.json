@@ -1,7 +1,10 @@
 {
   "gold_set_version": 1,
+  "schema": "podcast-pipeline-gold-set-v1",
   "name": "Podcast Pipeline Gold Set",
   "description": "Human-approved podcast excerpts used to compare pipeline providers.",
+  "approval_policy": "Entries remain pending_review until a reviewer pseudonym and explicit human_approved status are recorded.",
+  "condition_tags": ["crosstalk", "noise", "music", "accent", "sponsor_read", "short_turn", "long_episode"],
   "promotion_thresholds": {
     "max_wer_regression": 0.0,
     "max_speaker_attributed_wer_regression": 0.0,

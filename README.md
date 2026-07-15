@@ -106,6 +106,8 @@ At a high level, each episode goes through:
 
 Expensive stages now record provider-aware fingerprints. The default provider set preserves the established behavior, while optional forced alignment and future model adapters can be evaluated without blindly rerunning every independent stage.
 
+Stage 7 keeps `faster_whisper` and `speechbrain_ecapa` as the defaults. `--asr-provider parakeet` is an optional lazy NeMo/Parakeet experiment with explicit Windows/CUDA diagnostics; `--alignment-provider whisperx` enables forced alignment; and `--speaker-embedding-provider speechbrain_xvector` is a candidate family. Candidate reports must pass the gold-set promotion guardrails before a profile or default is changed.
+
 The optional review layer can also backfill reviewed outputs from existing `*_cleaned_speaker_transcript.json` files, so legacy tier-1 work does not need to be rerun just to add tier-2 review artifacts.
 
 The validated Windows GPU environment uses PyTorch 2.9 with TorchCodec 0.8.1 and a shared FFmpeg build. When the native decoder is available, pyannote can receive path-based audio; learned long-file routing still provides a chunked fallback for global diarization memory failures.

@@ -28,3 +28,32 @@ class SpeechBrainECAPAProvider:
 
     def encode(self, waveform):
         return self.verifier.encode_batch(waveform)
+
+
+class SpeechBrainXVectorProvider:
+    """Optional candidate speaker embedder using SpeechBrain x-vector."""
+
+    def __init__(self, verifier, model_name: str):
+        self.verifier = verifier
+        try:
+            version = metadata.version("speechbrain")
+        except metadata.PackageNotFoundError:
+            version = ""
+        self._identity = ProviderIdentity(
+            stage="speaker_embedding",
+            provider="speechbrain_xvector",
+            model=model_name,
+            version=version,
+            capabilities={"sample_rate": 16000, "normalized_embeddings": True, "candidate": True},
+        )
+
+    @property
+    def identity(self) -> ProviderIdentity:
+        return self._identity
+
+    def encode(self, waveform):
+        return self.verifier.encode_batch(waveform)
+
+
+def speaker_embedding_provider_names():
+    return ("speechbrain_ecapa", "speechbrain_xvector")

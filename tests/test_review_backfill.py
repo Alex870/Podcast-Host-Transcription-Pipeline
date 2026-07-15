@@ -13,13 +13,20 @@ from unittest.mock import patch
 
 
 def _install_cli_test_stubs():
-    numpy_stub = types.ModuleType("numpy")
-    numpy_stub.ndarray = object
-    numpy_stub.mean = lambda values, axis=0: values[0] if values else None
-    numpy_stub.stack = lambda values: values
-    numpy_stub.dot = lambda a, b: 0.0
-    numpy_stub.linalg = types.SimpleNamespace(norm=lambda value: 1.0)
-    sys.modules.setdefault("numpy", numpy_stub)
+    try:
+        import numpy as installed_numpy
+    except ModuleNotFoundError:
+        numpy_stub = types.ModuleType("numpy")
+        numpy_stub.ndarray = object
+        numpy_stub.mean = lambda values, axis=0: values[0] if values else None
+        numpy_stub.stack = lambda values: values
+        numpy_stub.dot = lambda a, b: 0.0
+        numpy_stub.linalg = types.SimpleNamespace(norm=lambda value: 1.0)
+        sys.modules.setdefault("numpy", numpy_stub)
+    else:
+        # Keep the real numerical implementation available to the speaker
+        # profile tests that run after this CLI-stub module is imported.
+        sys.modules.setdefault("numpy", installed_numpy)
 
     scipy_stub = types.ModuleType("scipy")
     scipy_stub.__version__ = "1.0-test"
