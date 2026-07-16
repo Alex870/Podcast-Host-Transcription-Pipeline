@@ -10,9 +10,9 @@ torchcodec==0.8.1
 
 numpy==2.2.6
 faster-whisper==1.2.1
-huggingface_hub
+huggingface_hub==1.23.0
 pyannote.audio==4.0.4
-rich
+rich==15.0.0
 speechbrain==1.1.0
-fastapi==0.115.0
-uvicorn==0.30.6
+fastapi==0.139.0
+uvicorn==0.51.0

@@ -13,6 +13,10 @@ It is built for shows where speaker identity matters, especially when you want s
 
 The shared transcript, processed-cache, Chroma metadata, and `podcast.json` expectations across the podcast stack are documented in [`docs/podcast_pipeline_contract.md`](docs/podcast_pipeline_contract.md).
 
+## Clean-machine packaging
+
+The baseline Python dependencies are pinned in `podcast_transcribe_requirements.txt`. The optional WhisperX alignment environment is separately pinned in `podcast_transcribe_alignment_requirements.txt`. The browser workbench uses the checked-in `workbench-ui/pnpm-lock.yaml` and `pnpm-workspace.yaml`; run `pnpm install --frozen-lockfile` followed by `pnpm run build`. The root ecosystem clean-machine diagnostic records CUDA, FFmpeg, TorchCodec, and Hugging Face checks without bundling models or credentials.
+
 ## Why This Exists
 
 Basic podcast transcribers usually stop at "faithfully capture the words." That is not enough if the transcript is going to feed a semantic pipeline, vector database, or host-centric chat system. This repository is meant to produce transcript artifacts that are structured, reviewable, and operationally useful beyond simple text search.
