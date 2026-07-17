@@ -1,0 +1,1 @@
+{"payload":{"configuration_fingerprint":"cfg-1","content":{"empty":null,"text":"café"},"contract_version":"identity-test-v1","parent_ids":["parent-α"],"producer":{"name":"fixture"},"windows_relative_path":"episodes\\one.json"},"expected_sha256":"e4e533d683f8805c44a1c28e58f718c6f14c90f056bbfd80a92a515d4effb33a"}
