@@ -1,0 +1,1 @@
+{"manifest":{"contract_version":"correction-manifest-v1","source_transcript_hash":"stale","correction_set_id":"invalid","accepted_corrections":[{"source_span_id":"span-001","field":"text","before":"wrong","after":"right","reason_code":"spelling","adjudication_state":"accepted"}]},"transcript":{"segments":[{"source_span_id":"span-001","text":"actual"}]}}
