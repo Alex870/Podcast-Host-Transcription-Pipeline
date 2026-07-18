@@ -69,3 +69,6 @@ Updated: 2026-07-17
 6. Complete target-machine resilience, privacy, and packaging checks.
 
 The ecosystem-level sequence and promotion rules live in `../PODCAST_ECOSYSTEM_ROADMAP.md` when these repositories share a workspace.
+## Phases 0–2 implementation status (2026-07-17)
+
+Correction contract, deterministic preview/apply, canonical identities, and fixtures are implemented. Real one-podcast correction acceptance awaits the approved private evaluation pack.
