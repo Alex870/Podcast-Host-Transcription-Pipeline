@@ -1,6 +1,6 @@
 # Roadmap
 
-Updated: 2026-07-17
+Updated: 2026-07-24
 
 `podcast-host-transcription-pipeline` is the evidence-creation and human-correction boundary for the podcast ecosystem. The core pipeline, provider contracts, gold-set tooling, selective recomputation, speaker workflows, review workbench, and clean-machine diagnostics are implemented. The roadmap now prioritizes representative human evidence and a correction loop that remains traceable downstream.
 
@@ -17,6 +17,7 @@ Updated: 2026-07-17
 - Batch ASR, diarization, speaker matching, cleanup, manifests, resume, review backfill, and reports.
 - Provider-aware stage fingerprints and atomic caches through deterministic cleanup.
 - React/FastAPI review workbench with comparison, annotations, controlled write-back, and Teach-Me rules.
+- Persistent bootstrap menu with safe external vLLM/LM Studio discovery, model validation, and atomic project-config updates.
 - Versioned gold-set evaluation with WER, SA-WER, permutation-aware DER, glossary/host measures, condition slices, resource metrics, and promotion gates.
 - Optional WhisperX, Parakeet, and candidate speaker-embedding paths with guarded diagnostics.
 - Cross-episode speaker evidence, reversible recurring-speaker promotion, and profile-family compatibility checks.
@@ -57,6 +58,7 @@ Updated: 2026-07-17
 - Add disk/capacity estimates, batch risk ranking, actionable recovery links, and background progress/cancellation.
 - Validate backup/restore and interrupted-run recovery on a cache-free target.
 - Add configurable retention/redaction for audio clips, review exports, logs, and temporary workbench data.
+- Keep backend credentials and cloud-provider management out of the local/LAN configuration wizard unless a concrete provider requirement justifies a separate secure design.
 - Continue decomposing the large CLI where it reduces change risk or enables testing; avoid a rewrite for its own sake.
 
 ## Sequencing
@@ -69,6 +71,6 @@ Updated: 2026-07-17
 6. Complete target-machine resilience, privacy, and packaging checks.
 
 The ecosystem-level sequence and promotion rules live in `../PODCAST_ECOSYSTEM_ROADMAP.md` when these repositories share a workspace.
-## Phases 0–2 implementation status (2026-07-17)
+## Phases 0–2 implementation status (2026-07-24)
 
-Correction contract, deterministic preview/apply, canonical identities, and fixtures are implemented. Real one-podcast correction acceptance awaits the approved private evaluation pack.
+Correction contract, deterministic preview/apply, canonical identities, and fixtures are implemented. The launcher, external review-backend configuration, isolated-worker shutdown path, and one full production run have also been validated. Real one-podcast correction acceptance still awaits the approved private evaluation pack.

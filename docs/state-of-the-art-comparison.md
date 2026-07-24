@@ -9,23 +9,26 @@ The podcast-host-transcription-pipeline is not technologically obsolete. It is a
 - `faster-whisper` with `distil-large-v3`
 - pyannote Community-1 diarization
 - SpeechBrain ECAPA speaker identification
-- Deterministic cleanup plus optional local LLM review
+- timestamp-passthrough alignment with optional WhisperX
+- deterministic cleanup plus staged local/LAN LLM review
 - Resumable, inspectable intermediate artifacts
 
 Its largest gap from the research frontier is architectural: ASR, diarization, alignment, and speaker identification are separate stages. Newer research increasingly performs speaker-attributed transcription jointly, reducing error propagation between stages.
 
 The recommended strategy is to evolve the current pipeline through interchangeable model adapters and podcast-specific benchmarks rather than replace it wholesale.
 
+Since the original comparison, that adapter strategy has become part of the implementation: faster-whisper remains the baseline, while Parakeet, WhisperX, and candidate speaker-embedding paths are guarded optional providers. Full-pipeline gold-set benchmarking and a separate tier-2 review benchmark now provide promotion gates. External review models can be discovered and validated from vLLM or LM Studio without changing reusable tier-1 artifacts.
+
 ## Technology Comparison
 
 | Capability | Current project | Research/frontier direction | Assessment |
 |---|---|---|---|
-| Speech recognition | Distil-Whisper through `faster-whisper` | NVIDIA Parakeet TDT, Canary, and newer speech-language models | The current model remains dependable but no longer leads on throughput or benchmark accuracy. |
+| Speech recognition | Distil-Whisper through `faster-whisper`, with guarded Parakeet experiments | NVIDIA Parakeet TDT, Canary, and newer speech-language models | The current default remains dependable; alternatives now have a measured promotion path. |
 | Diarization | pyannote Community-1 | Precision-2, Sortformer, and Streaming Sortformer | Community-1 is current and competitive; this is not an outdated component. |
 | Speaker-attributed ASR | Separate ASR, diarization, and timestamp reconciliation | Joint diarization-ASR and target-speaker ASR | Promising frontier, but materially less mature. |
-| Word alignment | Whisper timestamps plus speaker-turn overlap | Forced phoneme alignment and WhisperX-style processing | A practical near-term improvement. |
-| Speaker identity | SpeechBrain ECAPA-TDNN embeddings | ERes2NetV2, WavLM-derived, and other self-supervised embeddings | ECAPA is mature but aging. |
-| Transcript refinement | Rules, glossary, and optional text LLM | Audio-aware language models and multimodal speech LLMs | Frontier models offer more context but less determinism. |
+| Word alignment | Timestamp passthrough by default, optional WhisperX forced alignment | Forced phoneme alignment and speech-native alignment models | The practical adapter exists; representative timing evidence is now the limiting factor. |
+| Speaker identity | SpeechBrain ECAPA-TDNN default with versioned candidate-provider contracts | ERes2NetV2, WavLM-derived, and other self-supervised embeddings | ECAPA is mature but aging; incompatible embedding families remain isolated. |
+| Transcript refinement | Rules, protected glossary, Teach-Me guidance, and staged vLLM/LM Studio review | Audio-aware language models and multimodal speech LLMs | The current text-review path is more deterministic and auditable, but cannot consult audio directly. |
 | Operational model | Local, modular, and recoverable | Larger integrated models or managed APIs | The current approach wins on privacy, debugging, and control. |
 
 ## ASR Frontier

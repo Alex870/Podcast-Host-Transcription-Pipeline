@@ -20,6 +20,8 @@ The menu options are:
 6. `Run pipeline quality benchmark`
 7. `Configure external review LLM`
 
+The interactive launcher returns to this menu after every completed action and after handled action errors. Select `Q` to close it. Passing an explicit action on the command line remains a one-shot operation for scripts and automation.
+
 ## Normal Transcription Workflow
 
 The normal operator flow is:

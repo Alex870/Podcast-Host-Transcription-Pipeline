@@ -55,6 +55,7 @@ Current bootstrap options:
 7. Configure external review LLM
 
 All PowerShell entrypoints pause at the end so the console window stays open long enough to read the result.
+After an interactive menu action finishes, the bootstrap returns to the main menu; only `Q` closes it. Explicit `-Action` invocations remain one-shot.
 Option `5` will also install workbench frontend dependencies and rebuild the bundled UI automatically when needed.
 Option `7` discovers models exposed by a vLLM or LM Studio server, tests the selected model, previews the exact config changes, and safely updates the project config.
 

@@ -41,6 +41,21 @@ Changing no provider settings should preserve existing output behavior.
 
 The current validated Windows GPU dependency set is PyTorch 2.9 with CUDA 12.8 wheels, TorchAudio 2.9, TorchVision 0.24, TorchCodec 0.8.1, and a shared FFmpeg build. TorchCodec is used opportunistically for path-based pyannote audio input; the pipeline retains its own chunked loader and long-file fallback when the native decoder or global clustering cannot handle an episode safely.
 
+## Launcher and Review Backend Control Plane
+
+The root PowerShell launcher is the operator control plane. Interactive use stays in a menu loop after each completed or failed action and exits only when the operator selects `Q`. Explicit invocations such as `-Action Debug` remain one-shot so automation does not become interactive unexpectedly.
+
+Launcher option `7` configures the shared external review backend used by:
+
+- staged transcript review and tier-2 backfill
+- review-model benchmarking
+- workbench semantic scans
+- Teach-Me rule induction and validation
+
+The wizard accepts an IP address, hostname, or HTTP(S) URL; probes OpenAI-compatible model endpoints; distinguishes vLLM from LM Studio; filters LM Studio entries to chat-capable model types; and verifies the selected model through a lightweight chat-completions request. It updates only the backend URL/model keys plus review profile or stage keys explicitly chosen by the operator. Every successful write is validated, backed up, encoded as UTF-8 without a BOM, and atomically replaces the prior project config.
+
+The backend remains a local/LAN boundary. API-key and cloud-provider credential management are intentionally outside this control plane.
+
 ## Provider Contracts
 
 Provider interfaces live under `src/podcast_transcribe/providers/`.
@@ -122,6 +137,8 @@ The near-frontier probe band is 30 minutes above the current failure floor. Prob
 The optional review layer is staged and additive. Cleanup, glossary, speaker consistency, and episode QA each have explicit prompts, edit scopes, adaptive budgets, protected-term validation, and stage-level provenance. Calibration runs once per processing run using real transcript text; production windows adapt downward on overflow and upward only after conservative success streaks. Overflow is retried at smaller windows rather than treated as an ordinary skip; only hard backend failures at the minimum floor can leave a stage incomplete.
 
 Approved project-local Teach-Me rules are passed to the relevant review stage as constrained guidance. They are never executable code, cannot override preferred-term protection, and are recorded in reviewed metadata and workbench audit artifacts.
+
+Review-backend configuration is centralized in `podcast_transcribe_config.json`. Changing the selected model invalidates review-specific fingerprints and calibration hints without invalidating reusable ASR, alignment, diarization, speaker-attribution, or deterministic-cleanup artifacts.
 
 ## Quality Evaluation
 
