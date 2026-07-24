@@ -4906,6 +4906,18 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
     print(f"Wrote folder summary: {summary_path}")
 
 
+def exit_isolated_worker_after_success(input_file: Optional[str], exit_fn=None) -> bool:
+    """Exit a successful isolated worker before native model teardown can fault."""
+
+    if not input_file:
+        return False
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    (exit_fn or os._exit)(0)
+    return True
+
+
 def load_models(args, device: str):
     if args.asr_provider == "parakeet":
         asr_provider = ParakeetASRProvider(args.model, device=device)
@@ -5155,6 +5167,7 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
     )
     print_final_review_summary(list(episode_summary_rows_by_name.values()))
     print(f"Wrote folder summary: {summary_path}")
+    exit_isolated_worker_after_success(args.input_file)
 
 
 def main():
@@ -5215,11 +5228,6 @@ def main():
         run_isolated_batch(args, input_dir, output_dir, audio_files)
     else:
         process_audio_batch(args, input_dir, output_dir, audio_files)
-        if args.input_file:
-            # Isolated workers are short-lived by design; skip native-library teardown that can fault after outputs are complete.
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os._exit(0)
 
 
 if __name__ == "__main__":

@@ -322,6 +322,8 @@ OpenAI-compatible base URL for LM Studio or vLLM.
 
 Model identifier exposed by the configured review backend.
 
+The safest way to set `backend`, `review_base_url`, and `review_model_name` is launcher option `7`. Its external-LLM wizard discovers available models, verifies the selected model through `/v1/chat/completions`, and updates only the intended review settings. It creates a timestamped config backup and writes UTF-8 JSON without a BOM.
+
 ### `transcript_cleanup_review`
 
 - Type: `boolean`

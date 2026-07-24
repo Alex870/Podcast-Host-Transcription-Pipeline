@@ -87,6 +87,7 @@ from podcast_transcribe.cli import (
     diarization_route_decision,
     diarization_runtime_fingerprint,
     diarize_audio,
+    exit_isolated_worker_after_success,
     load_diarization_history,
     normalize_episode_summary_row,
     parse_args,
@@ -114,6 +115,20 @@ class Word:
 
 
 class ReviewBackfillTests(unittest.TestCase):
+    def test_isolated_worker_exits_only_after_successful_single_file_run(self):
+        exit_codes = []
+
+        self.assertFalse(exit_isolated_worker_after_success(None, exit_fn=exit_codes.append))
+        self.assertEqual(exit_codes, [])
+
+        self.assertTrue(
+            exit_isolated_worker_after_success(
+                "episode.mp3",
+                exit_fn=exit_codes.append,
+            )
+        )
+        self.assertEqual(exit_codes, [0])
+
     def test_ffprobe_resolution_rejects_conda_binary_when_no_external_build_is_configured(self):
         with tempfile.TemporaryDirectory() as tmp:
             conda_prefix = Path(tmp) / "conda"

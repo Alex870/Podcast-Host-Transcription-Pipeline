@@ -28,6 +28,7 @@ Basic podcast transcribers usually stop at "faithfully capture the words." That 
 - `scripts/Debug-PodcastTranscribeEnvironment.ps1`: environment validation
 - `scripts/Migrate-LegacyPodcastTranscribeState.ps1`: migrate config, state, and outputs from an older working directory
 - `scripts/Launch-PodcastTranscribeWorkbench.ps1`: local transcript review workbench launcher
+- `scripts/Configure-PodcastTranscribeReviewBackend.ps1`: external review-LLM discovery and configuration wizard
 - `src/podcast_transcribe/`: Python package for the pipeline
 - `workbench-ui/`: React + Vite frontend for the transcript review workbench
 - `examples/`: example config, glossary, and replacement files
@@ -51,9 +52,11 @@ Current bootstrap options:
 4. Run review benchmark
 5. Launch transcript review workbench
 6. Run pipeline quality benchmark
+7. Configure external review LLM
 
 All PowerShell entrypoints pause at the end so the console window stays open long enough to read the result.
 Option `5` will also install workbench frontend dependencies and rebuild the bundled UI automatically when needed.
+Option `7` discovers models exposed by a vLLM or LM Studio server, tests the selected model, previews the exact config changes, and safely updates the project config.
 
 ## Outputs
 

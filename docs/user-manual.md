@@ -18,6 +18,7 @@ The menu options are:
 4. `Run review benchmark`
 5. `Launch transcript review workbench`
 6. `Run pipeline quality benchmark`
+7. `Configure external review LLM`
 
 ## Normal Transcription Workflow
 
@@ -63,6 +64,31 @@ It checks:
 - configured review backend reachability when review is enabled
 
 Use it whenever the environment, CUDA stack, FFmpeg install, or backend settings change.
+
+## External Review LLM Configuration
+
+Option `7` configures the shared external LLM used by transcript review, review benchmarking, workbench semantic scans, and Teach-Me.
+
+The wizard:
+
+1. shows the current backend, URL, model, profile, and review stages
+2. accepts an IP address, hostname, `host:port`, or HTTP(S) URL
+3. probes OpenAI-compatible model endpoints and identifies vLLM or LM Studio
+4. lists the available models and tests the selected model with a small chat-completions request
+5. preserves the current review-stage settings by default, or explicitly enables local/all review stages
+6. shows an exact before/after preview before writing
+
+If no port is supplied, the wizard tries the current configured port for that host, then `8000` for vLLM and `1234` for LM Studio. Enter `Q` at any prompt to cancel without changing the config.
+
+On success, only the selected review-backend keys are changed. The wizard preserves tokens, paths, transcription settings, speaker settings, and every other unrelated field. It writes UTF-8 JSON without a BOM, creates a timestamped backup beside the config, and atomically replaces the original.
+
+The script can also be launched directly:
+
+```powershell
+.\scripts\Configure-PodcastTranscribeReviewBackend.ps1
+```
+
+After selecting a model, use option `4` to benchmark its review quality, stability, speed, and usable context capacity.
 
 ### Long-file diarization
 

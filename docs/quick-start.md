@@ -204,6 +204,8 @@ The launcher will:
 
 If you have a stronger review machine or LAN-served vLLM backend, enable review in `podcast_transcribe_config.json`.
 
+The recommended setup path is bootstrap option `7`, `Configure external review LLM`. Enter the server IP address, hostname, or URL; choose one of the models discovered from the server; and review the exact config preview before saving. The wizard tests chat completions before it writes anything and preserves all unrelated settings.
+
 Example:
 
 ```json
