@@ -27,6 +27,16 @@ flowchart TD
     L --> M[Pipeline quality benchmark]
 ```
 
+## Contract and Evidence Control Plane
+
+`episode-contract-v2` makes bundle completeness independent from the older resume marker. The classifier can choose a JSON-only delta promotion, a cached rebuild, or a full tier-1 reprocess. A JSON-only promotion is allowed only when the bundle already proves completion of embedding-backed speaker identity evidence; otherwise cached stages are reused and missing speaker evidence is rebuilt from source audio. Legacy JSON/manifests are archived before canonical replacement, and completed v2 provenance prevents repeated upgrades.
+
+Human changes flow through `correction-manifest-v2`. The workbench writes corrected siblings and a compatibility CSV, then emits downstream notifications containing the correction-set ID and affected source spans. Podcast-RAG can plan selective document deltas; RAGScope can route stale judgments back to adjudication.
+
+Speaker attribution writes embedding evidence while the model is already loaded. The workbench clusters only compatible evidence vectors across episodes, so reusable diarization labels never become accidental identities. `speakers.json` schema v2 retains explicit promotion, role, merge/split, and rollback history.
+
+The private evaluation pack is configured separately from the repository. Workbench queues and the guided campaign operate on that path, while only aggregate benchmark results and synthetic contract fixtures are suitable for Git.
+
 ## Stable Baseline
 
 The default provider set intentionally reproduces the established pipeline:
@@ -39,7 +49,7 @@ The default provider set intentionally reproduces the established pipeline:
 
 Changing no provider settings should preserve existing output behavior.
 
-The current validated Windows GPU dependency set is PyTorch 2.9 with CUDA 12.8 wheels, TorchAudio 2.9, TorchVision 0.24, TorchCodec 0.8.1, and a shared FFmpeg build. TorchCodec is used opportunistically for path-based pyannote audio input; the pipeline retains its own chunked loader and long-file fallback when the native decoder or global clustering cannot handle an episode safely.
+The current validated Windows GPU dependency set is PyTorch 2.9 with CUDA 12.8 wheels, TorchAudio 2.9, TorchVision 0.24, TorchCodec 0.8.1, and a shared FFmpeg 7 build. On Windows the runtime preloads DLLs from the configured `ffmpeg_bin_dir` before importing TorchCodec, preventing an incompatible FFmpeg elsewhere on `PATH` from intercepting ABI discovery. TorchCodec is used opportunistically for path-based pyannote audio input; the pipeline retains its own chunked loader and long-file fallback when the native decoder or global clustering cannot handle an episode safely.
 
 ## Launcher and Review Backend Control Plane
 

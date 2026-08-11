@@ -25,26 +25,26 @@ Updated: 2026-07-24
 
 ## Value-Ordered Priorities
 
-### 1. Populate and operate the real quality set
+### 1. Populate and operate the real quality set — implemented
 
-- Select representative approved excerpts across duration, noise, music, crosstalk, accents, sponsor reads, hosts, and recurring guests.
-- Link gold spans to the shared local evaluation pack and publish only approved aggregate results.
-- Add workbench queues for missing references, adjudication conflicts, and high-impact errors.
-- Establish release-critical ASR, diarization, speaker, glossary, timing, and resource baselines.
+- The external private evaluation pack is configurable through `evaluation_pack_path`.
+- The workbench exposes unlabelled, pending-review, adjudication, and human-approved queues.
+- A guided 12-episode sampler enforces the 3 short / 6 typical / 3 long mix and records required condition coverage.
+- Baseline acceptance requires 12 human-approved episodes, the required duration mix, and crosstalk, recurring-speaker, and noise/music coverage.
 
-### 2. Make corrections first-class incremental artifacts
+### 2. Make corrections first-class incremental artifacts — implemented
 
-- Assign durable IDs to accepted transcript, timing, glossary, and speaker corrections.
-- Emit append-only correction manifests with before/after hashes and affected source spans.
-- Preview downstream invalidation before write-back and expose a machine-readable change set to Podcast-RAG.
-- Detect corrections that invalidate evaluation judgments and route them for re-review rather than silently changing labels.
+- `correction-manifest-v2` adds deterministic correction IDs, source anchors, before-value guards, statuses, supersession, and provenance while retaining v1 readers.
+- Approved text changes write corrected JSON/TXT siblings and a compatibility correction CSV; rollback regenerates all projections.
+- Correction notifications identify affected episode/span IDs for Podcast-RAG and RAGScope, with `downstream_pending` persisted when a consumer is unavailable.
+- `episode-contract-v2` is emitted natively and legacy v1 episodes are upgraded by delta, cached rebuild, or automatic full reprocessing as required.
 
-### 3. Mature recurring-speaker identity
+### 3. Mature recurring-speaker identity — implemented
 
-- Rank cross-episode drift and unknown-speaker candidates by confidence, recurrence, and evaluation impact.
-- Support multi-host and alias histories without mixing incompatible embedding families.
-- Add evidence-clip review, merge/split proposals, conflict resolution, and rollback.
-- Measure speaker-profile changes against false-match and missed-match rates before activation.
+- Episode-local speaker labels are no longer treated as identities across episodes.
+- Speaker attribution emits versioned embedding evidence; candidates use deterministic complete-link clustering within one embedding family.
+- The workbench supports evidence review, threshold-gated promotion, host/co-host/guest roles, merge, split, and rollback.
+- `speakers.json` is normalized additively to schema v2 with stable IDs, aliases, roles, evidence, status, and history.
 
 ### 4. Run measured provider and alignment experiments
 
@@ -63,14 +63,13 @@ Updated: 2026-07-24
 
 ## Sequencing
 
-1. Approve and populate the real gold/evaluation set.
-2. Record the current default baseline.
-3. Ship durable correction manifests and downstream invalidation preview.
-4. Harden recurring-speaker review using measured failures.
-5. Run provider/alignment/embedder comparisons and promote only demonstrated gains.
-6. Complete target-machine resilience, privacy, and packaging checks.
+1. Complete the private 12-episode annotation campaign and accept its first measured baseline.
+2. Exercise one real correction through Podcast-RAG and RAGScope using the new v2 notifications.
+3. Review and promote recurring-speaker candidates produced by real episode embeddings.
+4. Run provider/alignment/embedder comparisons and promote only demonstrated gains.
+5. Complete target-machine resilience, privacy, and packaging checks.
 
 The ecosystem-level sequence and promotion rules live in `../PODCAST_ECOSYSTEM_ROADMAP.md` when these repositories share a workspace.
-## Phases 0–2 implementation status (2026-07-24)
+## Phases 0–3 implementation status (2026-07-24)
 
-Correction contract, deterministic preview/apply, canonical identities, and fixtures are implemented. The launcher, external review-backend configuration, isolated-worker shutdown path, and one full production run have also been validated. Real one-podcast correction acceptance still awaits the approved private evaluation pack.
+Quality-set operations, contract-aware v2 upgrades, first-class correction artifacts, downstream notifications, and embedding-backed recurring-speaker identity are implemented. The remaining work is operational evidence: complete the private campaign, accept its baseline, exercise a real cross-repository correction, and promote only speaker/provider changes supported by that evidence.

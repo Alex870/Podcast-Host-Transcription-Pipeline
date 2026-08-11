@@ -19,6 +19,11 @@ from typing import Dict, List, Optional, Tuple
 
 from podcast_transcribe.config import resolve_review_runtime_config
 from podcast_transcribe.contract import validate_reviewed_transcript_payload, validate_transcript_payload
+from podcast_transcribe.ecosystem_contracts import (
+    build_correction_manifest_history,
+    canonical_id,
+    correction_identity_payload,
+)
 from podcast_transcribe.learned_rules import (
     LEARNED_RULE_ALLOWED_FAMILIES,
     LEARNED_RULE_ALLOWED_STAGES,
@@ -55,6 +60,7 @@ TEACH_ME_SUBDIR = "teach_me"
 TEACH_ME_CONTROL_FIXTURE_PATH = Path(__file__).resolve().parents[2] / "benchmarks" / "review_fixtures" / "teach_me_controls.json"
 PIPELINE_GOLD_SET_DIR = Path("benchmarks") / "pipeline_gold_set"
 PIPELINE_GOLD_ANNOTATIONS_DIRNAME = "annotations"
+CORRECTION_MANIFEST_DIRNAME = "_correction_manifests"
 
 _GLOSSARY_WRITE_LOCK = threading.Lock()
 
@@ -64,6 +70,17 @@ def _load_json(path: Path) -> Dict[str, object]:
     if not isinstance(payload, dict):
         raise RuntimeError(f"Expected a JSON object: {path}")
     return payload
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
+
+
+def _write_json_atomic(path: Path, payload: Dict[str, object]) -> None:
+    _write_text_atomic(path, json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 def _resolve_under_root(root: Path, raw_path: Optional[str], default_relative: Optional[str] = None) -> Path:
@@ -441,6 +458,11 @@ def resolve_workbench_paths(project_root: Path, output_dir: Path) -> Dict[str, P
         str(config.get("replacement_map_json") or "examples/preferred_replacements.json"),
     )
     workbench_dir = output_dir / WORKBENCH_DIRNAME
+    evaluation_pack_path = _resolve_under_root(
+        project_root,
+        str(config.get("evaluation_pack_path") or ""),
+        str(PIPELINE_GOLD_SET_DIR),
+    )
     return {
         "corrections_dir": corrections_dir,
         "preferred_terms_path": preferred_terms_path,
@@ -449,6 +471,7 @@ def resolve_workbench_paths(project_root: Path, output_dir: Path) -> Dict[str, P
         "scan_cache_dir": workbench_dir / SCAN_CACHE_SUBDIR,
         "issue_resolution_dir": workbench_dir / ISSUE_RESOLUTION_SUBDIR,
         "audit_log_path": project_root / AUDIT_LOG_SUBDIR / AUDIT_LOG_FILENAME,
+        "evaluation_pack_path": evaluation_pack_path,
     }
 
 
@@ -547,13 +570,24 @@ def load_episode_bundle(project_root: Path, output_dir: Path, episode_id: str) -
         "speaker_workflow_report": speaker_workflow_report,
         "deterministic_findings": deterministic_findings,
         "semantic_scan": scan_cache,
-        "gold_annotation": load_gold_annotation(project_root, episode_id),
+        "gold_annotation": load_gold_annotation(project_root, episode_id, output_dir),
     }
 
 
-def _gold_set_paths(project_root: Path, episode_id: Optional[str] = None) -> Dict[str, Path]:
-    gold_root = (project_root / PIPELINE_GOLD_SET_DIR).resolve()
-    _assert_within_root(project_root, gold_root)
+def _gold_set_paths(
+    project_root: Path,
+    episode_id: Optional[str] = None,
+    output_dir: Optional[Path] = None,
+) -> Dict[str, Path]:
+    if output_dir is not None:
+        gold_root = resolve_workbench_paths(project_root, output_dir)["evaluation_pack_path"]
+    else:
+        config = load_project_config(project_root)
+        gold_root = _resolve_under_root(
+            project_root,
+            str(config.get("evaluation_pack_path") or ""),
+            str(PIPELINE_GOLD_SET_DIR),
+        )
     paths = {
         "root": gold_root,
         "manifest": gold_root / "manifest.json",
@@ -565,8 +599,8 @@ def _gold_set_paths(project_root: Path, episode_id: Optional[str] = None) -> Dic
     return paths
 
 
-def load_gold_annotation(project_root: Path, episode_id: str) -> Dict[str, object]:
-    annotation_path = _gold_set_paths(project_root, episode_id)["annotation"]
+def load_gold_annotation(project_root: Path, episode_id: str, output_dir: Optional[Path] = None) -> Dict[str, object]:
+    annotation_path = _gold_set_paths(project_root, episode_id, output_dir)["annotation"]
     if not annotation_path.exists():
         return {"present": False, "episode_id": episode_id, "path": str(annotation_path), "segments": []}
     payload = _load_json(annotation_path)
@@ -598,7 +632,7 @@ def save_gold_segment_annotation(
     errors = validate_transcript_payload(cleaned_payload)
     if errors:
         raise RuntimeError(f"Cannot annotate invalid cleaned transcript: {'; '.join(errors[:5])}")
-    paths = _gold_set_paths(project_root, episode_id)
+    paths = _gold_set_paths(project_root, episode_id, output_dir)
     paths["annotations"].mkdir(parents=True, exist_ok=True)
     if paths["annotation"].exists():
         reference_payload = _load_json(paths["annotation"])
@@ -637,6 +671,20 @@ def save_gold_segment_annotation(
         metadata["reviewer_id"] = reviewer_id.strip()
     metadata["approval_status"] = str(approval_status or metadata.get("approval_status") or "pending_review").strip().lower()
     metadata["version"] = int(metadata.get("version") or 1)
+    history = metadata.get("adjudication_history") if isinstance(metadata.get("adjudication_history"), list) else []
+    history.append(
+        {
+            "timestamp_epoch_seconds": int(time.time()),
+            "segment_id": int(segment_id),
+            "reviewer_id": str(reviewer_id).strip(),
+            "approval_status": metadata["approval_status"],
+            "reference_text": str(reference_text).strip(),
+            "reference_speaker": str(reference_speaker).strip(),
+            "tags": sorted({str(item).strip() for item in tags or [] if str(item).strip()}),
+            "notes": notes.strip(),
+        }
+    )
+    metadata["adjudication_history"] = history
     paths["annotation"].write_text(json.dumps(reference_payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     if paths["manifest"].exists():
@@ -669,7 +717,205 @@ def save_gold_segment_annotation(
             "target_path": str(paths["annotation"]),
         },
     )
-    return load_gold_annotation(project_root, episode_id)
+    return load_gold_annotation(project_root, episode_id, output_dir)
+
+
+def evaluation_queues(project_root: Path, output_dir: Path) -> Dict[str, object]:
+    paths = _gold_set_paths(project_root, output_dir=output_dir)
+    manifest = _load_json(paths["manifest"]) if paths["manifest"].exists() else {
+        "gold_set_version": 2,
+        "name": "Private Podcast Evaluation Pack",
+        "entries": [],
+    }
+    entries_by_id = {
+        str(item.get("id") or ""): item
+        for item in manifest.get("entries") or []
+        if isinstance(item, dict)
+    }
+    queues: Dict[str, List[Dict[str, object]]] = {
+        "unlabelled": [],
+        "pending_review": [],
+        "adjudication_required": [],
+        "human_approved": [],
+    }
+    for episode in discover_episode_bundles(output_dir):
+        episode_id = str(episode["episode_id"])
+        entry = entries_by_id.get(episode_id)
+        if entry is None:
+            queues["unlabelled"].append(episode)
+            continue
+        status = str(entry.get("approval_status") or "pending_review").lower()
+        queue = "human_approved" if status in {"approved", "human_approved"} else status
+        if queue not in queues:
+            queue = "pending_review"
+        queues[queue].append({**episode, "evaluation_entry": entry})
+    return {
+        "evaluation_pack_path": str(paths["root"]),
+        "manifest_path": str(paths["manifest"]),
+        "queues": queues,
+        "counts": {key: len(value) for key, value in queues.items()},
+    }
+
+
+def propose_quality_campaign(project_root: Path, output_dir: Path) -> Dict[str, object]:
+    episodes = discover_episode_bundles(output_dir)
+    enriched = []
+    for episode in episodes:
+        cleaned = _load_json(Path(str(episode["cleaned_json_path"])))
+        transcription = cleaned.get("transcription") if isinstance(cleaned.get("transcription"), dict) else {}
+        duration = float(transcription.get("duration") or 0.0)
+        enriched.append({**episode, "duration_seconds": duration})
+    ordered = sorted(enriched, key=lambda item: (float(item["duration_seconds"]), str(item["episode_id"])))
+    if not ordered:
+        return {"target_count": 12, "selected": [], "requirements": {}}
+    short = ordered[:3]
+    long = ordered[-3:] if len(ordered) > 3 else []
+    used = {str(item["episode_id"]) for item in short + long}
+    middle_pool = [item for item in ordered if str(item["episode_id"]) not in used]
+    if len(middle_pool) <= 6:
+        typical = middle_pool
+    else:
+        step = (len(middle_pool) - 1) / 5
+        typical = [middle_pool[round(index * step)] for index in range(6)]
+    selected = short + typical + long
+    return {
+        "campaign_version": 1,
+        "target_count": 12,
+        "selected": [
+            {
+                **item,
+                "duration_class": "short" if item in short else "long" if item in long else "typical",
+                "required_operator_tags": [],
+            }
+            for item in selected[:12]
+        ],
+        "requirements": {
+            "duration_mix": {"short": 3, "typical": 6, "long": 3},
+            "minimum_condition_counts": {
+                "crosstalk": 2,
+                "recurring_guest_or_cohost": 2,
+                "noise_or_music": 2,
+            },
+            "human_approval_required": True,
+        },
+    }
+
+
+def initialize_quality_campaign(project_root: Path, output_dir: Path) -> Dict[str, object]:
+    proposal = propose_quality_campaign(project_root, output_dir)
+    if len(proposal.get("selected") or []) < 12:
+        raise RuntimeError("At least 12 processed episodes are required to initialize the guided campaign.")
+    paths = _gold_set_paths(project_root, output_dir=output_dir)
+    manifest = _load_json(paths["manifest"]) if paths["manifest"].exists() else {
+        "gold_set_version": 2,
+        "name": "Private Podcast Evaluation Pack",
+        "entries": [],
+    }
+    manifest["gold_set_version"] = 2
+    manifest["campaign_selection"] = {
+        "campaign_version": 1,
+        "created_at_epoch_seconds": int(time.time()),
+        "requirements": proposal["requirements"],
+        "episodes": [
+            {
+                "id": item["episode_id"],
+                "duration_class": item["duration_class"],
+                "duration_seconds": item["duration_seconds"],
+            }
+            for item in proposal["selected"]
+        ],
+    }
+    entries = {
+        str(item.get("id") or ""): item
+        for item in manifest.get("entries") or []
+        if isinstance(item, dict)
+    }
+    for item in proposal["selected"]:
+        episode_id = str(item["episode_id"])
+        entry = entries.setdefault(
+            episode_id,
+            {
+                "id": episode_id,
+                "audio_stem": episode_id,
+                "reference": f"annotations/{episode_id}.reference.json",
+                "enabled": True,
+                "approval_status": "pending_review",
+                "segment_ids": [],
+                "tags": [],
+            },
+        )
+        entry["duration_class"] = item["duration_class"]
+    manifest["entries"] = sorted(entries.values(), key=lambda item: str(item.get("id") or ""))
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    paths["manifest"].write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    return {"status": "initialized", "manifest_path": str(paths["manifest"]), **proposal}
+
+
+def accept_evaluation_baseline(project_root: Path, output_dir: Path, reviewer_id: str) -> Dict[str, object]:
+    queues = evaluation_queues(project_root, output_dir)
+    approved = int(queues["counts"]["human_approved"])
+    if approved < 12:
+        raise RuntimeError(f"The guided evaluation campaign requires 12 human-approved episodes; found {approved}.")
+    pack_root = Path(str(queues["evaluation_pack_path"]))
+    manifest = _load_json(pack_root / "manifest.json")
+    approved_entries = [
+        item for item in manifest.get("entries") or []
+        if isinstance(item, dict)
+        and str(item.get("approval_status") or "").lower() in {"approved", "human_approved"}
+    ]
+    duration_counts = {
+        name: sum(str(item.get("duration_class") or "") == name for item in approved_entries)
+        for name in ("short", "typical", "long")
+    }
+    if duration_counts != {"short": 3, "typical": 6, "long": 3}:
+        raise RuntimeError(f"Approved campaign duration mix is incomplete: {duration_counts}")
+    tags = [[str(tag).lower() for tag in item.get("tags") or []] for item in approved_entries]
+    condition_counts = {
+        "crosstalk": sum("crosstalk" in item for item in tags),
+        "recurring_guest_or_cohost": sum(
+            bool({"recurring_guest", "cohost", "co-host", "recurring_guest_or_cohost"} & set(item))
+            for item in tags
+        ),
+        "noise_or_music": sum(bool({"noise", "music", "noise_or_music"} & set(item)) for item in tags),
+    }
+    shortfalls = [name for name, count in condition_counts.items() if count < 2]
+    if shortfalls:
+        raise RuntimeError("Approved campaign is missing condition coverage: " + ", ".join(shortfalls))
+    report_path = output_dir / "pipeline_quality_benchmark_report.json"
+    if not report_path.exists():
+        raise RuntimeError("Run the pipeline benchmark before accepting a baseline.")
+    report = _load_json(report_path)
+    baseline_dir = pack_root / "baselines"
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    target = baseline_dir / "accepted_baseline.json"
+    if target.exists():
+        raise RuntimeError("An accepted baseline already exists. Baseline replacement requires a separate adjudicated promotion.")
+    payload = {
+        "baseline_contract_version": 1,
+        "accepted_at_epoch_seconds": int(time.time()),
+        "reviewer_id": str(reviewer_id).strip() or "anonymous",
+        "evaluation_pack_path": str(pack_root),
+        "episode_contract_versions": sorted(
+            {
+                str(item.get("episode_contract_version") or "legacy")
+                for item in report.get("results") or []
+                if isinstance(item, dict)
+            }
+        ),
+        "report": report,
+    }
+    target.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    _append_audit_log(
+        project_root,
+        output_dir,
+        {
+            "created_at_epoch_ms": int(time.time() * 1000),
+            "action": "evaluation_baseline_accepted",
+            "reviewer_id": payload["reviewer_id"],
+            "target_path": str(target),
+        },
+    )
+    return {"status": "accepted", "path": str(target)}
 
 
 def _workbench_scan_system_prompt() -> str:
@@ -1493,23 +1739,137 @@ def apply_text_correction(
     preview = preview_text_correction(project_root, output_dir, episode_id, segment_id, corrected_text)
     cleaned_path = output_dir / f"{episode_id}_cleaned_speaker_transcript.json"
     assert_write_revision(cleaned_path, expected_revision)
+    cleaned_payload = _load_json(cleaned_path)
+    transcript_for_contract = deepcopy(cleaned_payload)
+    for segment in transcript_for_contract.get("segments") or []:
+        if isinstance(segment, dict):
+            segment.setdefault("source_span_id", str(segment.get("id") or ""))
+    manifest_dir = output_dir / CORRECTION_MANIFEST_DIRNAME
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = manifest_dir / f"{episode_id}.correction-manifest-v2.json"
+    existing_history: List[Dict[str, object]] = []
+    if manifest_path.exists():
+        existing_manifest = _load_json(manifest_path)
+        existing_history = [
+            dict(item)
+            for item in existing_manifest.get("corrections") or []
+            if isinstance(item, dict)
+        ]
+    for item in existing_history:
+        if (
+            str(item.get("source_span_id") or "") == str(segment_id)
+            and str(item.get("field") or "") == "text"
+            and str(item.get("status") or "") == "approved"
+        ):
+            item["status"] = "superseded"
+            item["adjudication_state"] = "superseded"
+    source_segment = next(
+        item for item in transcript_for_contract["segments"]
+        if str(item.get("source_span_id")) == str(segment_id)
+    )
+    new_correction = {
+        "source_span_id": str(segment_id),
+        "source_anchor": {
+            "episode_id": episode_id,
+            "source_span_id": str(segment_id),
+            "start": float(source_segment.get("start") or 0.0),
+            "end": float(source_segment.get("end") or 0.0),
+            "field": "text",
+        },
+        "field": "text",
+        "before": source_segment.get("text"),
+        "after": preview["corrected_text"],
+        "correction_kind": "transcript_text",
+        "scope": "episode_segment",
+        "reason_code": "operator_correction",
+        "status": "approved",
+        "adjudication_state": "accepted",
+        "supersedes": [
+            str(item.get("correction_id") or "")
+            for item in existing_history
+            if str(item.get("source_span_id") or "") == str(segment_id)
+            and str(item.get("status") or "") == "superseded"
+        ],
+        "superseded_by": [],
+        "provenance": {
+            "source": "transcript_review_workbench",
+            "approved_at_epoch_ms": int(time.time() * 1000),
+        },
+    }
+    manifest, corrected_payload = build_correction_manifest_history(
+        transcript_for_contract,
+        [*existing_history, new_correction],
+        reviewer="workbench-operator",
+        producer={"name": "podcast-host-transcription-pipeline", "contract_version": "2"},
+    )
+    new_id = str(manifest["corrections"][-1]["correction_id"])
+    for item in manifest["corrections"]:
+        if str(item.get("status") or "") == "superseded" and not item.get("superseded_by"):
+            item["superseded_by"] = [new_id]
+    manifest["correction_set_id"] = canonical_id(correction_identity_payload(manifest), prefix="correction")
+    corrected_payload["contract_version"] = "episode-contract-v2"
+    corrected_payload["text_version"] = "corrected_human"
+    corrected_payload["correction_lineage"] = {
+        "correction_set_ids": [manifest["correction_set_id"]],
+        "applied_correction_ids": [
+            str(item["correction_id"])
+            for item in manifest["corrections"]
+            if item.get("status") == "approved"
+        ],
+    }
+    corrected_json_path = output_dir / f"{episode_id}_corrected_speaker_transcript.json"
+    _write_json_atomic(corrected_json_path, corrected_payload)
+    _write_json_atomic(manifest_path, manifest)
+
     corrections_dir = resolve_workbench_paths(project_root, output_dir)["corrections_dir"]
     _assert_within_root(project_root, corrections_dir)
     corrections_dir.mkdir(parents=True, exist_ok=True)
     correction_path = corrections_dir / f"{episode_id}_corrections.csv"
     fieldnames, rows = _read_existing_corrections(correction_path)
-    if "segment_id" not in fieldnames:
-        fieldnames = ["segment_id", "corrected_text", "speaker"]
+    fieldnames = list(dict.fromkeys(["segment_id", "corrected_text", "speaker", *fieldnames]))
     row = deepcopy(rows.get(str(segment_id), {}))
     row["segment_id"] = str(segment_id)
     row["corrected_text"] = preview["corrected_text"]
     row.setdefault("speaker", "")
     rows[str(segment_id)] = row
-    with correction_path.open("w", encoding="utf-8", newline="") as handle:
+    correction_temp = correction_path.with_name(correction_path.name + ".tmp")
+    with correction_temp.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for key in sorted(rows.keys(), key=lambda value: int(value)):
             writer.writerow(rows[key])
+    correction_temp.replace(correction_path)
+    corrected_segments = [
+        _segment_summary(item)
+        for item in corrected_payload.get("segments") or []
+        if isinstance(item, dict)
+    ]
+    speaker_lines = [
+        f"[{float(item.get('start') or 0.0):.2f}][{item.get('speaker') or 'UNKNOWN'}] {item.get('text') or ''}"
+        for item in corrected_segments
+    ]
+    host_labels = {"HOST"}
+    speaker_mapping = corrected_payload.get("speaker_mapping") or {}
+    host_original = corrected_payload.get("host_original_speaker_id")
+    if host_original not in (None, ""):
+        host_labels.add(str(speaker_mapping.get(str(host_original)) or "HOST"))
+    host_lines = [
+        f"[{float(item.get('start') or 0.0):.2f}][{item.get('speaker') or 'UNKNOWN'}] {item.get('text') or ''}"
+        for item in corrected_segments
+        if str(item.get("speaker") or "") in host_labels
+    ]
+    (output_dir / f"{episode_id}_corrected_speaker_transcript.txt").write_text(
+        "\n".join(speaker_lines), encoding="utf-8"
+    )
+    (output_dir / f"{episode_id}_corrected_host_only.txt").write_text(
+        "\n".join(host_lines), encoding="utf-8"
+    )
+    downstream_event = _notify_downstream_correction(
+        project_root,
+        output_dir,
+        episode_id,
+        manifest,
+    )
     audit_entry = {
         "created_at_epoch_ms": int(time.time() * 1000),
         "action": "apply_text_correction",
@@ -1518,9 +1878,172 @@ def apply_text_correction(
         "target_path": str(correction_path),
         "before": preview["original_text"],
         "after": preview["corrected_text"],
+        "correction_id": new_id,
+        "correction_set_id": manifest["correction_set_id"],
+        "downstream_status": downstream_event["status"],
     }
     _append_audit_log(project_root, output_dir, audit_entry)
-    return {"status": "ok", "target_path": str(correction_path), "preview": preview}
+    return {
+        "status": "ok",
+        "target_path": str(correction_path),
+        "manifest_path": str(manifest_path),
+        "corrected_json_path": str(corrected_json_path),
+        "correction_id": new_id,
+        "correction_set_id": manifest["correction_set_id"],
+        "downstream": downstream_event,
+        "preview": preview,
+    }
+
+
+def _notify_downstream_correction(
+    project_root: Path,
+    output_dir: Path,
+    episode_id: str,
+    manifest: Dict[str, object],
+) -> Dict[str, object]:
+    config = load_project_config(project_root)
+    event = {
+        "contract_version": "correction-notification-v1",
+        "episode_id": episode_id,
+        "correction_set_id": manifest.get("correction_set_id"),
+        "correction_manifest_path": str(
+            output_dir / CORRECTION_MANIFEST_DIRNAME / f"{episode_id}.correction-manifest-v2.json"
+        ),
+        "stale_source_span_ids": sorted(
+            {
+                str(item.get("source_span_id") or "")
+                for item in manifest.get("corrections") or []
+                if isinstance(item, dict) and item.get("status") == "approved"
+            }
+        ),
+        "created_at_epoch_ms": int(time.time() * 1000),
+    }
+    delivered = []
+    missing = []
+    for key, inbox_name in (
+        ("podcast_rag_project_dir", "transcription_corrections"),
+        ("ragscope_project_dir", "transcription_corrections"),
+    ):
+        raw = str(config.get(key) or "").strip()
+        if not raw:
+            missing.append(key)
+            continue
+        root = Path(raw)
+        if not root.is_absolute():
+            root = project_root / root
+        if not root.exists():
+            missing.append(key)
+            continue
+        inbox = root / "state" / inbox_name
+        inbox.mkdir(parents=True, exist_ok=True)
+        target = inbox / f"{manifest.get('correction_set_id')}.json"
+        target.write_text(json.dumps(event, indent=2, ensure_ascii=False), encoding="utf-8")
+        delivered.append(str(target))
+    pending_dir = output_dir / "_downstream_corrections"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    pending_path = pending_dir / f"{manifest.get('correction_set_id')}.json"
+    event["status"] = "delivered" if delivered and not missing else "downstream_pending"
+    event["delivered_paths"] = delivered
+    event["missing_consumers"] = missing
+    pending_path.write_text(json.dumps(event, indent=2, ensure_ascii=False), encoding="utf-8")
+    return {**event, "pending_path": str(pending_path)}
+
+
+def list_episode_corrections(output_dir: Path, episode_id: str) -> Dict[str, object]:
+    path = output_dir / CORRECTION_MANIFEST_DIRNAME / f"{episode_id}.correction-manifest-v2.json"
+    if not path.exists():
+        return {"episode_id": episode_id, "present": False, "corrections": []}
+    payload = _load_json(path)
+    return {"episode_id": episode_id, "present": True, "path": str(path), **payload}
+
+
+def rollback_text_correction(
+    project_root: Path,
+    output_dir: Path,
+    episode_id: str,
+    correction_id: str,
+) -> Dict[str, object]:
+    current = list_episode_corrections(output_dir, episode_id)
+    if not current.get("present"):
+        raise RuntimeError(f"No correction history exists for {episode_id}.")
+    corrections = [dict(item) for item in current.get("corrections") or [] if isinstance(item, dict)]
+    target = next((item for item in corrections if str(item.get("correction_id")) == correction_id), None)
+    if target is None:
+        raise RuntimeError(f"Correction was not found: {correction_id}")
+    target["status"] = "disabled"
+    target["adjudication_state"] = "rejected"
+    cleaned_path = output_dir / f"{episode_id}_cleaned_speaker_transcript.json"
+    source = _load_json(cleaned_path)
+    for segment in source.get("segments") or []:
+        if isinstance(segment, dict):
+            segment.setdefault("source_span_id", str(segment.get("id") or ""))
+    manifest, corrected = build_correction_manifest_history(
+        source,
+        corrections,
+        reviewer="workbench-operator",
+        producer={"name": "podcast-host-transcription-pipeline", "contract_version": "2"},
+    )
+    manifest_path = output_dir / CORRECTION_MANIFEST_DIRNAME / f"{episode_id}.correction-manifest-v2.json"
+    _write_json_atomic(manifest_path, manifest)
+    corrected["contract_version"] = "episode-contract-v2"
+    corrected["text_version"] = "corrected_human"
+    corrected["correction_lineage"] = {
+        "correction_set_ids": [manifest["correction_set_id"]],
+        "applied_correction_ids": [
+            str(item["correction_id"]) for item in manifest["corrections"] if item.get("status") == "approved"
+        ],
+    }
+    corrected_path = output_dir / f"{episode_id}_corrected_speaker_transcript.json"
+    _write_json_atomic(corrected_path, corrected)
+    active = [item for item in manifest["corrections"] if item.get("status") == "approved"]
+    correction_path = resolve_workbench_paths(project_root, output_dir)["corrections_dir"] / f"{episode_id}_corrections.csv"
+    correction_path.parent.mkdir(parents=True, exist_ok=True)
+    correction_temp = correction_path.with_name(correction_path.name + ".tmp")
+    with correction_temp.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["segment_id", "corrected_text", "speaker"])
+        writer.writeheader()
+        for item in sorted(active, key=lambda value: int(value.get("source_span_id") or 0)):
+            writer.writerow(
+                {
+                    "segment_id": item.get("source_span_id"),
+                    "corrected_text": item.get("after"),
+                    "speaker": "",
+                }
+            )
+    correction_temp.replace(correction_path)
+    corrected_segments = [item for item in corrected.get("segments") or [] if isinstance(item, dict)]
+    speaker_mapping = corrected.get("speaker_mapping") or {}
+    host_original = corrected.get("host_original_speaker_id")
+    host_labels = {"HOST"}
+    if host_original not in (None, ""):
+        host_labels.add(str(speaker_mapping.get(str(host_original)) or "HOST"))
+    (output_dir / f"{episode_id}_corrected_speaker_transcript.txt").write_text(
+        "\n".join(
+            f"[{float(item.get('start') or 0.0):.2f}][{item.get('speaker') or 'UNKNOWN'}] {item.get('text') or ''}"
+            for item in corrected_segments
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / f"{episode_id}_corrected_host_only.txt").write_text(
+        "\n".join(
+            f"[{float(item.get('start') or 0.0):.2f}][{item.get('speaker') or 'UNKNOWN'}] {item.get('text') or ''}"
+            for item in corrected_segments
+            if str(item.get("speaker") or "") in host_labels
+        ),
+        encoding="utf-8",
+    )
+    _append_audit_log(
+        project_root,
+        output_dir,
+        {
+            "created_at_epoch_ms": int(time.time() * 1000),
+            "action": "rollback_text_correction",
+            "episode_id": episode_id,
+            "correction_id": correction_id,
+            "correction_set_id": manifest["correction_set_id"],
+        },
+    )
+    return {"status": "rolled_back", "correction_id": correction_id, "manifest": manifest}
 
 
 def _read_preferred_terms(path: Path) -> List[str]:

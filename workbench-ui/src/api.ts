@@ -122,6 +122,90 @@ export function loadSpeakerWorkflow(view = "all") {
   }>(`/api/speaker-workflow?view=${encodeURIComponent(view)}`);
 }
 
+export function loadEvaluationQueues() {
+  return request<{
+    evaluation_pack_path: string;
+    counts: Record<string, number>;
+    queues: Record<string, Array<Record<string, unknown>>>;
+  }>("/api/evaluation/queues");
+}
+
+export function loadEvaluationCampaignProposal() {
+  return request<{
+    target_count: number;
+    selected: Array<Record<string, unknown>>;
+    requirements: Record<string, unknown>;
+  }>("/api/evaluation/campaign/proposal");
+}
+
+export function initializeEvaluationCampaign() {
+  return request<{ status: string; selected: Array<Record<string, unknown>> }>("/api/evaluation/campaign/initialize", {
+    method: "POST",
+  });
+}
+
+export function acceptEvaluationBaseline(reviewerId: string) {
+  return request<{ status: string; path: string }>("/api/evaluation/baseline/accept", {
+    method: "POST",
+    body: JSON.stringify({ reviewerId }),
+  });
+}
+
+export function loadSpeakerIdentities() {
+  return request<{
+    library: { speaker_schema_version: number; speakers: Array<Record<string, unknown>> };
+    workflow: {
+      recurring_unknown_speakers: Array<Record<string, unknown>>;
+      identity_basis: string;
+    };
+  }>("/api/speaker-identities");
+}
+
+export function speakerEvidenceAudioUrl(evidenceId: string) {
+  return `/api/speaker-evidence/${encodeURIComponent(evidenceId)}/audio`;
+}
+
+export function promoteSpeakerCandidate(candidateId: string, displayName: string, roles: string[], aliases: string[], reviewerId: string) {
+  return request<{ status: string; speaker_id: string }>("/api/speaker-identities/promote", {
+    method: "POST",
+    body: JSON.stringify({ candidateId, displayName, roles, aliases, reviewerId }),
+  });
+}
+
+export function mergeSpeakerIdentities(speakerIds: string[], reviewerId: string) {
+  return request<{ status: string; survivor_speaker_id: string }>("/api/speaker-identities/merge", {
+    method: "POST",
+    body: JSON.stringify({ speakerIds, reviewerId }),
+  });
+}
+
+export function splitSpeakerIdentity(speakerId: string, evidenceIds: string[], displayName: string, reviewerId: string) {
+  return request<{ status: string; speaker_id: string }>("/api/speaker-identities/split", {
+    method: "POST",
+    body: JSON.stringify({ speakerId, evidenceIds, displayName, reviewerId }),
+  });
+}
+
+export function rollbackSpeakerLibrary(reviewerId: string) {
+  return request<{ status: string }>("/api/speaker-identities/rollback", {
+    method: "POST",
+    body: JSON.stringify({ reviewerId }),
+  });
+}
+
+export function listEpisodeCorrections(episodeId: string) {
+  return request<{ present: boolean; corrections: Array<Record<string, unknown>> }>(
+    `/api/episodes/${encodeURIComponent(episodeId)}/text-corrections`,
+  );
+}
+
+export function rollbackTextCorrection(episodeId: string, correctionId: string) {
+  return request<{ status: string }>(`/api/episodes/${encodeURIComponent(episodeId)}/text-corrections/rollback`, {
+    method: "POST",
+    body: JSON.stringify({ correctionId }),
+  });
+}
+
 export function proposeTeachMeRule(episodeId: string, segmentId: number, desiredReviewedText: string, supersedesRuleId = "") {
   return request<TeachMeProposal>(`/api/episodes/${encodeURIComponent(episodeId)}/teach-me/propose`, {
     method: "POST",

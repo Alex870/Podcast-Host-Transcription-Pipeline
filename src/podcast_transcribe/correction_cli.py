@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "preview":
         result = preview_corrections(
             _read(args.transcript), _read(args.corrections), reviewer=args.reviewer,
-            producer={"name": "podcast-host-transcription-pipeline", "contract_version": "1"},
+            producer={"name": "podcast-host-transcription-pipeline", "contract_version": "2"},
         )
         _write_atomic(Path(args.output), result)
         print(result["preview_id"])

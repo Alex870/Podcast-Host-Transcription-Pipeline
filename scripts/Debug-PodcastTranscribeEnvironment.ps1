@@ -385,15 +385,40 @@ import json
 import os
 import sys
 import warnings
+import ctypes
+from pathlib import Path
 
+
+_FFMPEG_DLL_DIRECTORY_HANDLE = None
+_FFMPEG_DLL_HANDLES = []
 
 def configure_ffmpeg_dll_directory():
+    global _FFMPEG_DLL_DIRECTORY_HANDLE
     ffmpeg_bin_dir = os.getenv("PODCAST_TRANSCRIBE_FFMPEG_BIN_DIR") or os.getenv("FFMPEG_BIN_DIR")
-    if os.name != "nt" or not ffmpeg_bin_dir or not hasattr(os, "add_dll_directory"):
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
         return
+    if not ffmpeg_bin_dir and Path(r"C:\ffmpeg7\bin").is_dir():
+        ffmpeg_bin_dir = r"C:\ffmpeg7\bin"
 
-    if os.path.isdir(ffmpeg_bin_dir):
-        os.add_dll_directory(ffmpeg_bin_dir)
+    if ffmpeg_bin_dir and os.path.isdir(ffmpeg_bin_dir):
+        if list(Path(ffmpeg_bin_dir).glob("avcodec-62.dll")):
+            raise RuntimeError(
+                "The configured FFmpeg directory contains FFmpeg 8 shared libraries, "
+                "which TorchCodec 0.8.1 does not support on Windows. Configure a shared "
+                "FFmpeg 4-7 build, such as C:\\ffmpeg7\\bin."
+            )
+        _FFMPEG_DLL_DIRECTORY_HANDLE = os.add_dll_directory(ffmpeg_bin_dir)
+        for pattern in (
+            "avutil-*.dll",
+            "swresample-*.dll",
+            "swscale-*.dll",
+            "avcodec-*.dll",
+            "avformat-*.dll",
+            "avfilter-*.dll",
+            "avdevice-*.dll",
+        ):
+            for dll_path in sorted(Path(ffmpeg_bin_dir).glob(pattern)):
+                _FFMPEG_DLL_HANDLES.append(ctypes.WinDLL(str(dll_path)))
 
 
 configure_ffmpeg_dll_directory()

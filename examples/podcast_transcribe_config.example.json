@@ -1,7 +1,7 @@
 {
   "default_source_dir": "D:/Speech_to_text/audio",
   "hf_token": "",
-  "ffmpeg_bin_dir": "C:/ffmpeg/bin",
+  "ffmpeg_bin_dir": "C:/ffmpeg7/bin",
   "known_speakers_dir": "speaker_reference_samples",
   "preferred_terms_file": "examples/preferred_terms.txt",
   "replacement_map_json": "examples/preferred_replacements.json",
@@ -23,6 +23,9 @@
   },
   "cleanup_level": "normal",
   "corrections_dir": "",
+  "evaluation_pack_path": "",
+  "podcast_rag_project_dir": "",
+  "ragscope_project_dir": "",
   "resume_intermediates": true,
   "archive_debug_artifacts": false,
   "child_timeout_seconds": 0,

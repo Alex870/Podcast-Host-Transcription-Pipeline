@@ -23,6 +23,8 @@ Preferred starting folder for the launcher. If valid, the launcher uses it direc
 
 Directory containing known-speaker reference clips and `speakers.json`.
 
+New libraries use additive speaker schema v2 fields for stable IDs, aliases, multiple roles, embedding-family evidence, status, and revision history. Legacy entries remain readable.
+
 ### `host_profile_json`
 
 - Type: `string`
@@ -47,6 +49,30 @@ Optional clean host-reference audio file. Relative paths are resolved from the r
 
 Optional directory containing manual correction CSVs named like `<audio_stem>_corrections.csv`.
 
+### `evaluation_pack_path`
+
+- Type: `string`
+- Default: `""`, which uses `benchmarks/pipeline_gold_set`
+- Affects: pipeline quality benchmark, workbench evaluation queues
+
+Path to the private `podcast-evaluation-pack-v1` directory. It may be outside the repository so transcript references and human judgments remain private.
+
+### `podcast_rag_project_dir`
+
+- Type: `string`
+- Default: `""`
+- Affects: correction downstream notifications
+
+Optional Podcast-RAG project root. Approved correction manifests are announced under its `state/transcription_corrections` inbox. When unavailable, the notification remains `downstream_pending` in the transcription output folder.
+
+### `ragscope_project_dir`
+
+- Type: `string`
+- Default: `""`
+- Affects: correction downstream notifications and stale judgments
+
+Optional RAGScope project root. Approved corrections announce affected source-span IDs to its correction inbox for re-adjudication.
+
 ### `review_debug_dir`
 
 - Type: `string`
@@ -61,7 +87,7 @@ Optional override directory for review debug artifacts. When blank and `review_d
 
 ## Hugging Face and FFmpeg
 
-The current validated Windows GPU environment uses PyTorch 2.9.0 with CUDA 12.8, TorchAudio 2.9.0, TorchVision 0.24.0, and TorchCodec 0.8.1. Install those versions through `podcast_transcribe_requirements.txt`; they are environment dependencies rather than config keys. A shared FFmpeg build is still required for TorchCodec path-based audio decoding.
+The current validated Windows GPU environment uses PyTorch 2.9.0 with CUDA 12.8, TorchAudio 2.9.0, TorchVision 0.24.0, and TorchCodec 0.8.1. Install those versions through `podcast_transcribe_requirements.txt`; they are environment dependencies rather than config keys. TorchCodec 0.8.1 on Windows requires a shared FFmpeg 4-7 build. The validated project default is FFmpeg 7.1.1 under `C:/ffmpeg7/bin`; the runtime preloads that directory's DLLs before TorchCodec import.
 
 ### `hf_token`
 

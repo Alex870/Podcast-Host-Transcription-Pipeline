@@ -15,7 +15,7 @@ The shared transcript, processed-cache, Chroma metadata, and `podcast.json` expe
 
 ## Clean-machine packaging
 
-The baseline Python dependencies are pinned in `podcast_transcribe_requirements.txt`. The optional WhisperX alignment environment is separately pinned in `podcast_transcribe_alignment_requirements.txt`. The browser workbench uses the checked-in `workbench-ui/pnpm-lock.yaml` and `pnpm-workspace.yaml`; run `pnpm install --frozen-lockfile` followed by `pnpm run build`. The root ecosystem clean-machine diagnostic records CUDA, FFmpeg, TorchCodec, and Hugging Face checks without bundling models or credentials.
+The baseline Python dependencies are pinned in `podcast_transcribe_requirements.txt`. The optional WhisperX alignment environment is separately pinned in `podcast_transcribe_alignment_requirements.txt`. The browser workbench uses the checked-in `workbench-ui/pnpm-lock.yaml` and `pnpm-workspace.yaml`; launcher option 5 installs and rebuilds it automatically when needed. The root ecosystem clean-machine diagnostic records CUDA, FFmpeg, TorchCodec, and Hugging Face checks without bundling models or credentials.
 
 ## Why This Exists
 
@@ -34,7 +34,7 @@ Basic podcast transcribers usually stop at "faithfully capture the words." That 
 - `examples/`: example config, glossary, and replacement files
 - `docs/`: Quick Start, user docs, config reference, architecture, and contract docs
 - `benchmarks/review_fixtures/`: checked-in cleaned-transcript fixtures for review benchmarking
-- `benchmarks/pipeline_gold_set/`: human-approved reference spans for full-pipeline quality measurement
+- `benchmarks/pipeline_gold_set/`: synthetic/template quality fixtures; real private evaluation packs are configured externally
 
 ## Launcher Menu
 
@@ -67,6 +67,7 @@ Per episode, the pipeline can emit:
 - cleaned transcript files: `*_cleaned_speaker_transcript.txt`, `*_cleaned_host_only.txt`, `*_cleaned_speaker_transcript.json`
 - review and QA files: `*_review.csv`, `*_speaker_identity_review.csv`
 - optional reviewed files: `*_reviewed_speaker_transcript.txt`, `*_reviewed_host_only.txt`, `*_reviewed_speaker_transcript.json`
+- human-corrected siblings: `*_corrected_speaker_transcript.txt`, `*_corrected_host_only.txt`, `*_corrected_speaker_transcript.json`
 - provenance and reporting: `*_manifest.json`
 
 Batch-level outputs include `_episode_review_summary.csv`, `_batch_report.md`, `_review_run_report.*`, and `_speaker_workflow_report.*`.
@@ -118,7 +119,9 @@ Stage 7 keeps `faster_whisper` and `speechbrain_ecapa` as the defaults. `--asr-p
 
 The optional review layer can also backfill reviewed outputs from existing `*_cleaned_speaker_transcript.json` files, so legacy tier-1 work does not need to be rerun just to add tier-2 review artifacts.
 
-The validated Windows GPU environment uses PyTorch 2.9 with TorchCodec 0.8.1 and a shared FFmpeg build. When the native decoder is available, pyannote can receive path-based audio; learned long-file routing still provides a chunked fallback for global diarization memory failures.
+New runs write `episode-contract-v2`. Legacy v1 bundles are promoted on the next normal pass using output-only or cached reconstruction where possible, with automatic tier-1 reprocessing only when required evidence is unavailable. The workbench writes `correction-manifest-v2` histories and builds recurring-speaker candidates from compatible embeddings rather than reusable diarization labels.
+
+The validated Windows GPU environment uses PyTorch 2.9 with TorchCodec 0.8.1 and a shared FFmpeg 7 build. Keep that build in a dedicated directory such as `C:\ffmpeg7\bin`; the launcher preloads its DLLs so another FFmpeg installation on `PATH` cannot interfere. When the native decoder is available, pyannote can receive path-based audio; learned long-file routing still provides a chunked fallback for global diarization memory failures.
 
 ## Supported Audio Formats
 

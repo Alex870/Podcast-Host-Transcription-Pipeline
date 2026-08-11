@@ -16,24 +16,38 @@ from pydantic import BaseModel, Field
 
 from podcast_transcribe.workbench_core import (
     approve_review_rule,
+    accept_evaluation_baseline,
     apply_preferred_term_addition,
     apply_replacement_map_update,
     apply_text_correction,
     backfill_review_rule,
     disable_review_rule,
     discover_episode_bundles,
+    evaluation_queues,
+    initialize_quality_campaign,
     get_review_rule,
     list_review_rules,
+    list_episode_corrections,
     load_audit_log,
     load_episode_bundle,
     propose_teach_me_rule,
+    propose_quality_campaign,
     reject_review_rule,
     rerun_review_with_approved_rules,
+    rollback_text_correction,
     resolve_workbench_paths,
     run_semantic_scan,
     save_gold_segment_annotation,
 )
-from podcast_transcribe.speaker_workflow import build_cross_episode_speaker_view
+from podcast_transcribe.speaker_workflow import (
+    build_cross_episode_speaker_view,
+    collect_speaker_evidence,
+    load_speaker_library,
+    merge_speaker_identities,
+    promote_speaker_candidate,
+    rollback_speaker_library,
+    split_speaker_identity,
+)
 from podcast_transcribe.speakers import (
     approve_speaker_profile_promotion,
     rollback_speaker_profile_promotion,
@@ -50,6 +64,10 @@ class TextCorrectionRequest(BaseModel):
     segment_id: int = Field(..., alias="segmentId")
     corrected_text: str = Field(..., alias="correctedText")
     expected_revision: Optional[Dict[str, object]] = Field(default=None, alias="expectedRevision")
+
+
+class CorrectionRollbackRequest(BaseModel):
+    correction_id: str = Field(..., alias="correctionId")
 
 
 class TeachMeRequest(BaseModel):
@@ -85,6 +103,30 @@ class SpeakerProfilePromotionRequest(BaseModel):
     profile_path: str = Field(..., alias="profilePath")
     candidate_profile: Dict[str, object] = Field(default_factory=dict, alias="candidateProfile")
     evaluation_report: Dict[str, object] = Field(default_factory=dict, alias="evaluationReport")
+    reviewer_id: str = Field("", alias="reviewerId")
+
+
+class SpeakerCandidatePromotionRequest(BaseModel):
+    candidate_id: str = Field(..., alias="candidateId")
+    display_name: str = Field(..., alias="displayName")
+    roles: List[str] = Field(default_factory=lambda: ["guest"])
+    aliases: List[str] = Field(default_factory=list)
+    reviewer_id: str = Field("", alias="reviewerId")
+
+
+class SpeakerMergeRequest(BaseModel):
+    speaker_ids: List[str] = Field(..., alias="speakerIds")
+    reviewer_id: str = Field("", alias="reviewerId")
+
+
+class SpeakerSplitRequest(BaseModel):
+    speaker_id: str = Field(..., alias="speakerId")
+    evidence_ids: List[str] = Field(..., alias="evidenceIds")
+    display_name: str = Field(..., alias="displayName")
+    reviewer_id: str = Field("", alias="reviewerId")
+
+
+class ReviewerApprovalRequest(BaseModel):
     reviewer_id: str = Field("", alias="reviewerId")
 
 
@@ -178,6 +220,42 @@ def list_episodes():
         raise _json_error(exc) from exc
 
 
+@app.get("/api/evaluation/queues")
+def evaluation_queue_endpoint():
+    try:
+        project_root, output_dir = SESSION.require()
+        return evaluation_queues(project_root, output_dir)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.get("/api/evaluation/campaign/proposal")
+def evaluation_campaign_proposal_endpoint():
+    try:
+        project_root, output_dir = SESSION.require()
+        return propose_quality_campaign(project_root, output_dir)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/evaluation/campaign/initialize")
+def evaluation_campaign_initialize_endpoint():
+    try:
+        project_root, output_dir = SESSION.require()
+        return initialize_quality_campaign(project_root, output_dir)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/evaluation/baseline/accept")
+def accept_evaluation_baseline_endpoint(payload: ReviewerApprovalRequest):
+    try:
+        project_root, output_dir = SESSION.require()
+        return accept_evaluation_baseline(project_root, output_dir, payload.reviewer_id)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
 @app.get("/api/episodes/{episode_id}")
 def get_episode(episode_id: str):
     try:
@@ -253,6 +331,24 @@ def apply_text_correction_endpoint(episode_id: str, payload: TextCorrectionReque
         raise _json_error(exc) from exc
 
 
+@app.get("/api/episodes/{episode_id}/text-corrections")
+def list_text_corrections_endpoint(episode_id: str):
+    try:
+        _project_root, output_dir = SESSION.require()
+        return list_episode_corrections(output_dir, episode_id)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/episodes/{episode_id}/text-corrections/rollback")
+def rollback_text_correction_endpoint(episode_id: str, payload: CorrectionRollbackRequest):
+    try:
+        project_root, output_dir = SESSION.require()
+        return rollback_text_correction(project_root, output_dir, episode_id, payload.correction_id)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
 @app.post("/api/glossary/preferred-terms/preview")
 def preview_preferred_term_endpoint(payload: PreferredTermRequest):
     try:
@@ -307,6 +403,123 @@ def speaker_workflow(view: str = "all"):
     try:
         _project_root, output_dir = SESSION.require()
         return build_cross_episode_speaker_view(output_dir, view=view)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+def _speaker_library_path(project_root: Path) -> Path:
+    from podcast_transcribe.workbench_core import load_project_config
+
+    config = load_project_config(project_root)
+    configured = str(config.get("known_speakers_dir") or "speaker_reference_samples")
+    root = Path(configured)
+    if not root.is_absolute():
+        root = project_root / root
+    resolved = root.resolve()
+    try:
+        resolved.relative_to(project_root.resolve())
+    except ValueError as exc:
+        raise RuntimeError("Known-speakers directory must remain inside the project root.") from exc
+    return resolved / "speakers.json"
+
+
+@app.get("/api/speaker-identities")
+def speaker_identities():
+    try:
+        project_root, output_dir = SESSION.require()
+        return {
+            "library": load_speaker_library(_speaker_library_path(project_root)),
+            "workflow": build_cross_episode_speaker_view(output_dir),
+        }
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.get("/api/speaker-evidence/{evidence_id}/audio")
+def speaker_evidence_audio(evidence_id: str):
+    try:
+        _project_root, output_dir = SESSION.require()
+        evidence = next(
+            (
+                row.get("identity_evidence")
+                for row in collect_speaker_evidence(output_dir)
+                if isinstance(row.get("identity_evidence"), dict)
+                and str(row["identity_evidence"].get("evidence_id") or "") == evidence_id
+            ),
+            None,
+        )
+        if not isinstance(evidence, dict):
+            raise RuntimeError(f"Speaker evidence not found: {evidence_id}")
+        source_audio = Path(str(evidence.get("source_audio") or "")).resolve()
+        if not source_audio.exists() or not source_audio.is_file():
+            raise RuntimeError(f"Source audio is unavailable for speaker evidence: {evidence_id}")
+        return FileResponse(source_audio)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/speaker-identities/promote")
+def promote_speaker_identity(payload: SpeakerCandidatePromotionRequest):
+    try:
+        project_root, output_dir = SESSION.require()
+        workflow = build_cross_episode_speaker_view(output_dir)
+        candidate = next(
+            (
+                item for item in workflow.get("recurring_unknown_speakers") or []
+                if str(item.get("candidate_id") or "") == payload.candidate_id
+            ),
+            None,
+        )
+        if candidate is None:
+            raise RuntimeError(f"Speaker candidate not found: {payload.candidate_id}")
+        return promote_speaker_candidate(
+            _speaker_library_path(project_root),
+            candidate,
+            display_name=payload.display_name,
+            roles=payload.roles,
+            aliases=payload.aliases,
+            reviewer_id=payload.reviewer_id,
+        )
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/speaker-identities/merge")
+def merge_speaker_identity_endpoint(payload: SpeakerMergeRequest):
+    try:
+        project_root, _output_dir = SESSION.require()
+        return merge_speaker_identities(
+            _speaker_library_path(project_root),
+            payload.speaker_ids,
+            reviewer_id=payload.reviewer_id,
+        )
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/speaker-identities/split")
+def split_speaker_identity_endpoint(payload: SpeakerSplitRequest):
+    try:
+        project_root, _output_dir = SESSION.require()
+        return split_speaker_identity(
+            _speaker_library_path(project_root),
+            payload.speaker_id,
+            payload.evidence_ids,
+            display_name=payload.display_name,
+            reviewer_id=payload.reviewer_id,
+        )
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/speaker-identities/rollback")
+def rollback_speaker_identity_endpoint(payload: ReviewerApprovalRequest):
+    try:
+        project_root, _output_dir = SESSION.require()
+        return rollback_speaker_library(
+            _speaker_library_path(project_root),
+            reviewer_id=payload.reviewer_id,
+        )
     except Exception as exc:
         raise _json_error(exc) from exc
 

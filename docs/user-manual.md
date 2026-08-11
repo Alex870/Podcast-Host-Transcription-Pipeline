@@ -22,6 +22,50 @@ The menu options are:
 
 The interactive launcher returns to this menu after every completed action and after handled action errors. Select `Q` to close it. Passing an explicit action on the command line remains a one-shot operation for scripts and automation.
 
+## Episode Contract Upgrades
+
+New transcript bundles use `episode-contract-v2`. On an ordinary option 2 run, legacy v1 episodes are classified and upgraded automatically:
+
+1. existing compatible JSON outputs are promoted without loading ML models;
+2. cached stage artifacts are reused when output-only reconstruction is insufficient;
+3. tier-1 stages rerun automatically only when v2 evidence cannot otherwise be reconstructed.
+
+Embedding-backed speaker identity is part of v2 completeness. Legacy bundles without that evidence cannot be promoted by metadata alone; compatible transcription and diarization caches are reused where possible, then speaker attribution is rebuilt from source audio.
+
+Before canonical v1 JSON and manifest files are replaced, compact copies are retained under:
+
+```text
+output\_contract_archive\<episode>\v1
+```
+
+Console output distinguishes `v2 contract delta upgrade`, `v2 cached rebuild`, and `v2 full reprocess`. A completed v2 episode records its contract and upgrade provenance so later runs skip it.
+
+## Human Corrections
+
+Workbench text corrections now produce `correction-manifest-v2` history and three additive corrected siblings:
+
+```text
+*_corrected_speaker_transcript.json
+*_corrected_speaker_transcript.txt
+*_corrected_host_only.txt
+```
+
+Raw, cleaned, and reviewed artifacts remain unchanged. The compatibility correction CSV is regenerated from active approved corrections, so an ordinary pipeline rerun reproduces the result. Superseded and rolled-back corrections remain visible in workbench history.
+
+When `podcast_rag_project_dir` or `ragscope_project_dir` is configured, approved changes are announced to those repositories. Otherwise the notification remains in `output\_downstream_corrections` with `downstream_pending`.
+
+## Private Evaluation Campaign
+
+Set `evaluation_pack_path` to a private directory outside Git, then open option 5. The workbench shows unlabelled, pending-review, adjudication-required, and approved queues and can initialize a guided 12-episode campaign.
+
+The campaign requires three short, six typical, and three long episodes, plus at least two examples each for crosstalk, recurring guest/co-host behavior, and noise or music. Every official reference requires a reviewer ID and human approval. Option 6 writes the benchmark report; the workbench accepts the first baseline only after all campaign gates pass.
+
+## Recurring Speaker Identity
+
+Cross-episode identity is based on versioned voice embeddings, never the reusable `SPEAKER_01`-style labels. The workbench lists candidates only after compatible evidence appears in at least two episodes. Promotion requires at least three episodes or 600 seconds of acceptable evidence.
+
+Operators can review evidence clips, assign host/co-host/guest roles, promote a candidate, merge or split identities, and roll back the latest library change. Embeddings from different provider/model families cannot be merged.
+
 ## Normal Transcription Workflow
 
 The normal operator flow is:

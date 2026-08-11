@@ -15,6 +15,7 @@ from podcast_transcribe.contract import (
     validate_reviewed_transcript_payload,
     validate_transcript_payload,
 )
+from podcast_transcribe.contract_v2 import EPISODE_CONTRACT_V2, stable_episode_uid
 from podcast_transcribe.quality import classify_segment_text, summarize_content_quality
 from podcast_transcribe.state import atomic_write_text
 
@@ -294,6 +295,9 @@ def write_json_output(
         "transcript_schema_version": TRANSCRIPT_SCHEMA_VERSION,
     }
     payload = {
+        "contract_version": EPISODE_CONTRACT_V2,
+        "episode_id": Path(source_file).stem,
+        "episode_uid": str(metadata.get("episode_uid") or stable_episode_uid(source_file)),
         "schema_version": TRANSCRIPT_SCHEMA_VERSION,
         "pipeline": PIPELINE_NAME,
         "pipeline_version": pipeline_version,
@@ -313,6 +317,7 @@ def write_json_output(
         "segments": [
             {
                 "id": segment.id,
+                "source_span_id": str(segment.id),
                 "start": segment.start,
                 "end": segment.end,
                 "speaker": segment.speaker,
@@ -363,6 +368,31 @@ def write_json_output(
             }
             for segment in segments
         ],
+    }
+    payload["completed_processing_stages"] = sorted(
+        {
+            str(key)
+            for key, value in (metadata.get("stage_provenance") or {}).items()
+            if isinstance(value, dict)
+        }
+        | {"output_write"}
+    )
+    payload["artifact_provenance"] = {
+        "stage_provenance": metadata.get("stage_provenance") or {},
+        "pipeline": PIPELINE_NAME,
+        "pipeline_version": pipeline_version,
+    }
+    payload["correction_lineage"] = metadata.get("correction_lineage") or {
+        "correction_set_ids": [],
+        "applied_correction_ids": [],
+    }
+    payload["speaker_identity_evidence"] = metadata.get("speaker_identity_evidence") or []
+    payload["speaker_identity_evidence_complete"] = bool(
+        metadata.get("speaker_identity_evidence_complete", True)
+    )
+    payload["contract_upgrade"] = metadata.get("contract_upgrade") or {
+        "target_contract": "episode-contract-v2",
+        "method": "native_v2_processing",
     }
     if review_metadata:
         payload["review_schema_version"] = REVIEWED_TRANSCRIPT_SCHEMA_VERSION
@@ -452,10 +482,14 @@ def write_output_manifest(
                     "filename": output_path.name,
                     "size_bytes": output_path.stat().st_size,
                     "sha1": hashlib.sha1(output_path.read_bytes()).hexdigest(),
+                    "sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
                 }
             )
 
     manifest = {
+        "contract_version": EPISODE_CONTRACT_V2,
+        "episode_id": Path(source_file).stem,
+        "episode_uid": stable_episode_uid(source_file, source_fingerprint),
         "manifest_version": 1,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "pipeline": PIPELINE_NAME,

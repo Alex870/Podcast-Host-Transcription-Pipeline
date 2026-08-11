@@ -14,11 +14,13 @@ from podcast_transcribe.workbench_core import (
     backfill_review_rule,
     discover_episode_bundles,
     list_review_rules,
+    list_episode_corrections,
     load_audit_log,
     load_episode_bundle,
     preview_text_correction,
     propose_teach_me_rule,
     run_semantic_scan,
+    rollback_text_correction,
     save_gold_segment_annotation,
 )
 
@@ -149,6 +151,18 @@ class WorkbenchCoreTests(unittest.TestCase):
             self.assertEqual(applied["status"], "ok")
             correction_file = project_root / "corrections" / "Episode 20260628_corrections.csv"
             self.assertTrue(correction_file.exists())
+            self.assertTrue(Path(applied["manifest_path"]).exists())
+            self.assertTrue(Path(applied["corrected_json_path"]).exists())
+            history = list_episode_corrections(output_dir, "Episode 20260628")
+            self.assertEqual(history["contract_version"], "correction-manifest-v2")
+            correction_id = history["corrections"][0]["correction_id"]
+            rolled_back = rollback_text_correction(
+                project_root,
+                output_dir,
+                "Episode 20260628",
+                correction_id,
+            )
+            self.assertEqual(rolled_back["status"], "rolled_back")
 
             term_result = apply_preferred_term_addition(project_root, output_dir, "ChromaDB")
             self.assertEqual(term_result["status"], "ok")

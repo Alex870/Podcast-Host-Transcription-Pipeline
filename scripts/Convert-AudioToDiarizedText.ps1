@@ -352,7 +352,7 @@ if (-not $AnyBenchmark) {
             Write-Host "No ffmpeg bin directory configured."
         }
 
-        $InitialFfmpegFolder = if (Test-Path -LiteralPath "C:\ffmpeg\bin") { "C:\ffmpeg\bin" } else { $null }
+        $InitialFfmpegFolder = if (Test-Path -LiteralPath "C:\ffmpeg7\bin") { "C:\ffmpeg7\bin" } elseif (Test-Path -LiteralPath "C:\ffmpeg\bin") { "C:\ffmpeg\bin" } else { $null }
         $SelectedFfmpegBinDir = Select-Folder -Description "Select the ffmpeg bin directory (the folder containing ffmpeg DLLs)." -InitialFolder $InitialFfmpegFolder
         if ([string]::IsNullOrWhiteSpace($SelectedFfmpegBinDir)) {
             Write-Error "Error: ffmpeg bin directory not selected. Exiting."
@@ -578,9 +578,14 @@ if (-not [string]::IsNullOrWhiteSpace($AlignmentModel)) {
 if ($ReviewBenchmark) {
     $args += "--review-benchmark"
 } elseif ($PipelineBenchmark) {
+    $evaluationPackPath = if ($Config.evaluation_pack_path) {
+        Resolve-ConfigPathValue ([string]$Config.evaluation_pack_path)
+    } else {
+        Join-Path $ProjectRoot "benchmarks\pipeline_gold_set"
+    }
     $args += @(
         "--pipeline-benchmark"
-        "--gold-set-dir", (Join-Path $ProjectRoot "benchmarks\pipeline_gold_set")
+        "--evaluation-pack-path", $evaluationPackPath
         "--benchmark-candidate-dir", $OutputFolder
     )
 } else {

@@ -4,24 +4,36 @@ import {
   applyPreferredTerm,
   applyReplacement,
   applyTextCorrection,
+  acceptEvaluationBaseline,
   approveReviewRule,
   backfillReviewRule,
   disableReviewRule,
   getSession,
+  initializeEvaluationCampaign,
   listEpisodes,
+  listEpisodeCorrections,
   listReviewRules,
   loadAudit,
   loadEpisode,
+  loadEvaluationCampaignProposal,
+  loadEvaluationQueues,
+  loadSpeakerIdentities,
   loadSpeakerWorkflow,
   openSession,
+  mergeSpeakerIdentities,
   previewPreferredTerm,
   previewReplacement,
   previewTextCorrection,
+  promoteSpeakerCandidate,
   proposeTeachMeRule,
   rejectReviewRule,
   rerunReviewRule,
+  rollbackTextCorrection,
+  rollbackSpeakerLibrary,
   runScan,
   saveGoldSegmentAnnotation,
+  speakerEvidenceAudioUrl,
+  splitSpeakerIdentity,
 } from "./api";
 import type { EpisodeBundle, Finding, LearnedRule, TeachMeProposal, TranscriptSegment } from "./types";
 
@@ -80,6 +92,12 @@ export default function App() {
   const [goldNotes, setGoldNotes] = useState("");
   const [goldReviewerId, setGoldReviewerId] = useState("");
   const [goldApprovalStatus, setGoldApprovalStatus] = useState("pending_review");
+  const [speakerCandidateName, setSpeakerCandidateName] = useState("");
+  const [speakerCandidateRole, setSpeakerCandidateRole] = useState("guest");
+  const [speakerMergeIds, setSpeakerMergeIds] = useState("");
+  const [speakerSplitId, setSpeakerSplitId] = useState("");
+  const [speakerSplitEvidenceIds, setSpeakerSplitEvidenceIds] = useState("");
+  const [speakerSplitName, setSpeakerSplitName] = useState("");
 
   const sessionQuery = useQuery({
     queryKey: ["session"],
@@ -119,6 +137,36 @@ export default function App() {
     enabled: sessionQuery.data?.sessionOpen === true,
   });
 
+  const evaluationQueuesQuery = useQuery({
+    queryKey: ["evaluation-queues"],
+    queryFn: loadEvaluationQueues,
+    enabled: sessionQuery.data?.sessionOpen === true,
+  });
+
+  const evaluationCampaignQuery = useQuery({
+    queryKey: ["evaluation-campaign"],
+    queryFn: loadEvaluationCampaignProposal,
+    enabled: sessionQuery.data?.sessionOpen === true,
+  });
+
+  const initializeCampaignMutation = useMutation({
+    mutationFn: initializeEvaluationCampaign,
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["evaluation-queues"] }),
+        queryClient.invalidateQueries({ queryKey: ["evaluation-campaign"] }),
+      ]);
+      setStatusMessage("Guided 12-episode evaluation campaign initialized.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const acceptBaselineMutation = useMutation({
+    mutationFn: () => acceptEvaluationBaseline(goldReviewerId),
+    onSuccess: (payload) => setStatusMessage(`Evaluation baseline accepted: ${payload.path}`),
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
   useEffect(() => {
     const firstEpisode = episodesQuery.data?.episodes?.[0]?.episode_id;
     if (!selectedEpisodeId && firstEpisode) {
@@ -130,6 +178,18 @@ export default function App() {
     queryKey: ["episode", selectedEpisodeId],
     queryFn: () => loadEpisode(selectedEpisodeId),
     enabled: Boolean(selectedEpisodeId),
+  });
+
+  const correctionHistoryQuery = useQuery({
+    queryKey: ["correction-history", selectedEpisodeId],
+    queryFn: () => listEpisodeCorrections(selectedEpisodeId),
+    enabled: Boolean(selectedEpisodeId),
+  });
+
+  const speakerIdentitiesQuery = useQuery({
+    queryKey: ["speaker-identities"],
+    queryFn: loadSpeakerIdentities,
+    enabled: sessionQuery.data?.sessionOpen === true,
   });
 
   const auditQuery = useQuery({
@@ -173,8 +233,70 @@ export default function App() {
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["audit"] }),
+        queryClient.invalidateQueries({ queryKey: ["correction-history", selectedEpisodeId] }),
       ]);
       setStatusMessage("Text correction applied.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const rollbackCorrectionMutation = useMutation({
+    mutationFn: (correctionId: string) => rollbackTextCorrection(selectedEpisodeId, correctionId),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["audit"] }),
+        queryClient.invalidateQueries({ queryKey: ["correction-history", selectedEpisodeId] }),
+      ]);
+      setStatusMessage("Correction rolled back.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const promoteSpeakerMutation = useMutation({
+    mutationFn: (candidateId: string) =>
+      promoteSpeakerCandidate(candidateId, speakerCandidateName, [speakerCandidateRole], [], goldReviewerId),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["speaker-identities"] }),
+        queryClient.invalidateQueries({ queryKey: ["speakerWorkflow"] }),
+      ]);
+      setSpeakerCandidateName("");
+      setStatusMessage("Speaker identity promoted.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const mergeSpeakerMutation = useMutation({
+    mutationFn: () => mergeSpeakerIdentities(
+      speakerMergeIds.split(",").map((item) => item.trim()).filter(Boolean),
+      goldReviewerId,
+    ),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["speaker-identities"] });
+      setStatusMessage("Speaker identities merged.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const splitSpeakerMutation = useMutation({
+    mutationFn: () => splitSpeakerIdentity(
+      speakerSplitId.trim(),
+      speakerSplitEvidenceIds.split(",").map((item) => item.trim()).filter(Boolean),
+      speakerSplitName.trim(),
+      goldReviewerId,
+    ),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["speaker-identities"] });
+      setStatusMessage("Speaker identity split.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const rollbackSpeakerMutation = useMutation({
+    mutationFn: () => rollbackSpeakerLibrary(goldReviewerId),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["speaker-identities"] });
+      setStatusMessage("Speaker identity library rolled back.");
     },
     onError: (error: Error) => setStatusMessage(error.message),
   });
@@ -199,6 +321,7 @@ export default function App() {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["episode", selectedEpisodeId] }),
         queryClient.invalidateQueries({ queryKey: ["audit"] }),
+        queryClient.invalidateQueries({ queryKey: ["evaluation-queues"] }),
       ]);
       setStatusMessage("Gold-set reference annotation saved.");
     },
@@ -491,7 +614,35 @@ export default function App() {
               <div><strong>Changed rows</strong><span>{speakerWorkflowQuery.data?.changed_count ?? 0}</span></div>
               <div><strong>Recurring unknowns</strong><span>{speakerWorkflowQuery.data?.recurring_unknown_speakers?.length ?? 0}</span></div>
             </div>
-            <div className="hint-text">Unknown-speaker groups include evidence clips for human review; profile promotion remains explicit and reversible.</div>
+            <div className="hint-text">
+              Candidates are grouped from compatible voice embeddings, never from reused SPEAKER_ labels.
+            </div>
+          </section>
+
+          <section className="panel metadata-panel">
+            <div className="panel-header"><h2>Evaluation campaign</h2></div>
+            <div className="meta-grid">
+              <div><strong>Unlabelled</strong><span>{evaluationQueuesQuery.data?.counts?.unlabelled ?? 0}</span></div>
+              <div><strong>Pending</strong><span>{evaluationQueuesQuery.data?.counts?.pending_review ?? 0}</span></div>
+              <div><strong>Adjudication</strong><span>{evaluationQueuesQuery.data?.counts?.adjudication_required ?? 0}</span></div>
+              <div><strong>Approved</strong><span>{evaluationQueuesQuery.data?.counts?.human_approved ?? 0}</span></div>
+              <div><strong>Campaign sample</strong><span>{evaluationCampaignQuery.data?.selected?.length ?? 0}/12</span></div>
+            </div>
+            <div className="hint-text">{evaluationQueuesQuery.data?.evaluation_pack_path ?? "Evaluation pack not resolved."}</div>
+            <div className="button-row">
+              <button
+                disabled={(evaluationCampaignQuery.data?.selected?.length ?? 0) < 12}
+                onClick={() => initializeCampaignMutation.mutate()}
+              >
+                Initialize campaign
+              </button>
+              <button
+                disabled={(evaluationQueuesQuery.data?.counts?.human_approved ?? 0) < 12}
+                onClick={() => acceptBaselineMutation.mutate()}
+              >
+                Accept benchmark baseline
+              </button>
+            </div>
           </section>
 
           <section className="panel findings-panel">
@@ -541,6 +692,96 @@ export default function App() {
                 >
                   Apply
                 </button>
+              </div>
+              <div className="audit-list">
+                {(correctionHistoryQuery.data?.corrections ?? []).slice().reverse().map((item) => (
+                  <div className="audit-item" key={String(item.correction_id)}>
+                    <strong>{String(item.status ?? "unknown")} | {String(item.correction_kind ?? "text")}</strong>
+                    <span>{String(item.after ?? "")}</span>
+                    {item.status === "approved" ? (
+                      <button onClick={() => rollbackCorrectionMutation.mutate(String(item.correction_id))}>Rollback</button>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+              <input
+                value={speakerMergeIds}
+                onChange={(event) => setSpeakerMergeIds(event.target.value)}
+                placeholder="Speaker IDs to merge, comma separated"
+              />
+              <button
+                disabled={speakerMergeIds.split(",").filter((item) => item.trim()).length < 2}
+                onClick={() => mergeSpeakerMutation.mutate()}
+              >
+                Merge identities
+              </button>
+              <input value={speakerSplitId} onChange={(event) => setSpeakerSplitId(event.target.value)} placeholder="Speaker ID to split" />
+              <input
+                value={speakerSplitEvidenceIds}
+                onChange={(event) => setSpeakerSplitEvidenceIds(event.target.value)}
+                placeholder="Evidence IDs to move, comma separated"
+              />
+              <input value={speakerSplitName} onChange={(event) => setSpeakerSplitName(event.target.value)} placeholder="New identity name" />
+              <div className="button-row">
+                <button
+                  disabled={!speakerSplitId.trim() || !speakerSplitEvidenceIds.trim() || !speakerSplitName.trim()}
+                  onClick={() => splitSpeakerMutation.mutate()}
+                >
+                  Split identity
+                </button>
+                <button onClick={() => rollbackSpeakerMutation.mutate()}>Rollback last identity change</button>
+              </div>
+            </div>
+
+            <div className="action-block">
+              <h3>Speaker identities</h3>
+              <div className="hint-text">
+                Promote only candidates that meet the cross-episode evidence threshold. Host and co-host roles may both be assigned.
+              </div>
+              <input
+                value={speakerCandidateName}
+                onChange={(event) => setSpeakerCandidateName(event.target.value)}
+                placeholder="Speaker display name"
+              />
+              <select value={speakerCandidateRole} onChange={(event) => setSpeakerCandidateRole(event.target.value)}>
+                <option value="guest">Guest</option>
+                <option value="co-host">Co-host</option>
+                <option value="host">Host</option>
+              </select>
+              <div className="audit-list">
+                {(speakerIdentitiesQuery.data?.workflow?.recurring_unknown_speakers ?? []).map((candidate) => (
+                  <div className="audit-item" key={String(candidate.candidate_id)}>
+                    <strong>{String(candidate.episode_count)} episodes | {String(candidate.total_duration_seconds)} seconds</strong>
+                    <span>{String(candidate.embedding_family)}</span>
+                    {(() => {
+                      const clips = Array.isArray(candidate.evidence_clips)
+                        ? candidate.evidence_clips as Array<Record<string, unknown>>
+                        : [];
+                      const clip = clips[0];
+                      const spans = Array.isArray(clip?.spans)
+                        ? clip.spans as Array<Record<string, unknown>>
+                        : [];
+                      const evidenceId = String(clip?.evidence_id ?? "");
+                      const start = Number(spans[0]?.start ?? 0);
+                      return evidenceId ? (
+                        <audio
+                          controls
+                          preload="none"
+                          src={speakerEvidenceAudioUrl(evidenceId)}
+                          onLoadedMetadata={(event) => {
+                            event.currentTarget.currentTime = start;
+                          }}
+                        />
+                      ) : null;
+                    })()}
+                    <button
+                      disabled={!speakerCandidateName.trim() || candidate.promotion_eligible !== true}
+                      onClick={() => promoteSpeakerMutation.mutate(String(candidate.candidate_id))}
+                    >
+                      Promote
+                    </button>
+                  </div>
+                ))}
               </div>
             </div>
 

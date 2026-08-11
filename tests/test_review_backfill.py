@@ -88,6 +88,7 @@ from podcast_transcribe.cli import (
     diarization_runtime_fingerprint,
     diarize_audio,
     exit_isolated_worker_after_success,
+    progress_spinner_name,
     load_diarization_history,
     normalize_episode_summary_row,
     parse_args,
@@ -115,6 +116,11 @@ class Word:
 
 
 class ReviewBackfillTests(unittest.TestCase):
+    def test_progress_spinner_is_ascii_safe_for_legacy_windows_encoding(self):
+        stream = SimpleNamespace(encoding="cp1252")
+        self.assertEqual(progress_spinner_name(stream), "line")
+        self.assertEqual(progress_spinner_name(SimpleNamespace(encoding="utf-8")), "dots")
+
     def test_isolated_worker_exits_only_after_successful_single_file_run(self):
         exit_codes = []
 
@@ -303,10 +309,15 @@ class ReviewBackfillTests(unittest.TestCase):
                 "alignment_artifact_reused": True,
                 "speaker_attribution_artifact_reused": True,
                 "deterministic_cleanup_artifact_reused": True,
+                "episode_contract_version": "episode-contract-v2",
+                "contract_upgrade_method": "native_v2_processing",
+                "contract_upgrade_archive_path": "",
             }
             write_episode_summary_csv(path, [row])
             text = path.read_text(encoding="utf-8")
             self.assertIn("alignment_provider", text)
+            self.assertIn("episode_contract_version", text)
+            self.assertIn("native_v2_processing", text)
             self.assertIn("timestamp_passthrough", text)
             self.assertIn("speaker_attribution_artifact_reused", text)
 
@@ -509,7 +520,8 @@ class ReviewBackfillTests(unittest.TestCase):
                 runtime_config=self._episode_qa_only_runtime_config(),
             )
 
-            self.assertEqual(state["state"], "needs_tier1")
+            self.assertEqual(state["state"], "needs_v2_full_reprocess")
+            self.assertEqual(state["legacy_processing_state"], "needs_tier1")
             self.assertIn("failed contract validation", state["cleaned_json_error"])
 
     def test_classifier_treats_legacy_baseline_as_complete_when_review_disabled(self):
@@ -527,7 +539,88 @@ class ReviewBackfillTests(unittest.TestCase):
                 runtime_config={"runtime_profile": "baseline_16gb", "backend": "none"},
             )
 
+            self.assertEqual(state["state"], "needs_v2_delta_upgrade")
+            self.assertEqual(state["legacy_processing_state"], "complete")
+
+    def test_classifier_reprocesses_legacy_bundle_without_speaker_identity_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio_path = root / "Episode 20260512.mp3"
+            audio_path.write_bytes(b"audio")
+            self._write_baseline_bundle(root, audio_path.name)
+            cleaned_path = root / "Episode 20260512_cleaned_speaker_transcript.json"
+            payload = json.loads(cleaned_path.read_text(encoding="utf-8"))
+            payload.pop("speaker_identity_evidence_complete", None)
+            payload.pop("speaker_identity_evidence", None)
+            payload["metadata"].pop("speaker_identity_evidence_complete", None)
+            payload["metadata"].pop("speaker_identity_evidence", None)
+            payload["contract_version"] = "episode-contract-v1"
+            cleaned_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            state = classify_episode_processing_state(
+                audio_path,
+                root,
+                processed_files={audio_path.name: {}},
+                existing_summary_rows={audio_path.name: {"episode": audio_path.name}},
+                runtime_config={"runtime_profile": "baseline_16gb", "backend": "none"},
+            )
+
+            self.assertEqual(state["state"], "needs_v2_full_reprocess")
+            self.assertEqual(state["legacy_processing_state"], "complete")
+
+    def test_classifier_uses_cached_rebuild_when_legacy_evidence_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio_path = root / "Episode 20260512.mp3"
+            audio_path.write_bytes(b"audio")
+            self._write_baseline_bundle(root, audio_path.name)
+            cleaned_path = root / "Episode 20260512_cleaned_speaker_transcript.json"
+            payload = json.loads(cleaned_path.read_text(encoding="utf-8"))
+            payload.pop("speaker_identity_evidence_complete", None)
+            payload.pop("speaker_identity_evidence", None)
+            payload["metadata"].pop("speaker_identity_evidence_complete", None)
+            payload["metadata"].pop("speaker_identity_evidence", None)
+            payload["contract_version"] = "episode-contract-v1"
+            cleaned_path.write_text(json.dumps(payload), encoding="utf-8")
+            artifact_dir = root / "_processing_artifacts" / audio_path.stem
+            artifact_dir.mkdir(parents=True)
+            (artifact_dir / "transcription.json").write_text(
+                json.dumps({"artifact_version": 2, "payload": {"segments": []}}),
+                encoding="utf-8",
+            )
+
+            state = classify_episode_processing_state(
+                audio_path,
+                root,
+                processed_files={audio_path.name: {}},
+                existing_summary_rows={audio_path.name: {"episode": audio_path.name}},
+                runtime_config={"runtime_profile": "baseline_16gb", "backend": "none"},
+            )
+
+            self.assertEqual(state["state"], "needs_v2_cached_rebuild")
+            self.assertEqual(state["legacy_processing_state"], "complete")
+
+    def test_classifier_skips_complete_v2_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio_path = root / "Episode 20260512.mp3"
+            audio_path.write_bytes(b"audio")
+            self._write_baseline_bundle(root, audio_path.name)
+            (root / "Episode 20260512_manifest.json").write_text(
+                json.dumps({"contract_version": "episode-contract-v2"}),
+                encoding="utf-8",
+            )
+
+            state = classify_episode_processing_state(
+                audio_path,
+                root,
+                processed_files={audio_path.name: {}},
+                existing_summary_rows={audio_path.name: {"episode": audio_path.name}},
+                runtime_config={"runtime_profile": "baseline_16gb", "backend": "none"},
+            )
+
             self.assertEqual(state["state"], "complete")
+            self.assertEqual(state["episode_contract_status"], "v2_complete")
 
     def test_classifier_requests_tier1_delta_when_alignment_provider_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -557,7 +650,7 @@ class ReviewBackfillTests(unittest.TestCase):
                 {"alignment_provider": "whisperx", "backend": "none"},
             )
 
-            self.assertEqual(state["state"], "needs_tier1")
+            self.assertEqual(state["state"], "needs_v2_full_reprocess")
             self.assertEqual(state["provider_shortfalls"], ["alignment:provider"])
 
     def test_classifier_requests_alignment_delta_for_legacy_unproven_output(self):
@@ -577,7 +670,7 @@ class ReviewBackfillTests(unittest.TestCase):
                 {"alignment_provider": "whisperx", "backend": "none"},
             )
 
-            self.assertEqual(state["state"], "needs_tier1")
+            self.assertEqual(state["state"], "needs_v2_full_reprocess")
             self.assertEqual(state["provider_shortfalls"], ["alignment:unproven_provider"])
 
     def test_classifier_treats_current_reviewed_bundle_as_complete_even_with_stale_summary(self):
@@ -596,7 +689,7 @@ class ReviewBackfillTests(unittest.TestCase):
                 runtime_config=self._episode_qa_only_runtime_config(),
             )
 
-            self.assertEqual(state["state"], "complete")
+            self.assertEqual(state["state"], "needs_v2_delta_upgrade")
             self.assertEqual(state["review_bundle_status"], "current_review_complete")
 
     def test_classifier_marks_legacy_reviewed_bundle_without_stage_proof_for_tier2_backfill(self):

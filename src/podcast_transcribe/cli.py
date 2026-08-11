@@ -18,13 +18,40 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-def configure_ffmpeg_dll_directory():
-    ffmpeg_bin_dir = os.getenv("PODCAST_TRANSCRIBE_FFMPEG_BIN_DIR") or os.getenv("FFMPEG_BIN_DIR")
-    if os.name != "nt" or not ffmpeg_bin_dir or not hasattr(os, "add_dll_directory"):
-        return
+_FFMPEG_DLL_DIRECTORY_HANDLE = None
+_FFMPEG_DLL_HANDLES = []
 
-    if os.path.isdir(ffmpeg_bin_dir):
-        os.add_dll_directory(ffmpeg_bin_dir)
+
+def configure_ffmpeg_dll_directory():
+    global _FFMPEG_DLL_DIRECTORY_HANDLE
+    ffmpeg_bin_dir = os.getenv("PODCAST_TRANSCRIBE_FFMPEG_BIN_DIR") or os.getenv("FFMPEG_BIN_DIR")
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+    if not ffmpeg_bin_dir and Path(r"C:\ffmpeg7\bin").is_dir():
+        ffmpeg_bin_dir = r"C:\ffmpeg7\bin"
+
+    if ffmpeg_bin_dir and os.path.isdir(ffmpeg_bin_dir):
+        if list(Path(ffmpeg_bin_dir).glob("avcodec-62.dll")):
+            raise RuntimeError(
+                "The configured FFmpeg directory contains FFmpeg 8 shared libraries, "
+                "which TorchCodec 0.8.1 does not support on Windows. Configure a shared "
+                "FFmpeg 4-7 build, such as C:\\ffmpeg7\\bin."
+            )
+        _FFMPEG_DLL_DIRECTORY_HANDLE = os.add_dll_directory(ffmpeg_bin_dir)
+        # TorchCodec probes several FFmpeg ABI variants. Preloading the configured
+        # shared build prevents an incompatible FFmpeg elsewhere on PATH from
+        # triggering a modal Windows loader error before the probe can recover.
+        for pattern in (
+            "avutil-*.dll",
+            "swresample-*.dll",
+            "swscale-*.dll",
+            "avcodec-*.dll",
+            "avformat-*.dll",
+            "avfilter-*.dll",
+            "avdevice-*.dll",
+        ):
+            for dll_path in sorted(Path(ffmpeg_bin_dir).glob(pattern)):
+                _FFMPEG_DLL_HANDLES.append(ctypes.WinDLL(str(dll_path)))
 
 
 configure_ffmpeg_dll_directory()
@@ -121,6 +148,14 @@ from podcast_transcribe.contract import (
     validate_reviewed_transcript_payload,
     validate_transcript_payload,
 )
+from podcast_transcribe.contract_v2 import (
+    EPISODE_CONTRACT_V2,
+    archive_legacy_episode_bundle,
+    episode_contract_status,
+    load_correction_lineage,
+    stable_episode_uid,
+    upgrade_episode_bundle_v2,
+)
 from podcast_transcribe.outputs import (
     build_episode_metadata,
     write_batch_report_md as output_write_batch_report_md,
@@ -179,6 +214,7 @@ from podcast_transcribe.speakers import (
     merge_profile as speaker_merge_profile,
     reference_sample_quality,
 )
+from podcast_transcribe.speaker_workflow import build_cross_episode_speaker_view
 
 
 SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
@@ -272,10 +308,16 @@ class ProgressHook:
             self.progress.refresh()
 
 
+def progress_spinner_name(output_stream=None) -> str:
+    stream = output_stream if output_stream is not None else sys.stdout
+    encoding = str(getattr(stream, "encoding", "") or "").lower()
+    return "dots" if "utf" in encoding else "line"
+
+
 def create_stage_progress(transient: bool = False) -> Progress:
     return Progress(
         TextColumn("[progress.description]{task.description}"),
-        SpinnerColumn(),
+        SpinnerColumn(progress_spinner_name()),
         BarColumn(),
         TaskProgressColumn(),
         TimeRemainingColumn(elapsed_when_finished=True),
@@ -859,8 +901,13 @@ def parse_args():
     )
     parser.add_argument(
         "--gold-set-dir",
-        default=str(Path(__file__).resolve().parents[2] / "benchmarks" / "pipeline_gold_set"),
+        default="",
         help="Directory containing the pipeline gold-set manifest and reference transcript JSON files.",
+    )
+    parser.add_argument(
+        "--evaluation-pack-path",
+        default="",
+        help="External private evaluation-pack directory. Takes precedence over --gold-set-dir.",
     )
     parser.add_argument(
         "--benchmark-candidate-dir",
@@ -2367,7 +2414,7 @@ def load_known_speaker_profiles(
         if not isinstance(entry, dict):
             continue
 
-        name = str(entry.get("name", "")).strip()
+        name = str(entry.get("display_name") or entry.get("name") or "").strip()
         files = entry.get("files", [])
         if not name or not isinstance(files, list):
             continue
@@ -2393,8 +2440,15 @@ def load_known_speaker_profiles(
 
         profiles[name] = {
             "name": name,
+            "speaker_id": str(entry.get("speaker_id") or ""),
+            "aliases": list(entry.get("aliases") or []),
+            "roles": list(entry.get("roles") or (["host"] if entry.get("is_host") else ["guest"])),
             "embedding": averaged,
-            "is_host": bool(entry.get("is_host", False)) or name.upper() == "HOST",
+            "is_host": (
+                bool(entry.get("is_host", False))
+                or name.upper() == "HOST"
+                or any(str(role).lower() in {"host", "co-host"} for role in entry.get("roles") or [])
+            ),
             "sample_files": resolved_files,
             "sample_quality": sample_quality,
         }
@@ -2480,6 +2534,8 @@ def match_known_speakers(
             continue
         assignments[diarized_speaker] = {
             "known_name": known_name,
+            "speaker_id": str(known_profiles[known_name].get("speaker_id") or ""),
+            "roles": list(known_profiles[known_name].get("roles") or []),
             "score": score,
             "is_host": bool(known_profiles[known_name].get("is_host", False)),
         }
@@ -2511,6 +2567,7 @@ def rename_speakers(
 
     for segment in segments:
         if segment.speaker in mapping:
+            segment.original_speaker = segment.speaker
             segment.speaker = mapping[segment.speaker]
         for word in segment.words:
             if word.speaker in mapping:
@@ -2844,6 +2901,9 @@ def build_episode_summary_row(
         "recurring_unnamed_speaker_flag": False,
         "host_profile_stability_flag": False,
         "processing_mode": "",
+        "episode_contract_version": "",
+        "contract_upgrade_method": "",
+        "contract_upgrade_archive_path": "",
         "tier1_reused_from_existing": False,
         "review_backfilled_from_cleaned_json": False,
         "diarization_mode": "",
@@ -2942,6 +3002,9 @@ def write_episode_summary_csv(path: Path, rows: List[Dict[str, object]]):
         "recurring_unnamed_speaker_flag",
         "host_profile_stability_flag",
         "processing_mode",
+        "episode_contract_version",
+        "contract_upgrade_method",
+        "contract_upgrade_archive_path",
         "tier1_reused_from_existing",
         "review_backfilled_from_cleaned_json",
         "diarization_mode",
@@ -3565,6 +3628,16 @@ def classify_episode_processing_state(
         except RuntimeError as exc:
             cleaned_json_error = str(exc)
     reviewed_bundle = reviewed_output_bundle_status(audio_path, output_dir, resolved_review)
+    manifest_path = output_dir / f"{audio_path.stem}_manifest.json"
+    manifest_payload: Dict[str, object] = {}
+    if manifest_path.exists():
+        try:
+            loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded_manifest, dict):
+                manifest_payload = loaded_manifest
+        except (OSError, json.JSONDecodeError):
+            pass
+    contract_status = episode_contract_status(cleaned_payload, manifest_payload)
     baseline_complete = baseline_resume_complete
     provider_shortfalls = provider_configuration_shortfall(cleaned_payload, runtime_config)
     if resolved_review["any_review_enabled"]:
@@ -3582,8 +3655,62 @@ def classify_episode_processing_state(
     else:
         state = "needs_tier1"
 
+    legacy_processing_state = state
+    if contract_status["status"] != "v2_complete":
+        speaker_evidence_complete = bool(
+            (cleaned_payload or {}).get("speaker_identity_evidence_complete")
+            or (cleaned_payload or {}).get("speaker_identity_evidence")
+            or (
+                ((cleaned_payload or {}).get("metadata") or {}).get("speaker_identity_evidence_complete")
+                if isinstance((cleaned_payload or {}).get("metadata"), dict)
+                else False
+            )
+            or (
+                ((cleaned_payload or {}).get("metadata") or {}).get("speaker_identity_evidence")
+                if isinstance((cleaned_payload or {}).get("metadata"), dict)
+                else []
+            )
+            or not (cleaned_payload or {}).get("segments")
+        )
+        speaker_artifact_path = (
+            output_dir / ARTIFACT_DIRNAME / audio_path.stem / "speaker_attribution.json"
+        )
+        cached_speaker_evidence = False
+        if speaker_artifact_path.exists():
+            try:
+                artifact_payload = json.loads(
+                    speaker_artifact_path.read_text(encoding="utf-8-sig")
+                )
+                stage_payload = artifact_payload.get("payload") or {}
+                stage_metadata = (
+                    stage_payload.get("metadata")
+                    if isinstance(stage_payload, dict)
+                    else {}
+                )
+                cached_speaker_evidence = bool(
+                    isinstance(stage_metadata, dict)
+                    and stage_metadata.get("speaker_identity_evidence")
+                )
+            except (OSError, json.JSONDecodeError):
+                cached_speaker_evidence = False
+        if state == "complete" and speaker_evidence_complete:
+            state = "needs_v2_delta_upgrade"
+        elif state == "needs_tier2_only" and speaker_evidence_complete:
+            pass
+        elif cached_speaker_evidence or (
+            (output_dir / ARTIFACT_DIRNAME / audio_path.stem).exists()
+            and any((output_dir / ARTIFACT_DIRNAME / audio_path.stem).glob("*.json"))
+        ):
+            state = "needs_v2_cached_rebuild"
+        else:
+            state = "needs_v2_full_reprocess" if audio_path.exists() else "v2_upgrade_blocked"
+
     return {
         "state": state,
+        "legacy_processing_state": legacy_processing_state,
+        "episode_contract_target": EPISODE_CONTRACT_V2,
+        "episode_contract_status": contract_status["status"],
+        "episode_contract_reason": contract_status["reason"],
         "baseline_complete": baseline_complete,
         "baseline_bundle_complete": baseline_bundle_complete,
         "baseline_resume_complete": baseline_resume_complete,
@@ -3614,7 +3741,36 @@ def is_file_already_processed(
         existing_summary_rows,
         runtime_config,
     )
-    return state["state"] == "complete"
+    return state["state"] in {"complete", "v2_complete"}
+
+
+def state_requires_tier1(state: str) -> bool:
+    return state in {"needs_tier1", "needs_v2_cached_rebuild", "needs_v2_full_reprocess"}
+
+
+def process_v2_delta_upgrade(
+    audio_path: Path,
+    output_dir: Path,
+    existing_summary_row: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    print(f"Processing {audio_path.name}")
+    print_episode_mode("v2 contract delta upgrade")
+    print_episode_stage(1, 2, "archive legacy contract artifacts")
+    result = upgrade_episode_bundle_v2(audio_path, output_dir)
+    print_episode_stage(2, 2, "write episode-contract-v2 metadata")
+    summary = dict(existing_summary_row or {})
+    summary.setdefault("episode", audio_path.name)
+    summary.update(
+        {
+            "processing_mode": "v2 contract delta upgrade",
+            "episode_contract_version": EPISODE_CONTRACT_V2,
+            "contract_upgrade_method": result["upgrade_method"],
+            "contract_upgrade_archive_path": result["archive_path"],
+            "tier1_reused_from_existing": True,
+        }
+    )
+    print(f"  upgraded files: {len(result['upgraded_files'])}")
+    return summary
 
 
 def reviewed_text_version_from_metadata(review_metadata: Dict[str, object]) -> str:
@@ -3754,6 +3910,7 @@ def process_review_backfill_from_cleaned_json(
     print_episode_stage(1, 3, "load cleaned transcript")
     cleaned_path = cleaned_json_output_path(audio_path, output_dir)
     cleaned_payload = load_cleaned_transcript_payload(cleaned_path)
+    archive_legacy_episode_bundle(audio_path, output_dir)
     cleaned_segments = segment_items_from_cleaned_payload(cleaned_payload)
     runtime_review_config = resolve_review_runtime_config(runtime_config or {})
     print_episode_stage(2, 3, "review")
@@ -3787,18 +3944,27 @@ def process_review_backfill_from_cleaned_json(
         for key, value in (cleaned_payload.get("speaker_mapping") or {}).items()
         if value not in ("", None)
     }
+    known_assignments = {
+        str(key): value
+        for key, value in (cleaned_payload.get("known_speaker_assignments") or {}).items()
+        if isinstance(value, dict)
+    }
     resolved_host_label = speaker_mapping.get(str(host_speaker), "HOST") if host_speaker else "HOST"
-    host_output_labels = {resolved_host_label, "HOST"}
+    host_output_labels = {
+        resolved_host_label,
+        "HOST",
+        *[
+            speaker_mapping.get(speaker_id, speaker_id)
+            for speaker_id, assignment in known_assignments.items()
+            if assignment.get("is_host")
+            or any(str(role).lower() in {"host", "co-host"} for role in assignment.get("roles") or [])
+        ],
+    }
     episode_metadata = cleaned_payload.get("metadata") if isinstance(cleaned_payload.get("metadata"), dict) else {}
     durations = {
         str(key): float(value)
         for key, value in (cleaned_payload.get("speaker_durations_seconds") or {}).items()
         if value not in ("", None)
-    }
-    known_assignments = {
-        str(key): value
-        for key, value in (cleaned_payload.get("known_speaker_assignments") or {}).items()
-        if isinstance(value, dict)
     }
     diarized_turns = [
         turn for turn in (cleaned_payload.get("diarization_turns") or []) if isinstance(turn, dict)
@@ -3846,6 +4012,9 @@ def process_review_backfill_from_cleaned_json(
         timings={"review_backfill": time.perf_counter() - started, "total": time.perf_counter() - started},
         summary=summary_row,
     )
+    upgrade_episode_bundle_v2(audio_path, output_dir, method="tier2_backfill_contract_upgrade")
+    summary_row["episode_contract_version"] = EPISODE_CONTRACT_V2
+    summary_row["contract_upgrade_method"] = "tier2_backfill_contract_upgrade"
     print(f"  reviewed output written: {bool(reviewed_paths)}")
     return summary_row
 
@@ -3969,6 +4138,26 @@ def write_run_reports(output_dir: Path, rows: List[Dict[str, object]], elapsed_s
     )
     output_write_review_run_report(output_dir, rows, elapsed_seconds=elapsed_seconds)
     output_write_speaker_workflow_report(output_dir, rows)
+    evidence_report = build_cross_episode_speaker_view(output_dir)
+    (output_dir / "_speaker_workflow_report.json").write_text(
+        json.dumps(evidence_report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    lines = [
+        "# Speaker Workflow Report",
+        "",
+        f"- Identity basis: {evidence_report['identity_basis']}",
+        f"- Evidence rows: {evidence_report['row_count']}",
+        f"- Recurring embedding-backed candidates: {len(evidence_report['recurring_unknown_speakers'])}",
+        "",
+    ]
+    for candidate in evidence_report["recurring_unknown_speakers"]:
+        lines.append(
+            f"- {candidate['candidate_id']}: episodes={candidate['episode_count']}, "
+            f"duration={candidate['total_duration_seconds']:.1f}s, "
+            f"promotion_eligible={candidate['promotion_eligible']}"
+        )
+    (output_dir / "_speaker_workflow_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def print_final_review_summary(rows: List[Dict[str, object]]):
@@ -4041,7 +4230,7 @@ def run_speaker_attribution_stage(
     assume_dominant: bool, max_embedding_seconds: float, min_host_seconds: float,
     historical_similarity_scores: Dict[str, List[float]], alignment_fingerprint: Dict[str, object],
     diarization_fingerprint: Dict[str, object], resume_intermediates: bool,
-) -> Tuple[Optional[str], Optional[np.ndarray], Dict[str, float], Dict[str, float], Dict[str, Dict[str, object]], Dict[str, str], List[Dict[str, object]], Dict[str, object], bool]:
+) -> Tuple[Optional[str], Optional[np.ndarray], Dict[str, float], Dict[str, float], Dict[str, Dict[str, object]], Dict[str, str], List[Dict[str, object]], List[Dict[str, object]], Dict[str, object], bool]:
     def file_revision(value: Optional[str]) -> Dict[str, object]:
         if not value:
             return {}
@@ -4067,12 +4256,18 @@ def run_speaker_attribution_stage(
     fingerprint = build_fingerprint()
     cached = load_segment_stage_artifact(output_dir, audio_path, "speaker_attribution", fingerprint) if resume_intermediates else None
     if cached:
+        cached_metadata = cached.get("metadata") if isinstance(cached.get("metadata"), dict) else {}
+        if not cached_metadata.get("speaker_identity_evidence"):
+            print("  speaker attribution: legacy cache lacks identity evidence; rebuilding")
+            cached = None
+    if cached:
         print("  speaker attribution: reused cached artifact")
         segments[:] = cached["segments"]
         metadata = cached.get("metadata") if isinstance(cached.get("metadata"), dict) else {}
         return (metadata.get("host_speaker"), None, dict(metadata.get("durations") or {}),
                 dict(metadata.get("similarity_scores") or {}), dict(metadata.get("known_assignments") or {}),
-                dict(metadata.get("speaker_mapping") or {}), list(metadata.get("drift_alerts") or []), fingerprint, True)
+                dict(metadata.get("speaker_mapping") or {}), list(metadata.get("drift_alerts") or []),
+                list(metadata.get("speaker_identity_evidence") or []), fingerprint, True)
     existing_profile = load_host_profile(host_profile_path, speaker_embedding_identity)
     host_speaker, speaker_embeddings, updated_profile, durations, similarity_scores = choose_host_speaker(
         verifier=verifier, audio_path=str(audio_path), diarized_turns=diarized_turns, host_reference_path=host_reference,
@@ -4087,16 +4282,55 @@ def run_speaker_attribution_stage(
     speaker_mapping = rename_speakers(segments, diarized_turns, host_speaker, durations, known_assignments=known_assignments)
     current_scores = {speaker_mapping.get(speaker_id, speaker_id): score for speaker_id, score in similarity_scores.items()}
     drift_alerts = detect_speaker_similarity_drift(current_scores, historical_similarity_scores)
+    speaker_identity_evidence = []
+    for local_speaker, embedding in sorted(speaker_embeddings.items()):
+        spans = sorted(
+            [
+                {
+                    "start": round(float(turn.get("start") or 0.0), 3),
+                    "end": round(float(turn.get("end") or 0.0), 3),
+                }
+                for turn in diarized_turns
+                if str(turn.get("speaker") or "") == str(local_speaker)
+            ],
+            key=lambda item: (-(item["end"] - item["start"]), item["start"]),
+        )[:5]
+        evidence_identity = {
+            "episode_id": audio_path.stem,
+            "local_speaker": local_speaker,
+            "embedding_family": f"{speaker_embedding_identity.provider}:{speaker_embedding_identity.model}",
+            "spans": spans,
+        }
+        speaker_identity_evidence.append(
+            {
+                "evidence_version": 1,
+                "evidence_id": f"speaker_evidence_{hashlib.sha256(json.dumps(evidence_identity, sort_keys=True).encode('utf-8')).hexdigest()}",
+                "episode_id": audio_path.stem,
+                "source_audio": str(audio_path),
+                "local_speaker": local_speaker,
+                "assigned_label": speaker_mapping.get(local_speaker, local_speaker),
+                "known_speaker_assignment": known_assignments.get(local_speaker) or {},
+                "is_host": local_speaker == host_speaker,
+                "duration_seconds": round(float(durations.get(local_speaker) or 0.0), 3),
+                "quality_score": round(min(1.0, float(durations.get(local_speaker) or 0.0) / 60.0), 4),
+                "embedding_family": f"{speaker_embedding_identity.provider}:{speaker_embedding_identity.model}",
+                "embedding_provider": speaker_embedding_identity.to_payload(),
+                "embedding_dimension": int(embedding.size),
+                "embedding": [round(float(value), 8) for value in embedding.reshape(-1).tolist()],
+                "spans": spans,
+            }
+        )
     if updated_profile is not None and host_speaker is not None:
         save_host_profile(host_profile_path, updated_profile, str(audio_path), speaker_embedding_identity)
         fingerprint = build_fingerprint()
     save_segment_stage_artifact(
         output_dir, audio_path, "speaker_attribution", segments,
         {"host_speaker": host_speaker, "durations": durations, "similarity_scores": similarity_scores,
-         "known_assignments": known_assignments, "speaker_mapping": speaker_mapping, "drift_alerts": drift_alerts},
+         "known_assignments": known_assignments, "speaker_mapping": speaker_mapping, "drift_alerts": drift_alerts,
+         "speaker_identity_evidence": speaker_identity_evidence},
         fingerprint, [alignment_fingerprint, diarization_fingerprint],
     )
-    return host_speaker, updated_profile, durations, similarity_scores, known_assignments, speaker_mapping, drift_alerts, fingerprint, False
+    return host_speaker, updated_profile, durations, similarity_scores, known_assignments, speaker_mapping, drift_alerts, speaker_identity_evidence, fingerprint, False
 
 
 def run_deterministic_cleanup_stage(
@@ -4270,7 +4504,7 @@ def process_file(
 
     print_episode_stage(4, 6, "speaker matching")
     matching_started = time.perf_counter()
-    host_speaker, updated_profile, durations, similarity_scores, known_assignments, speaker_mapping, drift_alerts, speaker_attribution_fingerprint, speaker_attribution_reused = run_speaker_attribution_stage(
+    host_speaker, updated_profile, durations, similarity_scores, known_assignments, speaker_mapping, drift_alerts, speaker_identity_evidence, speaker_attribution_fingerprint, speaker_attribution_reused = run_speaker_attribution_stage(
         output_dir=output_dir, audio_path=audio_path, segments=segments, diarized_turns=diarized_turns,
         verifier=verifier, speaker_embedding_identity=speaker_embedding_identity, host_reference=host_reference,
         host_profile_path=host_profile_path, known_speaker_profiles=known_speaker_profiles, host_threshold=host_threshold,
@@ -4311,7 +4545,16 @@ def process_file(
         },
     )
     resolved_host_label = speaker_mapping.get(host_speaker, "HOST") if host_speaker else "HOST"
-    host_output_labels = {resolved_host_label, "HOST"}
+    host_output_labels = {
+        resolved_host_label,
+        "HOST",
+        *[
+            speaker_mapping.get(speaker_id, speaker_id)
+            for speaker_id, assignment in known_assignments.items()
+            if assignment.get("is_host")
+            or any(str(role).lower() in {"host", "co-host"} for role in assignment.get("roles") or [])
+        ],
+    }
     review_rows = collect_review_rows(
         source_file=str(audio_path),
         segments=normalized_segments,
@@ -4380,7 +4623,10 @@ def process_file(
     }
     episode_metadata = {
         **build_episode_metadata(str(audio_path), filename_date_config),
+        "episode_uid": stable_episode_uid(str(audio_path), audio_file_fingerprint(audio_path)),
         "stage_provenance": stage_provenance,
+        "speaker_identity_evidence": speaker_identity_evidence,
+        "correction_lineage": load_correction_lineage(output_dir, audio_path.stem),
     }
     output_write_text_transcript(
         output_dir / f"{base_name}_speaker_transcript.txt",
@@ -4510,6 +4756,8 @@ def process_file(
     summary_row["processing_mode"] = "tier1+tier2" if resolve_review_runtime_config(runtime_config or {}).get("any_review_enabled") else "tier1-only"
     summary_row["tier1_reused_from_existing"] = False
     summary_row["review_backfilled_from_cleaned_json"] = False
+    summary_row["episode_contract_version"] = EPISODE_CONTRACT_V2
+    summary_row["contract_upgrade_method"] = "native_v2_processing"
     summary_row["diarization_mode"] = str(diarization_metadata.get("mode") or "")
     summary_row["diarization_probe_attempted"] = bool(diarization_metadata.get("probe"))
     summary_row["diarization_learned_route"] = bool(diarization_metadata.get("learned_route"))
@@ -4621,7 +4869,13 @@ def run_review_benchmark_mode(args, output_dir: Path):
 
 
 def run_pipeline_benchmark_mode(args, output_dir: Path):
-    gold_set_dir = Path(args.gold_set_dir).resolve()
+    configured_pack = str(getattr(args, "evaluation_pack_path", "") or "").strip()
+    configured_gold = str(getattr(args, "gold_set_dir", "") or "").strip()
+    gold_set_dir = Path(
+        configured_pack
+        or configured_gold
+        or (Path(__file__).resolve().parents[2] / "benchmarks" / "pipeline_gold_set")
+    ).resolve()
     candidate_dir = Path(args.benchmark_candidate_dir).resolve() if args.benchmark_candidate_dir else output_dir.resolve()
     print("Pipeline quality benchmark mode")
     print(f"  gold set: {gold_set_dir}")
@@ -4797,7 +5051,7 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
         for audio_path in audio_files
         if episode_states[audio_path.name]["state"] != "complete"
     ]
-    if any(episode_states[audio_path.name]["state"] == "needs_tier1" for audio_path in pending_audio_files):
+    if any(state_requires_tier1(str(episode_states[audio_path.name]["state"])) for audio_path in pending_audio_files):
         load_replacement_map(args.replacement_map_json)
     total_files = len(audio_files)
     batch_started = time.perf_counter()
@@ -4861,10 +5115,17 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
                 f"Provider delta for {audio_path.name}: "
                 f"{', '.join(state_info['provider_shortfalls'])}; compatible stage artifacts will be reused."
             )
-        print(
-            f"Processing mode for {audio_path.name}: "
-            f"{'tier2-only backfill' if state_info['state'] == 'needs_tier2_only' else 'tier1+tier2'}"
-        )
+        mode_labels = {
+            "needs_tier2_only": "tier2-only backfill",
+            "needs_v2_delta_upgrade": "v2 contract delta upgrade",
+            "needs_v2_cached_rebuild": "v2 cached rebuild",
+            "needs_v2_full_reprocess": "v2 full reprocess",
+            "v2_upgrade_blocked": "v2 upgrade blocked",
+        }
+        print(f"Processing mode for {audio_path.name}: {mode_labels.get(str(state_info['state']), 'tier1+tier2')}")
+        if state_info["state"] == "v2_upgrade_blocked":
+            print(f"V2 upgrade blocked for {audio_path.name}: source audio or required artifacts are unavailable.")
+            continue
 
         command = build_child_process_command(args, audio_path, output_dir)
         try:
@@ -4887,7 +5148,7 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
                 existing_summary_rows,
                 effective_runtime_config,
             )
-            if refreshed_state["state"] == "complete":
+            if refreshed_state["state"] in {"complete", "v2_complete"}:
                 print(
                     f"Child process for {audio_path.name} exited with code {result.returncode} "
                     "after writing all expected outputs; continuing batch."
@@ -5016,7 +5277,7 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
         if resolved_review_runtime.get("any_review_enabled") and resolved_review_runtime.get("backend_ready")
         else None
     )
-    needs_tier1 = any(state["state"] == "needs_tier1" for state in episode_states.values())
+    needs_tier1 = any(state_requires_tier1(str(state["state"])) for state in episode_states.values())
     preferred_terms: List[str] = []
     initial_prompt = None
     hotwords = None
@@ -5038,7 +5299,10 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
             known_speaker_profiles,
         ) = load_models(args, device)
     else:
-        print("No tier-1 work required; running review backfill from existing cleaned JSON outputs only.")
+        if resolved_review_runtime.get("any_review_enabled"):
+            print("No tier-1 work required; running review backfill from existing cleaned JSON outputs only.")
+        else:
+            print("No processing work required; all selected episodes already satisfy the active contract.")
 
     total_files = len(audio_files)
     is_single_episode_worker = bool(args.input_file) or total_files == 1
@@ -5102,12 +5366,25 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
                     f"Provider delta for {audio_path.name}: "
                     f"{', '.join(state_info['provider_shortfalls'])}; compatible stage artifacts will be reused."
                 )
-            print(
-                f"Processing mode for {audio_path.name}: "
-                f"{'tier2-only backfill' if state_info['state'] == 'needs_tier2_only' else 'tier1+tier2'}"
-            )
+            mode_labels = {
+                "needs_tier2_only": "tier2-only backfill",
+                "needs_v2_delta_upgrade": "v2 contract delta upgrade",
+                "needs_v2_cached_rebuild": "v2 cached rebuild",
+                "needs_v2_full_reprocess": "v2 full reprocess",
+                "v2_upgrade_blocked": "v2 upgrade blocked",
+            }
+            print(f"Processing mode for {audio_path.name}: {mode_labels.get(str(state_info['state']), 'tier1+tier2')}")
 
-        if state_info["state"] == "needs_tier2_only":
+        if state_info["state"] == "needs_v2_delta_upgrade":
+            episode_summary = process_v2_delta_upgrade(
+                audio_path,
+                output_dir,
+                episode_summary_rows_by_name.get(audio_path.name),
+            )
+        elif state_info["state"] == "v2_upgrade_blocked":
+            print(f"V2 upgrade blocked for {audio_path.name}: source audio or required artifacts are unavailable.")
+            continue
+        elif state_info["state"] == "needs_tier2_only":
             episode_summary = process_review_backfill_from_cleaned_json(
                 audio_path=audio_path,
                 output_dir=output_dir,
@@ -5116,6 +5393,10 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
                 existing_summary_row=episode_summary_rows_by_name.get(audio_path.name),
             )
         else:
+            if state_info["state"] in {"needs_v2_cached_rebuild", "needs_v2_full_reprocess"}:
+                archive_path = archive_legacy_episode_bundle(audio_path, output_dir)
+                if archive_path is not None:
+                    print(f"  archived legacy v1 contract artifacts: {archive_path}")
             episode_summary = process_file(
                 audio_path=audio_path,
                 output_dir=output_dir,
@@ -5214,7 +5495,7 @@ def main():
             existing_summary_rows,
             effective_runtime_config,
         )["state"]
-        == "needs_tier1"
+        in {"needs_tier1", "needs_v2_cached_rebuild", "needs_v2_full_reprocess"}
         for audio_path in audio_files
     )
 

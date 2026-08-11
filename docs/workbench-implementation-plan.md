@@ -10,7 +10,9 @@ The initial workbench foundation described by this plan is now implemented:
 - launcher-provided project/output defaults and automatic dependency/build handling
 - cleaned/reviewed transcript comparison and semantic scan caching
 - correction CSV, preferred-term, and replacement-map preview/apply flows
-- gold-set segment annotation for pipeline-quality benchmarking
+- correction-manifest-v2 history, corrected siblings, downstream notification, and rollback
+- external private evaluation-pack queues, guided 12-episode campaign initialization, adjudication history, and baseline acceptance
+- embedding-backed recurring-speaker candidates with role assignment, promotion, merge/split, and rollback
 - project-local Teach-Me rule induction, bounded validation, approval, current-episode rerun, and optional backfill APIs/UI
 
 The phases below are therefore forward-looking maturity work. They should not be read as prerequisites for the current workbench to launch or process existing outputs.
@@ -29,8 +31,8 @@ The default rule throughout is:
 
 - read cleaned transcript JSON as the canonical episode layer
 - treat reviewed JSON as additive comparison/provenance
-- never edit transcript outputs directly
-- write approved fixes back into pipeline input artifacts only
+- never overwrite raw, cleaned, or reviewed transcript outputs
+- write approved fixes as corrected siblings plus reproducible pipeline correction inputs
 
 ## Phase 1: Stabilize the Core Review Surface
 

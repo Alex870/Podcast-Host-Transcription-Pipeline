@@ -40,6 +40,31 @@ Recommended episode date fields:
 
 The executable contract for this repository lives in `src/podcast_transcribe/contract.py`. It defines the current transcript schema version and required fields and is used before transcript JSON outputs are written.
 
+### Episode contract v2
+
+`episode-contract-v2` is the bundle-level processing contract layered additively over the transcript schema. Native new outputs and upgraded legacy outputs record:
+
+- `contract_version`
+- stable `episode_id` and `episode_uid`
+- `source_fingerprint`
+- `artifact_provenance`
+- `completed_processing_stages`
+- `correction_lineage`
+- `speaker_identity_evidence`
+- `contract_upgrade`
+
+The manifest uses the same contract and includes SHA-256 artifact hashes. Legacy v1 JSON/manifests are archived before promotion. Existing transcript fields and filenames remain valid for downstream readers.
+
+### Correction manifest v2
+
+`correction-manifest-v2` records deterministic correction IDs, correction kind/scope, exact source anchors, before-value guards, approval status, supersession links, and provenance. Readers continue to accept `correction-manifest-v1` and normalize it in memory; historical v1 files are never rewritten.
+
+Approved corrections produce additive `corrected_human` transcript siblings and a compatibility CSV projection. Podcast-RAG consumes correction notifications to plan document deltas. RAGScope consumes affected source-span IDs to mark judgments for re-review.
+
+### Speaker identity evidence
+
+Episode-local diarization labels are not globally meaningful. Cross-episode candidates must be derived from versioned embeddings that share the same provider/model family. Candidate clustering uses conservative complete-link similarity, and all promotion, merge, split, role, and rollback operations require explicit workbench actions.
+
 Optional reviewed transcript variants are additive siblings to the baseline transcript JSON. When enabled and successfully generated, reviewed files add:
 
 - `review_schema_version`: reviewed-payload schema marker. Current version: `1`.

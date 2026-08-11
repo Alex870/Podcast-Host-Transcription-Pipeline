@@ -100,12 +100,42 @@ class Stage7Tests(unittest.TestCase):
             output = Path(tmp)
             for episode in ("EpisodeA", "EpisodeB"):
                 (output / f"{episode}_cleaned_speaker_transcript.json").write_text(
-                    json.dumps({"segments": [{"id": 1, "start": 2, "end": 3, "speaker": "SPEAKER_01", "text": episode}]}),
+                    json.dumps(
+                        {
+                            "segments": [
+                                {
+                                    "id": 1,
+                                    "start": 2,
+                                    "end": 3,
+                                    "speaker": "SPEAKER_01",
+                                    "original_speaker": "SPEAKER_01",
+                                    "text": episode,
+                                }
+                            ],
+                            "speaker_identity_evidence": [
+                                {
+                                    "evidence_id": f"evidence-{episode}",
+                                    "episode_id": episode,
+                                    "local_speaker": "SPEAKER_01",
+                                    "source_audio": f"{episode}.mp3",
+                                    "embedding_family": "ecapa:model",
+                                    "embedding": [1.0, 0.0] if episode == "EpisodeA" else [0.99, 0.01],
+                                    "duration_seconds": 400,
+                                    "quality_score": 1.0,
+                                    "spans": [{"start": 2, "end": 3}],
+                                }
+                            ],
+                        }
+                    ),
                     encoding="utf-8",
                 )
             view = build_cross_episode_speaker_view(output, "speaker")
             self.assertEqual(view["row_count"], 2)
             self.assertEqual(view["recurring_unknown_speakers"][0]["episode_count"], 2)
+            self.assertEqual(
+                view["recurring_unknown_speakers"][0]["evidence_clips"][0]["evidence_id"],
+                "evidence-EpisodeA",
+            )
             source = output / "EpisodeA_cleaned_speaker_transcript.json"
             revision = file_revision(source)
             assert_write_revision(source, revision)

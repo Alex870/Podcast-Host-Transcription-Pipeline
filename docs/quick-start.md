@@ -12,7 +12,7 @@ You will need:
 - accepted access for:
   - `pyannote/speaker-diarization-community-1`
   - `pyannote/segmentation-3.0`
-- FFmpeg installed with a usable `bin` directory such as `C:/ffmpeg/bin`
+- a shared FFmpeg 7 build installed with a usable `bin` directory such as `C:/ffmpeg7/bin`
 - the validated Windows GPU stack: PyTorch 2.9, TorchAudio 2.9, TorchVision 0.24, and TorchCodec 0.8.1
 - Node.js with a working `npm` if you want to use the transcript review workbench
 - enough local compute for Whisper, pyannote, and PyTorch-based audio processing
@@ -77,7 +77,7 @@ Then edit `podcast_transcribe_config.json` for your machine. A good first baseli
 {
   "default_source_dir": "D:/Speech_to_text/audio",
   "hf_token": "",
-  "ffmpeg_bin_dir": "C:/ffmpeg/bin",
+  "ffmpeg_bin_dir": "C:/ffmpeg7/bin",
   "known_speakers_dir": "speaker_reference_samples",
   "preferred_terms_file": "preferred_terms.txt",
   "replacement_map_json": "preferred_replacements.json",

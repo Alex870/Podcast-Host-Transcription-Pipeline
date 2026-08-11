@@ -93,6 +93,7 @@ def evaluate_entry(entry: Dict[str, object], gold_set_dir: Path, candidate_dir: 
     candidate_text = " ".join(str(segment.get("text") or "") for segment in candidate_segments)
     return {
         "id": str(entry.get("id") or reference_path.stem),
+        "episode_contract_version": str(candidate.get("contract_version") or candidate.get("schema_version") or "legacy"),
         "tags": list(entry.get("tags") or []),
         "error_taxonomy": list(entry.get("error_taxonomy") or entry.get("tags") or []),
         "segment_ids": sorted(segment_ids),
