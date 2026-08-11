@@ -1,4 +1,7 @@
+import hashlib
+import json
 import unittest
+from pathlib import Path
 
 from podcast_transcribe.ecosystem_contracts import (
     ContractError, apply_preview, build_correction_manifest, canonical_id,
@@ -15,6 +18,16 @@ PRODUCER = {"name": "podcast-host-transcription-pipeline", "contract_version": "
 
 
 class CorrectionContractTests(unittest.TestCase):
+    def test_canonical_v2_fixture_and_origin_checksum(self):
+        fixture_dir = Path(__file__).parent / "fixtures" / "contracts" / "correction-manifest-v2"
+        fixture_path = fixture_dir / "valid.json"
+        origin = json.loads((fixture_dir / "origin.json").read_text(encoding="utf-8"))
+        payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+        self.assertEqual(hashlib.sha256(fixture_path.read_bytes()).hexdigest(), origin["sha256"])
+        validate_correction_manifest(payload["manifest"], payload["transcript"])
+        self.assertEqual(len(payload["manifest"]["accepted_corrections"]), 1)
+        self.assertEqual(payload["manifest"]["corrections"][1]["status"], "rejected")
+
     def test_canonical_unicode_and_order(self):
         self.assertEqual(canonical_id({"b": "é", "a": 1}, prefix="x"), canonical_id({"a": 1, "b": "é"}, prefix="x"))
 
