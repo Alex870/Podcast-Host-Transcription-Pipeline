@@ -228,6 +228,43 @@ def calibrate_speaker_thresholds(
     }
 
 
+def build_speaker_calibration_set(
+    *,
+    calibration_id: str,
+    embedding_provider: Dict[str, object],
+    excerpts: List[Dict[str, object]],
+    reviewer_id: str,
+) -> Dict[str, object]:
+    """Build a versioned same-speaker/hard-negative set without mixing embeddings."""
+
+    family = _speaker_family(embedding_provider)
+    revision = str(embedding_provider.get("model_revision") or "").strip()
+    if family == "unknown" or not revision:
+        raise ValueError("Calibration requires a provider family and immutable model_revision.")
+    normalized = []
+    for excerpt in excerpts:
+        relation = str(excerpt.get("relation") or "")
+        if relation not in {"same_speaker", "hard_negative"}:
+            raise ValueError("Calibration excerpts must be labeled same_speaker or hard_negative.")
+        if not excerpt.get("excerpt_id") or not excerpt.get("source_audio_sha256"):
+            raise ValueError("Calibration excerpts require stable identity and source audio hash.")
+        excerpt_family = str(excerpt.get("embedding_family") or family)
+        if excerpt_family != family:
+            raise ValueError("Embedding-family mixing is not allowed in calibration sets.")
+        normalized.append({**excerpt, "embedding_family": family})
+    if not any(item["relation"] == "same_speaker" for item in normalized) or not any(item["relation"] == "hard_negative" for item in normalized):
+        raise ValueError("Calibration requires both same-speaker and hard-negative excerpts.")
+    return {
+        "contract_version": "speaker-calibration-set-1.0",
+        "calibration_id": str(calibration_id),
+        "embedding_provider": embedding_provider,
+        "embedding_family": family,
+        "reviewer_id": str(reviewer_id),
+        "human_reviewed": bool(str(reviewer_id).strip()),
+        "excerpts": sorted(normalized, key=lambda item: str(item["excerpt_id"])),
+    }
+
+
 def validate_profile_family(active_profile: Optional[Dict[str, object]], candidate_profile: Dict[str, object]) -> Dict[str, object]:
     """Validate provider family and vector dimensions before a profile can move."""
 

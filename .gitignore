@@ -18,6 +18,8 @@ _processing_checkpoints/
 _processing_artifacts/
 _workbench/
 .workbench/
+config/provider-models/
+speech-shadow-runs/
 
 *_speaker_transcript.txt
 *_speaker_transcript.json

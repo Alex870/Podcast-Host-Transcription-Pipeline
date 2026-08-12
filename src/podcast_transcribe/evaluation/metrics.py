@@ -151,11 +151,26 @@ def diarization_error_rate(
             errors = candidate_errors
             best_mapping = mapping
     scored = len(frames)
+    mapped_frames = [
+        (reference, tuple(sorted(best_mapping.get(label, label) for label in hypothesis)))
+        for reference, hypothesis in frames
+    ]
+    miss_frames = sum(bool(reference) and not hypothesis for reference, hypothesis in mapped_frames)
+    overlap_frames = sum((len(reference) > 1 or len(hypothesis) > 1) and reference != hypothesis for reference, hypothesis in mapped_frames)
+    label_frames = sum(bool(hypothesis) and len(reference) == len(hypothesis) and reference != hypothesis for reference, hypothesis in mapped_frames)
+    reference_boundaries = sorted({float(turn.get(field) or 0.0) for turn in reference_turns for field in ("start", "end")})
+    hypothesis_boundaries = sorted({float(turn.get(field) or 0.0) for turn in hypothesis_turns for field in ("start", "end")})
+    boundary_errors = [min(abs(value - candidate) for candidate in hypothesis_boundaries) for value in reference_boundaries] if hypothesis_boundaries else []
     return {
         "scored_seconds": scored * frame_seconds,
         "error_seconds": errors * frame_seconds,
         "diarization_error_rate": errors / scored if scored else None,
         "speaker_mapping": best_mapping,
+        "speaker_count_error": abs(len(reference_labels) - len(hypothesis_labels)),
+        "missed_speech_seconds": miss_frames * frame_seconds,
+        "overlap_error_seconds": overlap_frames * frame_seconds,
+        "label_mapping_error_seconds": label_frames * frame_seconds,
+        "segmentation_boundary_mean_error_seconds": sum(boundary_errors) / len(boundary_errors) if boundary_errors else None,
         "collar_seconds": collar_seconds,
     }
 

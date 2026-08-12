@@ -174,6 +174,14 @@ from podcast_transcribe.providers.alignment import ALIGNMENT_PROVIDERS, create_a
 from podcast_transcribe.providers.asr import FasterWhisperASRProvider, ParakeetASRProvider
 from podcast_transcribe.providers.contracts import ProviderIdentity
 from podcast_transcribe.providers.diarization import pyannote_provider_identity
+from podcast_transcribe.providers.governance import (
+    acquire_provider_artifact,
+    artifact_directory,
+    build_speech_provider_run,
+    provider_preflight,
+    resolve_execution_profile,
+    write_immutable_speech_run,
+)
 from podcast_transcribe.providers.speaker_embedding import SpeechBrainECAPAProvider, SpeechBrainXVectorProvider
 from podcast_transcribe.quality import language_model_warnings
 from podcast_transcribe.review import (
@@ -633,6 +641,8 @@ def parse_args():
     parser.add_argument("--input-file", help="Optional single audio file to process from input-dir.")
     parser.add_argument("--output-dir", help="Output directory. Defaults to input directory.")
     parser.add_argument("--model", default="large-v3", help="faster-whisper model name.")
+    parser.add_argument("--model-id", default="", help="Canonical ASR model repository id. Required when --model is only a shorthand.")
+    parser.add_argument("--model-revision", default="", help="Immutable ASR model revision used for acquisition and provenance.")
     parser.add_argument(
         "--asr-provider",
         choices=["faster_whisper", "parakeet"],
@@ -645,7 +655,7 @@ def parse_args():
     # parser.add_argument("--compute-type", default="auto", help="faster-whisper compute type.")
     parser.add_argument("--compute-type", default="float16", help="faster-whisper compute type.")
     parser.add_argument("--beam-size", type=int, default=5, help="Beam size for decoding.")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size for faster-whisper.")
+    parser.add_argument("--batch-size", type=int, default=0, help="Batch size for ASR. 0 uses a conservative adaptive CPU/CUDA default.")
     parser.add_argument("--hf-token", default=os.getenv("HF_TOKEN"), help="Hugging Face token for pyannote pipeline.")
     parser.add_argument(
         "--diarization-model",
@@ -668,6 +678,16 @@ def parse_args():
         default="",
         help="Optional alignment model override. Blank uses the provider's language default.",
     )
+    parser.add_argument("--alignment-model-revision", default="", help="Immutable forced-alignment model revision.")
+    parser.add_argument("--diarization-model-revision", default="", help="Immutable diarization model revision.")
+    parser.add_argument("--speaker-model-revision", default="", help="Immutable speaker-embedding model revision.")
+    parser.add_argument(
+        "--provider-cache-dir",
+        default="config/provider-models",
+        help="Repo-local cache for explicitly acquired provider artifacts.",
+    )
+    parser.add_argument("--provider-preflight", action="store_true", help="Report selected provider availability without downloading or loading models.")
+    parser.add_argument("--download-provider-models", action="store_true", help="Explicitly acquire the selected pinned provider artifacts, then exit.")
     parser.add_argument(
         "--speaker-embedding-provider",
         choices=["speechbrain_ecapa", "speechbrain_xvector"],
@@ -918,6 +938,12 @@ def parse_args():
         "--benchmark-baseline-dir",
         default="",
         help="Optional processed-output directory used as the baseline for candidate comparison and promotion gates.",
+    )
+    parser.add_argument("--speech-run-id", default="", help="Publish this benchmark as an immutable shadow speech run.")
+    parser.add_argument(
+        "--speech-shadow-root",
+        default="",
+        help="Immutable speech-run root. Defaults to <output-dir>/speech-shadow-runs.",
     )
     parser.add_argument(
         "--assume-dominant-speaker-is-host",
@@ -1773,12 +1799,13 @@ def run_diarization_stage(
     audio_path: Path,
     diarization_pipeline: Pipeline,
     diarization_model_id: str,
+    diarization_model_revision: str,
     verifier: Any,
     num_speakers: Optional[int],
     max_embedding_seconds: float,
     resume_intermediates: bool,
 ) -> Tuple[List[Dict[str, object]], bool, Dict[str, object]]:
-    diarization_identity = pyannote_provider_identity(diarization_model_id)
+    diarization_identity = pyannote_provider_identity(diarization_model_id, diarization_model_revision)
     stage_fingerprint = build_stage_fingerprint(
         "diarization",
         diarization_identity,
@@ -4076,16 +4103,21 @@ def runtime_config_payload(args) -> Dict[str, object]:
     keys = [
         "asr_provider",
         "model",
+        "model_id",
+        "model_revision",
         "language",
         "device",
         "compute_type",
         "beam_size",
         "batch_size",
         "diarization_model",
+        "diarization_model_revision",
         "alignment_provider",
         "alignment_model",
+        "alignment_model_revision",
         "speaker_embedding_provider",
         "speaker_model",
+        "speaker_model_revision",
         "host_threshold",
         "min_host_seconds",
         "max_embedding_seconds",
@@ -4480,6 +4512,7 @@ def process_file(
         audio_path=audio_path,
         diarization_pipeline=diarization_pipeline,
         diarization_model_id=str((runtime_config or {}).get("diarization_model") or ""),
+        diarization_model_revision=str((runtime_config or {}).get("diarization_model_revision") or ""),
         verifier=verifier,
         num_speakers=num_speakers,
         max_embedding_seconds=max_embedding_seconds,
@@ -4884,6 +4917,28 @@ def run_pipeline_benchmark_mode(args, output_dir: Path):
     if baseline_dir:
         print(f"  baseline outputs: {baseline_dir}")
     report = run_pipeline_benchmark(gold_set_dir, candidate_dir, baseline_dir)
+    if args.speech_run_id:
+        identities = selected_provider_identities(args)
+        report["providers"] = [identity.to_payload() for identity in identities]
+        report["provider_policies"] = {
+            "license": sorted({identity.license for identity in identities}),
+            "acquisition": sorted({identity.acquisition for identity in identities}),
+            "privacy_boundary": sorted({identity.privacy_boundary for identity in identities}),
+            "offline_behavior": "local after explicit acquisition",
+        }
+        execution = resolve_execution_profile(args.device, args.batch_size)
+        speech_run = build_speech_provider_run(
+            run_id=args.speech_run_id,
+            evaluation_pack=report.get("evaluation_identity") or {},
+            audio_identity=(report.get("evaluation_identity") or {}).get("source_identity") or {},
+            preprocessing={"profile": "gold-set-manifest", "normalization": "identical candidate/baseline inputs"},
+            providers=identities,
+            execution=asdict(execution),
+            outputs={"candidate_dir": str(candidate_dir), "baseline_dir": str(baseline_dir or ""), "raw_outputs_preserved": True},
+            metrics={"aggregate": report.get("aggregate") or {}, "results": report.get("results") or []},
+        )
+        shadow_root = Path(args.speech_shadow_root).resolve() if args.speech_shadow_root else output_dir.resolve() / "speech-shadow-runs"
+        report["speech_run_manifest"] = str(write_immutable_speech_run(shadow_root, speech_run))
     json_path, md_path = write_pipeline_benchmark_reports(output_dir, report)
     aggregate = report.get("aggregate") or {}
     print(f"  completed entries: {report.get('gold_set', {}).get('entry_count', 0)}")
@@ -4894,6 +4949,77 @@ def run_pipeline_benchmark_mode(args, output_dir: Path):
     )
     print(f"  report json: {json_path}")
     print(f"  report markdown: {md_path}")
+
+
+def selected_provider_identities(args) -> List[ProviderIdentity]:
+    asr_model_id = str(args.model_id or "").strip()
+    if not asr_model_id:
+        asr_model_id = (
+            str(args.model)
+            if args.asr_provider == "parakeet"
+            else f"Systran/faster-whisper-{args.model}"
+        )
+    speaker_model_id = str(args.speaker_model)
+    if args.speaker_embedding_provider == "speechbrain_xvector" and "xvect" not in speaker_model_id.lower():
+        speaker_model_id = "speechbrain/spkrec-xvect-voxceleb"
+    identities = [
+        ProviderIdentity(
+            stage="transcription",
+            provider=args.asr_provider,
+            model=asr_model_id,
+            model_revision=str(args.model_revision or ""),
+            capabilities={"timestamps": True, "word_alignment": True, "device_support": ["cpu", "cuda"]},
+            confidence_semantics="provider-specific; cross-provider confidence comparison is prohibited",
+            license="model-card terms apply",
+        ),
+        pyannote_provider_identity(args.diarization_model, str(args.diarization_model_revision or "")),
+        ProviderIdentity(
+            stage="speaker_embedding",
+            provider=args.speaker_embedding_provider,
+            model=speaker_model_id,
+            model_revision=str(args.speaker_model_revision or ""),
+            capabilities={"sample_rate": 16000, "device_support": ["cpu", "cuda"]},
+            confidence_semantics="cosine similarity within one embedding family only",
+            license="model-card terms apply",
+        ),
+    ]
+    if args.alignment_provider == "timestamp_passthrough":
+        identities.append(
+            ProviderIdentity(
+                stage="alignment",
+                provider="timestamp_passthrough",
+                model="asr_native_word_timestamps",
+                model_revision="builtin-v1",
+                acquisition="bundled",
+                license="project license",
+                capabilities={"timestamps": True, "word_alignment": True, "device_support": ["cpu", "cuda"]},
+            )
+        )
+    else:
+        identities.append(
+            ProviderIdentity(
+                stage="alignment",
+                provider="whisperx",
+                model=str(args.alignment_model or ""),
+                model_revision=str(args.alignment_model_revision or ""),
+                capabilities={"timestamps": True, "word_alignment": True, "device_support": ["cpu", "cuda"]},
+                confidence_semantics="provider-specific alignment score",
+                license="model-card terms apply",
+            )
+        )
+    return identities
+
+
+def run_provider_artifact_mode(args) -> None:
+    cache_root = Path(args.provider_cache_dir).resolve()
+    profile = resolve_execution_profile(args.device, args.batch_size)
+    reports = []
+    for identity in selected_provider_identities(args):
+        if args.download_provider_models and identity.acquisition != "bundled":
+            reports.append(acquire_provider_artifact(cache_root, identity, token=args.hf_token))
+        else:
+            reports.append(provider_preflight(cache_root, identity))
+    print(json.dumps({"execution": asdict(profile), "providers": reports}, indent=2))
 
 
 def estimate_audio_eta(processed_audio_seconds: float, elapsed_seconds: float, remaining_audio_seconds: float) -> Optional[float]:
@@ -5180,20 +5306,45 @@ def exit_isolated_worker_after_success(input_file: Optional[str], exit_fn=None) 
 
 
 def load_models(args, device: str):
+    cache_root = Path(args.provider_cache_dir).resolve()
+    identities = {identity.stage: identity for identity in selected_provider_identities(args)}
+    preflights = {stage: provider_preflight(cache_root, identity) for stage, identity in identities.items()}
+    missing = [f"{stage}: {report['diagnostic']} ({report['artifact_path']})" for stage, report in preflights.items() if not report["available"]]
+    if missing:
+        raise RuntimeError(
+            "Provider artifacts are not ready. No model downloads occur implicitly. Run --provider-preflight, then "
+            "--download-provider-models with pinned revisions. Missing: " + "; ".join(missing)
+        )
+    asr_identity = identities["transcription"]
+    asr_local_path = str(artifact_directory(cache_root, asr_identity) / "model")
     if args.asr_provider == "parakeet":
-        asr_provider = ParakeetASRProvider(args.model, device=device)
+        asr_provider = ParakeetASRProvider(
+            asr_identity.model,
+            device=device,
+            model_revision=asr_identity.model_revision,
+            local_model_path=asr_local_path,
+        )
     else:
-        whisper_model = WhisperModel(args.model, device=device, compute_type=args.compute_type)
-        asr_provider = FasterWhisperASRProvider(whisper_model, args.model, transcribe_audio)
+        whisper_model = WhisperModel(asr_local_path, device=device, compute_type=args.compute_type, local_files_only=True)
+        asr_provider = FasterWhisperASRProvider(
+            whisper_model,
+            asr_identity.model,
+            transcribe_audio,
+            model_revision=asr_identity.model_revision,
+        )
+    alignment_identity = identities["alignment"]
+    alignment_local_path = "" if alignment_identity.acquisition == "bundled" else str(artifact_directory(cache_root, alignment_identity) / "model")
     alignment_provider = create_alignment_provider(
         args.alignment_provider,
         device,
         args.alignment_model,
+        args.alignment_model_revision,
+        alignment_local_path,
     )
 
     try:
         diarization_pipeline, resolved_diarization_model = load_diarization_pipeline(
-            args.diarization_model, args.hf_token
+            str(artifact_directory(cache_root, identities["diarization"]) / "model"), args.hf_token
         )
     except TypeError as exc:
         raise RuntimeError(
@@ -5224,14 +5375,14 @@ def load_models(args, device: str):
     if device == "cuda":
         diarization_pipeline.to(torch.device(normalize_runtime_device(device)))
 
-    speaker_model = args.speaker_model
+    speaker_model = str(artifact_directory(cache_root, identities["speaker_embedding"]) / "model")
     if args.speaker_embedding_provider == "speechbrain_xvector" and "xvect" not in speaker_model.lower():
-        speaker_model = "speechbrain/spkrec-xvect-voxceleb"
+        speaker_model = str(artifact_directory(cache_root, identities["speaker_embedding"]) / "model")
     verifier = load_speaker_verifier(speaker_model, device, args.speaker_embedding_provider)
     speaker_embedding_provider = (
-        SpeechBrainXVectorProvider(verifier, speaker_model)
+        SpeechBrainXVectorProvider(verifier, identities["speaker_embedding"].model, identities["speaker_embedding"].model_revision)
         if args.speaker_embedding_provider == "speechbrain_xvector"
-        else SpeechBrainECAPAProvider(verifier, speaker_model)
+        else SpeechBrainECAPAProvider(verifier, identities["speaker_embedding"].model, identities["speaker_embedding"].model_revision)
     )
     known_speaker_profiles = load_known_speaker_profiles(
         verifier=verifier,
@@ -5456,6 +5607,10 @@ def main():
 
     args = parse_args()
 
+    if args.provider_preflight or args.download_provider_models:
+        run_provider_artifact_mode(args)
+        return
+
     if args.review_benchmark:
         output_dir = Path(args.output_dir) if args.output_dir else Path.cwd()
         run_review_benchmark_mode(args, output_dir)
@@ -5468,6 +5623,13 @@ def main():
 
     if not args.input_dir:
         raise RuntimeError("--input-dir is required unless a benchmark mode is used.")
+
+    if args.batch_size <= 0:
+        execution = resolve_execution_profile(args.device, 0)
+        args.batch_size = execution.batch_size
+        print(f"Adaptive batch size: {args.batch_size} ({execution.resolved_device}/{execution.precision})")
+        if execution.fallback_reason:
+            print(f"Device diagnostic: {execution.fallback_reason}")
 
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir) if args.output_dir else input_dir

@@ -9,22 +9,27 @@ from __future__ import annotations
 
 import importlib
 import platform
+import time
 from importlib import metadata
 from typing import Callable, Dict, List, Optional, Tuple
 
 from podcast_transcribe.models import SegmentItem
 from podcast_transcribe.providers.contracts import ProviderIdentity, StageResult
+from podcast_transcribe.providers.governance import invocation_metadata
 
 
 class FasterWhisperASRProvider:
-    def __init__(self, model, model_name: str, transcribe_callable: Callable[..., Tuple[List[SegmentItem], Dict[str, object]]]):
+    def __init__(self, model, model_name: str, transcribe_callable: Callable[..., Tuple[List[SegmentItem], Dict[str, object]]], model_revision: str = ""):
         self.model = model
         self.transcribe_callable = transcribe_callable
         self._identity = ProviderIdentity(
             stage="transcription",
             provider="faster_whisper",
             model=model_name,
-            capabilities={"word_timestamps": True, "hotwords": True, "batched_decode": True},
+            capabilities={"language": True, "timestamps": True, "word_alignment": True, "streaming": False, "speaker_attribution": False, "overlap": False, "device_support": ["cpu", "cuda"], "hotwords": True, "batched_decode": True},
+            model_revision=model_revision,
+            confidence_semantics="average log probability from faster-whisper; not calibrated across providers",
+            license="model-specific; inspect acquisition receipt",
         )
 
     @property
@@ -40,6 +45,7 @@ class FasterWhisperASRProvider:
         initial_prompt: Optional[str],
         hotwords: Optional[str],
     ) -> StageResult[List[SegmentItem]]:
+        started_at = time.perf_counter()
         segments, metadata = self.transcribe_callable(
             model=self.model,
             audio_path=audio_path,
@@ -49,7 +55,13 @@ class FasterWhisperASRProvider:
             initial_prompt=initial_prompt,
             hotwords=hotwords,
         )
-        return StageResult(value=segments, provider=self.identity, metadata=metadata)
+        invocation = invocation_metadata(
+            audio_path=audio_path,
+            preprocessing={"language": language, "beam_size": beam_size, "initial_prompt": bool(initial_prompt), "hotwords": bool(hotwords)},
+            execution={"device": str(getattr(self.model, "device", "configured")), "precision": str(getattr(self.model, "compute_type", "configured")), "batch_size": batch_size},
+            started_at=started_at,
+        )
+        return StageResult(value=segments, provider=self.identity, metadata={**metadata, **invocation})
 
 
 def parakeet_environment_diagnostics() -> Dict[str, object]:
@@ -87,10 +99,12 @@ class ParakeetASRProvider:
     factories. No NeMo or CUDA module is imported at application startup.
     """
 
-    def __init__(self, model_name: str, device: str = "auto", model_loader: Optional[Callable[[], object]] = None):
+    def __init__(self, model_name: str, device: str = "auto", model_loader: Optional[Callable[[], object]] = None, *, model_revision: str = "", local_model_path: str = ""):
         self.model_name = model_name
         self.device = device
         self._model_loader = model_loader
+        self.model_revision = model_revision
+        self.local_model_path = local_model_path
         self._model = None
         version = ""
         try:
@@ -102,7 +116,10 @@ class ParakeetASRProvider:
             provider="parakeet",
             model=model_name,
             version=version,
-            capabilities={"word_timestamps": True, "batched_decode": True, "lazy_optional_runtime": True},
+            capabilities={"language": True, "timestamps": True, "word_alignment": True, "streaming": False, "speaker_attribution": False, "overlap": False, "device_support": ["cpu", "cuda"], "batched_decode": True, "lazy_optional_runtime": True},
+            model_revision=model_revision,
+            confidence_semantics="provider-specific score; not calibrated against Whisper",
+            license="NVIDIA Open Model License or model-card override",
         )
 
     @property
@@ -115,6 +132,10 @@ class ParakeetASRProvider:
         if self._model_loader is not None:
             self._model = self._model_loader()
             return self._model
+        if not self.local_model_path:
+            raise RuntimeError(
+                "Parakeet model acquisition is explicit. Run provider download/preflight and pass the resulting local model path."
+            )
         try:
             asr_models = importlib.import_module("nemo.collections.asr.models")
         except ImportError as exc:
@@ -126,7 +147,7 @@ class ParakeetASRProvider:
         asr_model = getattr(asr_models, "ASRModel", None)
         if asr_model is None or not hasattr(asr_model, "from_pretrained"):
             raise RuntimeError("The installed NeMo package does not expose ASRModel.from_pretrained for Parakeet.")
-        self._model = asr_model.from_pretrained(model_name=self.model_name)
+        self._model = asr_model.from_pretrained(model_name=self.local_model_path)
         if self.device == "cuda" and hasattr(self._model, "cuda"):
             self._model.cuda()
         elif self.device == "cpu" and hasattr(self._model, "cpu"):
@@ -160,6 +181,7 @@ class ParakeetASRProvider:
         initial_prompt: Optional[str],
         hotwords: Optional[str],
     ) -> StageResult[List[SegmentItem]]:
+        started_at = time.perf_counter()
         model = self._load()
         try:
             raw = model.transcribe([audio_path], batch_size=batch_size)
@@ -190,6 +212,13 @@ class ParakeetASRProvider:
                     words=[],
                 )
             )
+        invocation = invocation_metadata(
+            audio_path=audio_path,
+            preprocessing={"language": language, "beam_size": beam_size, "initial_prompt": bool(initial_prompt), "hotwords": bool(hotwords)},
+            execution={"device": self.device, "precision": "provider_default", "batch_size": batch_size},
+            started_at=started_at,
+            warnings=["Parakeet does not consume Whisper prompt/hotword controls"] if initial_prompt or hotwords else [],
+        )
         return StageResult(
             value=segments,
             provider=self.identity,
@@ -199,5 +228,8 @@ class ParakeetASRProvider:
                 "diagnostics": parakeet_environment_diagnostics(),
                 "prompt_forwarded": bool(initial_prompt or hotwords),
                 "beam_size": beam_size,
+                "raw_provider_output": raw_items,
+                "normalization_applied_after_provider_return": True,
+                **invocation,
             },
         )

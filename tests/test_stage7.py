@@ -72,6 +72,9 @@ class Stage7Tests(unittest.TestCase):
         self.assertEqual(provider.identity.provider, "parakeet")
         self.assertEqual(result.value[0].text, "hello host")
         self.assertEqual(result.value[0].start, 1.0)
+        self.assertTrue(result.metadata["input_audio_identity"]["missing"])
+        self.assertIn("fingerprint", result.metadata["preprocessing"])
+        self.assertIn("runtime_seconds", result.metadata["execution"])
 
     def test_calibration_and_reversible_profile_promotion(self):
         calibration = calibrate_speaker_thresholds(

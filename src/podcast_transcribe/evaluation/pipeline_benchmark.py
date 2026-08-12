@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from pathlib import Path
+from statistics import median
 from typing import Dict, List, Optional, Tuple
 
 from podcast_transcribe.contract import validate_transcript_payload
@@ -60,6 +61,38 @@ def _transcript_text(payload: Dict[str, object]) -> str:
     return " ".join(str(segment.get("text") or "") for segment in payload.get("segments") or [] if isinstance(segment, dict))
 
 
+def _provider_policies(results: List[Dict[str, object]]) -> Dict[str, object]:
+    providers = []
+    for result in results:
+        provenance = result.get("candidate_provenance") or {}
+        if isinstance(provenance, dict):
+            for stage in provenance.values():
+                provider = stage.get("provider") if isinstance(stage, dict) else None
+                if isinstance(provider, dict):
+                    providers.append(provider)
+    return {
+        "license": sorted({str(item.get("license") or "unknown") for item in providers}),
+        "acquisition": sorted({str(item.get("acquisition") or "unknown") for item in providers}),
+        "privacy_boundary": sorted({str(item.get("privacy_boundary") or "unknown") for item in providers}),
+        "offline_behavior": "local after explicit acquisition",
+        "providers": providers,
+    }
+
+
+def _duration_report(results: List[Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+    buckets = {"short_lt_10m": [], "medium_10m_to_60m": [], "long_gte_60m": []}
+    for item in results:
+        duration = float(item.get("duration_seconds") or 0.0)
+        name = "short_lt_10m" if duration < 600 else ("medium_10m_to_60m" if duration < 3600 else "long_gte_60m")
+        buckets[name].append(item)
+    report = {}
+    for name, items in buckets.items():
+        words = sum(int(item["wer"]["reference_words"]) for item in items)
+        errors = sum(int(item["wer"]["errors"]) for item in items)
+        report[name] = {"entry_count": len(items), "wer": errors / words if words else None}
+    return report
+
+
 def evaluate_entry(entry: Dict[str, object], gold_set_dir: Path, candidate_dir: Optional[Path]) -> Dict[str, object]:
     reference_path = gold_set_dir / str(entry.get("reference") or "")
     candidate_path = _candidate_path(entry, candidate_dir, gold_set_dir)
@@ -99,6 +132,8 @@ def evaluate_entry(entry: Dict[str, object], gold_set_dir: Path, candidate_dir: 
         "segment_ids": sorted(segment_ids),
         "reference_path": str(reference_path),
         "candidate_path": str(candidate_path),
+        "source_identity": entry.get("source_identity") or candidate.get("source_identity") or {},
+        "duration_seconds": float(entry.get("duration_seconds") or 0.0),
         "wer": word_error_rate(reference_text, candidate_text),
         "speaker_attributed_wer": speaker_attributed_wer(reference_segments, candidate_segments),
         "timestamp_error": timestamp_error(reference_segments, candidate_segments),
@@ -110,9 +145,15 @@ def evaluate_entry(entry: Dict[str, object], gold_set_dir: Path, candidate_dir: 
         "host_classification": host_classification(reference_segments, candidate_segments),
         "glossary": glossary_preservation(entry.get("preferred_terms") or [], reference_text, candidate_text),
         "candidate_provenance": candidate.get("metadata", {}).get("stage_provenance", {}) if isinstance(candidate.get("metadata"), dict) else {},
+        "raw_output": {
+            "preserved": True,
+            "path": str(candidate_path),
+            "normalization_after_validation": True,
+        },
         "performance": {
             "timings_seconds": candidate_manifest.get("timings_seconds") or {},
             "resource_usage": candidate_manifest.get("resource_usage") or {},
+            "recovery": candidate_manifest.get("recovery") or candidate_manifest.get("fallbacks") or [],
             "manifest_path": str(manifest_path) if manifest_path.exists() else "",
         },
     }
@@ -161,6 +202,7 @@ def run_pipeline_benchmark(
             if (item.get("performance", {}).get("resource_usage") or {}).get(key) not in (None, "")
         ]
         resource_summary[key] = {"max": max(values) if values else None, "mean": sum(values) / len(values) if values else None}
+    candidate_storage_bytes = sum(Path(str(item["candidate_path"])).stat().st_size for item in results if Path(str(item["candidate_path"])).exists())
     taxonomy: Dict[str, Dict[str, object]] = {}
     for tag in sorted({tag for item in results for tag in item.get("error_taxonomy") or []}):
         tagged = [item for item in results if tag in (item.get("error_taxonomy") or [])]
@@ -175,9 +217,21 @@ def run_pipeline_benchmark(
             ),
         }
     report = {
+        "contract_version": "speech-quality-report-1.0",
         "pipeline_benchmark_version": PIPELINE_BENCHMARK_VERSION,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "gold_set": {"path": str(gold_set_dir), "name": manifest.get("name", gold_set_dir.name), "entry_count": len(results)},
+        "evaluation_identity": {
+            "pack_id": str(manifest.get("pack_id") or ""),
+            "source_identity": manifest.get("source_identity") or {},
+            "target_slices": list(manifest.get("target_slices") or []),
+            "complete": bool(manifest.get("pack_id") and manifest.get("source_identity")),
+        },
+        "shadow_only": True,
+        "confidence_comparison_allowed": False,
+        "human_corrections_authoritative": True,
+        "human_reviewed": bool(results) and int((gold_set_readiness(gold_set_dir) or {}).get("ready_count") or 0) == len(results),
+        "provider_policies": _provider_policies(results),
         "candidate_dir": str(candidate_dir) if candidate_dir else "",
         "aggregate": {
             "wer": aggregate_metric_counts(wer_items, "errors", "reference_words", "wer"),
@@ -189,10 +243,13 @@ def run_pipeline_benchmark(
             "diarization_error_rate": diarization_errors / diarization_scored if diarization_scored else None,
             "completion_rate": len(results) / (len(results) + len(failures)) if results or failures else 0.0,
             "mean_processing_seconds": sum(total_timings) / len(total_timings) if total_timings else None,
+            "median_processing_seconds": median(total_timings) if total_timings else None,
             "resource_usage": resource_summary,
+            "storage_bytes": candidate_storage_bytes,
         },
         "error_taxonomy": taxonomy,
         "condition_report": condition_report({"results": results}),
+        "duration_report": _duration_report(results),
         "gold_set_readiness": gold_set_readiness(gold_set_dir),
         "results": results,
         "failures": failures,

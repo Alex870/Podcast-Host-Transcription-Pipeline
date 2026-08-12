@@ -8,7 +8,7 @@ from podcast_transcribe.providers.contracts import ProviderIdentity
 
 
 class SpeechBrainECAPAProvider:
-    def __init__(self, verifier, model_name: str):
+    def __init__(self, verifier, model_name: str, model_revision: str = ""):
         self.verifier = verifier
         try:
             version = metadata.version("speechbrain")
@@ -20,6 +20,9 @@ class SpeechBrainECAPAProvider:
             model=model_name,
             version=version,
             capabilities={"sample_rate": 16000, "normalized_embeddings": True},
+            model_revision=model_revision,
+            confidence_semantics="cosine similarity within one embedding family only",
+            license="Apache-2.0 code; model-card data/model terms apply",
         )
 
     @property
@@ -33,7 +36,7 @@ class SpeechBrainECAPAProvider:
 class SpeechBrainXVectorProvider:
     """Optional candidate speaker embedder using SpeechBrain x-vector."""
 
-    def __init__(self, verifier, model_name: str):
+    def __init__(self, verifier, model_name: str, model_revision: str = ""):
         self.verifier = verifier
         try:
             version = metadata.version("speechbrain")
@@ -45,6 +48,9 @@ class SpeechBrainXVectorProvider:
             model=model_name,
             version=version,
             capabilities={"sample_rate": 16000, "normalized_embeddings": True, "candidate": True},
+            model_revision=model_revision,
+            confidence_semantics="cosine similarity within one embedding family only",
+            license="Apache-2.0 code; model-card data/model terms apply",
         )
 
     @property
