@@ -53,6 +53,12 @@ from podcast_transcribe.speakers import (
     rollback_speaker_profile_promotion,
     stage_speaker_profile_promotion,
 )
+from podcast_transcribe.operations import (
+    apply_retention,
+    campaign_preflight,
+    downstream_delivery_status,
+    retry_downstream_delivery,
+)
 
 
 class SessionOpenRequest(BaseModel):
@@ -128,6 +134,12 @@ class SpeakerSplitRequest(BaseModel):
 
 class ReviewerApprovalRequest(BaseModel):
     reviewer_id: str = Field("", alias="reviewerId")
+
+
+class RetentionRequest(BaseModel):
+    categories: List[str] = Field(default_factory=list)
+    older_than_days: int = Field(30, alias="olderThanDays", ge=0)
+    dry_run: bool = Field(True, alias="dryRun")
 
 
 def _frontend_dist_dir() -> Path:
@@ -225,6 +237,42 @@ def evaluation_queue_endpoint():
     try:
         project_root, output_dir = SESSION.require()
         return evaluation_queues(project_root, output_dir)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.get("/api/operations/preflight")
+def operations_preflight_endpoint():
+    try:
+        project_root, output_dir = SESSION.require()
+        return campaign_preflight(project_root, output_dir)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.get("/api/operations/downstream")
+def downstream_status_endpoint():
+    try:
+        _, output_dir = SESSION.require()
+        return downstream_delivery_status(output_dir)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/operations/downstream/{correction_set_id}/retry")
+def downstream_retry_endpoint(correction_set_id: str):
+    try:
+        project_root, output_dir = SESSION.require()
+        return retry_downstream_delivery(project_root, output_dir, correction_set_id)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/operations/retention")
+def retention_endpoint(payload: RetentionRequest):
+    try:
+        _, output_dir = SESSION.require()
+        return apply_retention(output_dir, payload.model_dump(by_alias=False), dry_run=payload.dry_run)
     except Exception as exc:
         raise _json_error(exc) from exc
 

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import tempfile
 import threading
 import time
 import uuid
@@ -1697,6 +1699,11 @@ def preview_text_correction(project_root: Path, output_dir: Path, episode_id: st
     new_text = str(corrected_text).strip()
     if not new_text:
         raise RuntimeError("Corrected text cannot be blank.")
+    config = load_project_config(project_root)
+    downstream = []
+    for key in ("podcast_rag_project_dir", "ragscope_project_dir"):
+        if str(config.get(key) or "").strip():
+            downstream.append({"consumer": key, "status": "plan_required"})
     return {
         "episode_id": episode_id,
         "segment_id": int(segment_id),
@@ -1704,7 +1711,42 @@ def preview_text_correction(project_root: Path, output_dir: Path, episode_id: st
         "corrected_text": new_text,
         "changes": [{"field": "corrected_text", "before": segment["text"], "after": new_text}],
         "source_revision": file_revision(output_dir / f"{episode_id}_cleaned_speaker_transcript.json"),
+        "target_files": [
+            f"{episode_id}_corrected_speaker_transcript.json",
+            f"{CORRECTION_MANIFEST_DIRNAME}/{episode_id}.correction-manifest-v2.json",
+            f"corrections/{episode_id}_corrections.csv",
+        ],
+        "downstream_plans": downstream,
     }
+
+
+def _write_authoritative_pair_atomic(first_path: Path, first_value: Dict[str, object], second_path: Path, second_value: Dict[str, object]) -> None:
+    """Commit transcript and correction manifest together, restoring both on failure."""
+    staged = []
+    backups: Dict[Path, Optional[bytes]] = {}
+    try:
+        for path, value in ((first_path, first_value), (second_path, second_value)):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            backups[path] = path.read_bytes() if path.exists() else None
+            handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".txn")
+            with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+                json.dump(value, stream, ensure_ascii=False, sort_keys=True, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            staged.append((Path(temporary), path))
+        for temporary, path in staged:
+            os.replace(temporary, path)
+    except Exception:
+        for path, previous in backups.items():
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(previous)
+        raise
+    finally:
+        for temporary, _ in staged:
+            temporary.unlink(missing_ok=True)
 
 
 def _read_existing_corrections(correction_path: Path) -> Tuple[List[str], Dict[str, Dict[str, str]]]:
@@ -1818,8 +1860,7 @@ def apply_text_correction(
         ],
     }
     corrected_json_path = output_dir / f"{episode_id}_corrected_speaker_transcript.json"
-    _write_json_atomic(corrected_json_path, corrected_payload)
-    _write_json_atomic(manifest_path, manifest)
+    _write_authoritative_pair_atomic(corrected_json_path, corrected_payload, manifest_path, manifest)
 
     corrections_dir = resolve_workbench_paths(project_root, output_dir)["corrections_dir"]
     _assert_within_root(project_root, corrections_dir)
@@ -1920,6 +1961,7 @@ def _notify_downstream_correction(
     }
     delivered = []
     missing = []
+    delivery_errors = []
     for key, inbox_name in (
         ("podcast_rag_project_dir", "transcription_corrections"),
         ("ragscope_project_dir", "transcription_corrections"),
@@ -1937,15 +1979,19 @@ def _notify_downstream_correction(
         inbox = root / "state" / inbox_name
         inbox.mkdir(parents=True, exist_ok=True)
         target = inbox / f"{manifest.get('correction_set_id')}.json"
-        target.write_text(json.dumps(event, indent=2, ensure_ascii=False), encoding="utf-8")
-        delivered.append(str(target))
+        try:
+            _write_json_atomic(target, event)
+            delivered.append(str(target))
+        except OSError as exc:
+            delivery_errors.append({"consumer": key, "error": str(exc)})
     pending_dir = output_dir / "_downstream_corrections"
     pending_dir.mkdir(parents=True, exist_ok=True)
     pending_path = pending_dir / f"{manifest.get('correction_set_id')}.json"
-    event["status"] = "delivered" if delivered and not missing else "downstream_pending"
+    event["status"] = "downstream_failed" if delivery_errors else "delivered" if delivered and not missing else "downstream_pending"
     event["delivered_paths"] = delivered
     event["missing_consumers"] = missing
-    pending_path.write_text(json.dumps(event, indent=2, ensure_ascii=False), encoding="utf-8")
+    event["delivery_errors"] = delivery_errors
+    _write_json_atomic(pending_path, event)
     return {**event, "pending_path": str(pending_path)}
 
 
