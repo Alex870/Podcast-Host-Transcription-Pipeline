@@ -116,6 +116,17 @@ Directory containing the FFmpeg Windows binaries/DLLs.
 
 Selects the ASR provider contract. The initial provider release wraps the established faster-whisper path; candidate ASR providers remain gated on pipeline benchmark results.
 
+### Model acquisition and revisions
+
+- `model_id`: canonical ASR model repository ID; defaults to the resolved faster-whisper repository for baseline shorthand.
+- `model_revision`: immutable ASR repository commit hash.
+- `diarization_model_revision`: immutable diarization repository commit hash.
+- `speaker_model_revision`: immutable speaker-embedding repository commit hash.
+- `alignment_model_revision`: immutable WhisperX alignment repository commit hash.
+- `provider_cache_dir`: local artifact root; default `config/provider-models`.
+
+Availability is separate from selection. Use the CLI `--provider-preflight` to inspect receipts and `--download-provider-models` for the only network acquisition path. A selected model without a complete revision-matched receipt fast-fails before processing.
+
 ### `model`
 
 - Type: `string`
@@ -213,7 +224,7 @@ Preflight/dry benchmark-plan behavior for the baseline runner. This is separate 
 ### `speaker_embedding_provider`
 
 - Type: `string`
-- Allowed values: `speechbrain_ecapa`
+- Allowed values: `speechbrain_ecapa`, `speechbrain_xvector`
 - Default: `"speechbrain_ecapa"`
 - Affects: host profiles, known-speaker matching, stage provenance
 

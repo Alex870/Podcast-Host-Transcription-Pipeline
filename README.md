@@ -117,6 +117,10 @@ Expensive stages now record provider-aware fingerprints. The default provider se
 
 Stage 7 keeps `faster_whisper` and `speechbrain_ecapa` as the defaults. `--asr-provider parakeet` is an optional lazy NeMo/Parakeet experiment with explicit Windows/CUDA diagnostics; `--alignment-provider whisperx` enables forced alignment; and `--speaker-embedding-provider speechbrain_xvector` is a candidate family. Candidate reports must pass the gold-set promotion guardrails before a profile or default is changed.
 
+Milestone 4 makes model acquisition explicit. Pin `--model-revision`, `--diarization-model-revision`, and `--speaker-model-revision` (plus `--alignment-model` and `--alignment-model-revision` for WhisperX), run `--provider-preflight`, then invoke `--download-provider-models` as a separate authenticated action. Normal processing uses only revision-matched artifacts under `--provider-cache-dir`; it never downloads models implicitly. `--batch-size 0` selects a conservative adaptive batch, and `--device auto` records CUDA selection or CPU fallback diagnostics.
+
+Use `--pipeline-benchmark --speech-run-id <id>` to publish an immutable shadow run. Promotion additionally requires an approved pack with exact source identity, target condition slices, and a deployment-machine profile containing measured runtime, peak-memory, and storage limits.
+
 The optional review layer can also backfill reviewed outputs from existing `*_cleaned_speaker_transcript.json` files, so legacy tier-1 work does not need to be rerun just to add tier-2 review artifacts.
 
 New runs write `episode-contract-v2`. Legacy v1 bundles are promoted on the next normal pass using output-only or cached reconstruction where possible, with automatic tier-1 reprocessing only when required evidence is unavailable. The workbench writes `correction-manifest-v2` histories and builds recurring-speaker candidates from compatible embeddings rather than reusable diarization labels.

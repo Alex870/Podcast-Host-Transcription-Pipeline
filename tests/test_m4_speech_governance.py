@@ -53,6 +53,24 @@ class MilestoneFourSpeechGovernanceTests(unittest.TestCase):
         self.assertEqual(profile.batch_size, 1)
         self.assertIn("unavailable", profile.fallback_reason)
 
+    def test_unsupported_device_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported device override"):
+            resolve_execution_profile("directml", 0, cuda_available=False)
+
+    def test_explicit_acquisition_forwards_authentication(self):
+        received = {}
+
+        def downloader(**kwargs):
+            received.update(kwargs)
+            path = Path(kwargs["local_dir"])
+            path.mkdir(parents=True)
+            return str(path)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            acquire_provider_artifact(Path(tmp), self.identity(), token="fixture-token", downloader=downloader)
+        self.assertEqual(received["token"], "fixture-token")
+        self.assertEqual(received["revision"], "abc1234")
+
     def test_shadow_run_is_immutable_and_requires_exact_identity(self):
         payload = build_speech_provider_run(
             run_id="run-1",

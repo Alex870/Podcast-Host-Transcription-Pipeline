@@ -225,6 +225,7 @@ def run_pipeline_benchmark(
             "pack_id": str(manifest.get("pack_id") or ""),
             "source_identity": manifest.get("source_identity") or {},
             "target_slices": list(manifest.get("target_slices") or []),
+            "target_machine_profile": manifest.get("target_machine_profile") or {},
             "complete": bool(manifest.get("pack_id") and manifest.get("source_identity")),
         },
         "shadow_only": True,
