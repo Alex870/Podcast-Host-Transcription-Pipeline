@@ -216,6 +216,15 @@ class ReviewBackfillTests(unittest.TestCase):
             self.assertEqual(command[command.index("--alignment-model") + 1], "large-v3")
 
     def test_speaker_attribution_cache_reuses_matching_evidence(self):
+        class FakeEmbedding:
+            size = 2
+
+            def reshape(self, *_shape):
+                return self
+
+            def tolist(self):
+                return [0.25, 0.75]
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             audio = root / "Episode.mp3"
@@ -235,7 +244,7 @@ class ReviewBackfillTests(unittest.TestCase):
                 alignment_fingerprint={"hash": "alignment"}, diarization_fingerprint={"hash": "diarization"},
                 resume_intermediates=True,
             )
-            with patch("podcast_transcribe.cli.choose_host_speaker", return_value=("SPEAKER_00", {}, None, {"SPEAKER_00": 1.0}, {})) as choose, \
+            with patch("podcast_transcribe.cli.choose_host_speaker", return_value=("SPEAKER_00", {"SPEAKER_00": FakeEmbedding()}, None, {"SPEAKER_00": 1.0}, {})) as choose, \
                  patch("podcast_transcribe.cli.match_known_speakers", return_value={}), \
                  patch("podcast_transcribe.cli.final_host_profile_update", return_value=None), \
                  patch("podcast_transcribe.cli.load_host_profile", return_value=None), \
@@ -975,7 +984,8 @@ class ReviewBackfillTests(unittest.TestCase):
                 patch("podcast_transcribe.cli.process_review_backfill_from_cleaned_json", return_value=summary_row), \
                 patch("podcast_transcribe.cli.write_episode_summary_csv"), \
                 patch("podcast_transcribe.cli.state_save_processed_files"), \
-                patch("podcast_transcribe.cli.output_write_batch_report_md"):
+                patch("podcast_transcribe.cli.output_write_batch_report_md"), \
+                patch("podcast_transcribe.cli.exit_isolated_worker_after_success", return_value=False):
                 with redirect_stdout(buffer):
                     process_audio_batch(args, root, root, [audio_path])
             text = buffer.getvalue()
