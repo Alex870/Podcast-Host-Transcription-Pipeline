@@ -5,8 +5,11 @@ from typing import Dict, List, Optional
 
 RUNTIME_PROFILES = {"baseline_16gb", "high_context_5090", "custom"}
 REVIEW_BACKENDS = {"none", "lm_studio", "vllm"}
+REVIEW_REASONING_EFFORTS = {"none", "low", "medium", "xhigh"}
+WORKFLOW_PROFILES = {"podcast", "anonymous_meeting"}
 DEFAULT_RUNTIME_PROFILE = "baseline_16gb"
 DEFAULT_REVIEW_BACKEND = "none"
+DEFAULT_REVIEW_BATCH_TOKEN_LIMIT = 12000
 
 
 def _coerce_bool(value, default: Optional[bool] = None) -> Optional[bool]:
@@ -43,10 +46,23 @@ def resolve_review_runtime_config(raw_config: Optional[Dict[str, object]]) -> Di
 
     review_base_url = str(payload.get("review_base_url") or "").strip()
     review_model_name = str(payload.get("review_model_name") or "").strip()
+    review_reasoning_effort = str(payload.get("review_reasoning_effort") or "none").strip().lower()
+    if review_reasoning_effort not in REVIEW_REASONING_EFFORTS:
+        review_reasoning_effort = "none"
     review_debug = _coerce_bool(payload.get("review_debug"), False) is True
     review_debug_dir = str(payload.get("review_debug_dir") or "").strip()
     review_auto_calibrate = _coerce_bool(payload.get("review_auto_calibrate"), None)
     review_auto_adapt_upward = _coerce_bool(payload.get("review_auto_adapt_upward"), None)
+    review_batch_token_limit_configured = payload.get("review_batch_token_limit") not in (None, "")
+    review_batch_token_limit = payload.get("review_batch_token_limit")
+    try:
+        review_batch_token_limit = int(review_batch_token_limit or DEFAULT_REVIEW_BATCH_TOKEN_LIMIT)
+    except (TypeError, ValueError):
+        review_batch_token_limit = DEFAULT_REVIEW_BATCH_TOKEN_LIMIT
+    review_batch_token_limit = max(2048, min(32000, review_batch_token_limit))
+    # The CLI enables this by default for production runs. Keeping the resolver
+    # opt-in preserves the direct review API's backwards-compatible behavior.
+    review_candidate_filter = _coerce_bool(payload.get("review_candidate_filter"), False) is True
     preferred_terms = _coerce_string_list(payload.get("preferred_terms"))
 
     profile_defaults = {
@@ -122,6 +138,10 @@ def resolve_review_runtime_config(raw_config: Optional[Dict[str, object]]) -> Di
         "effective_backend": effective_backend,
         "review_base_url": review_base_url,
         "review_model_name": review_model_name,
+        "review_reasoning_effort": review_reasoning_effort,
+        "review_batch_token_limit": review_batch_token_limit,
+        "review_batch_token_limit_configured": review_batch_token_limit_configured,
+        "review_candidate_filter": review_candidate_filter,
         "review_debug": review_debug,
         "review_debug_dir": review_debug_dir,
         "review_auto_calibrate": effective_review_auto_calibrate,

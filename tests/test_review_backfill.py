@@ -84,24 +84,34 @@ from podcast_transcribe.cli import (
     build_chunk_speaker_embeddings,
     build_child_process_command,
     classify_episode_processing_state,
+    choose_host_speaker,
     diarization_route_decision,
     diarization_runtime_fingerprint,
     diarize_audio,
     exit_isolated_worker_after_success,
+    eta_excluded_file_names,
+    is_current_review_bundle_skip,
     progress_spinner_name,
+    reconcile_chunk_speakers,
     load_diarization_history,
     normalize_episode_summary_row,
     parse_args,
     process_audio_batch,
     process_review_backfill_from_cleaned_json,
+    provider_configuration_shortfall,
+    prepare_speaker_audio_cache,
     resolve_ffprobe_path,
     run_alignment_stage,
+    run_anonymous_speaker_attribution_stage,
     run_deterministic_cleanup_stage,
     run_speaker_attribution_stage,
+    selected_provider_identities,
+    tolerant_mp3_path_input,
     runtime_config_payload,
     update_diarization_history,
     write_episode_summary_csv,
 )
+import podcast_transcribe.cli as cli_module
 from podcast_transcribe.models import SegmentItem, WordItem
 from podcast_transcribe.providers.contracts import ProviderIdentity, StageResult
 from podcast_transcribe.outputs import build_episode_metadata, write_json_output, write_text_transcript
@@ -116,6 +126,150 @@ class Word:
 
 
 class ReviewBackfillTests(unittest.TestCase):
+    def test_cached_wav_speaker_span_bypasses_native_decoder(self):
+        sentinel = object()
+        with patch("podcast_transcribe.cli.get_audio_metadata", return_value=(16000, 1, 30.0)), patch(
+            "podcast_transcribe.cli._load_pcm_wav_span_mono_16k",
+            return_value=sentinel,
+        ), patch.object(cli_module.torchaudio, "load") as load:
+            result = cli_module.load_audio_span_mono_16k(
+                "episode_speaker_audio.wav",
+                start_seconds=10.0,
+                end_seconds=20.0,
+                sample_rate=16000,
+            )
+
+        self.assertIs(result, sentinel)
+        load.assert_not_called()
+
+    def test_choose_host_speaker_releases_each_speaker_audio_buffer_before_next(self):
+        class Clip:
+            def numel(self):
+                return 16000
+
+        calls = []
+
+        def build_one_speaker(_audio_path, speaker_turns, *_args, **_kwargs):
+            calls.append([turn["speaker"] for turn in speaker_turns])
+            return Clip()
+
+        turns = [
+            {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"},
+            {"start": 2.0, "end": 3.0, "speaker": "SPEAKER_01"},
+        ]
+        with patch("podcast_transcribe.cli.get_audio_metadata", return_value=(16000, 1, 10.0)), patch(
+            "podcast_transcribe.cli._build_speaker_audio_samples_for_turns",
+            side_effect=build_one_speaker,
+        ), patch("podcast_transcribe.cli.compute_embedding", return_value="embedding"):
+            choose_host_speaker(
+                verifier=object(),
+                audio_path="episode.wav",
+                diarized_turns=turns,
+                host_reference_path=None,
+                existing_profile=None,
+                host_threshold=0.5,
+                assume_dominant=False,
+                max_embedding_seconds=90.0,
+                min_host_seconds=0.5,
+            )
+
+        self.assertEqual(calls, [["SPEAKER_00"], ["SPEAKER_01"]])
+
+    def test_current_review_bundle_items_are_excluded_from_eta_candidates(self):
+        audio_files = [Path("already-reviewed.mp3"), Path("needs-work.mp3")]
+        episode_states = {
+            "already-reviewed.mp3": {
+                "state": "complete",
+                "review_bundle_status": "current_review_complete",
+            },
+            "needs-work.mp3": {"state": "needs_tier1", "review_bundle_status": "review_stage_shortfall"},
+        }
+
+        self.assertTrue(is_current_review_bundle_skip(episode_states["already-reviewed.mp3"]))
+        self.assertFalse(is_current_review_bundle_skip(episode_states["needs-work.mp3"]))
+        self.assertEqual(
+            eta_excluded_file_names(audio_files, episode_states),
+            {"already-reviewed.mp3"},
+        )
+
+    def test_tolerant_mp3_path_input_pads_a_codec_frame_sized_short_read(self):
+        class FakeData:
+            def __init__(self, samples):
+                self.shape = (1, samples)
+
+            def __getitem__(self, key):
+                column_slice = key[1]
+                start, stop, step = column_slice.indices(self.shape[1])
+                return FakeData(max(0, (stop - start + step - 1) // step))
+
+            def padded(self, samples):
+                return FakeData(self.shape[1] + samples)
+
+        class FakeDecoder:
+            def __init__(self, path):
+                self.metadata = SimpleNamespace(
+                    sample_rate=48000,
+                    duration_seconds_from_header=10.0,
+                )
+
+            def get_samples_played_in_range(self, start, end):
+                return SimpleNamespace(data=FakeData(478895), sample_rate=48000)
+
+        class FakeAudio:
+            @staticmethod
+            def validate_file(file):
+                return {"audio": str(file)}
+
+            def get_num_samples(self, duration, sample_rate=None):
+                return round(duration * (sample_rate or 48000))
+
+            def downmix_and_resample(self, data, sample_rate, channel=None):
+                return data, sample_rate
+
+            def crop(self, file, segment, mode="raise"):
+                raise ValueError(
+                    "requested chunk [ 00:00:00.000 -->  00:00:10.000] from file "
+                    "resulted in 478895 samples instead of the expected 480000 samples."
+                )
+
+        class FakeSegment:
+            start = 0.0
+            end = 10.0
+            duration = 10.0
+
+        core_module = types.ModuleType("pyannote.audio.core")
+        io_module = types.ModuleType("pyannote.audio.core.io")
+        io_module.Audio = FakeAudio
+        io_module.AudioDecoder = FakeDecoder
+        io_module.TORCHCODEC_AVAILABLE = True
+        sys.modules["pyannote.audio"].core = core_module
+        core_module.io = io_module
+        sys.modules["pyannote.audio.core"] = core_module
+        sys.modules["pyannote.audio.core.io"] = io_module
+
+        try:
+            with patch.object(
+                cli_module.torch,
+                "nn",
+                SimpleNamespace(
+                    functional=SimpleNamespace(
+                        pad=lambda data, padding: data.padded(padding[1])
+                    )
+                ),
+                create=True,
+            ):
+                audio = FakeAudio()
+                with tolerant_mp3_path_input():
+                    data, sample_rate = audio.crop("episode.mp3", FakeSegment())
+
+            self.assertEqual(sample_rate, 48000)
+            self.assertEqual(data.shape, (1, 480000))
+            self.assertIs(audio.crop.__func__, FakeAudio.crop)
+        finally:
+            delattr(sys.modules["pyannote.audio"], "core")
+            sys.modules.pop("pyannote.audio.core.io", None)
+            sys.modules.pop("pyannote.audio.core", None)
+
     def test_progress_spinner_is_ascii_safe_for_legacy_windows_encoding(self):
         stream = SimpleNamespace(encoding="cp1252")
         self.assertEqual(progress_spinner_name(stream), "line")
@@ -150,6 +304,59 @@ class ReviewBackfillTests(unittest.TestCase):
             ):
                 self.assertIsNone(resolve_ffprobe_path())
 
+    def test_speaker_audio_cache_converts_compressed_source_and_reuses_matching_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "episode.mp3"
+            source.write_bytes(b"fake mp3")
+            output_dir = root / "output"
+            telemetry = cli_module.new_speaker_telemetry()
+            component_timings = {}
+
+            def fake_ffmpeg(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"RIFF" + (b"\0" * 100))
+
+            with patch.object(cli_module, "resolve_ffmpeg_path", return_value=str(root / "ffmpeg.exe")), patch.object(
+                cli_module.subprocess, "run", side_effect=fake_ffmpeg
+            ) as run_mock:
+                cache_path = prepare_speaker_audio_cache(
+                    source,
+                    output_dir,
+                    telemetry=telemetry,
+                    component_timings=component_timings,
+                )
+
+            self.assertEqual(cache_path.suffix, ".wav")
+            self.assertEqual(telemetry["audio_cache_mode"], "created")
+            self.assertGreaterEqual(float(telemetry["audio_cache_conversion_wall_seconds"]), 0.0)
+            self.assertIn("audio cache conversion", component_timings)
+            command = run_mock.call_args.args[0]
+            self.assertIn("-ac", command)
+            self.assertEqual(command[command.index("-ac") + 1], "1")
+            self.assertEqual(command[command.index("-ar") + 1], "16000")
+            self.assertEqual(command[command.index("-c:a") + 1], "pcm_s16le")
+
+            with patch.object(cli_module, "resolve_ffmpeg_path") as resolve_mock, patch.object(
+                cli_module.subprocess, "run"
+            ) as second_run_mock:
+                reused_path = prepare_speaker_audio_cache(source, output_dir, telemetry=telemetry)
+
+            self.assertEqual(reused_path, cache_path)
+            self.assertEqual(telemetry["audio_cache_mode"], "reused")
+            resolve_mock.assert_not_called()
+            second_run_mock.assert_not_called()
+
+    def test_speaker_audio_cache_falls_back_when_ffmpeg_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "episode.mp3"
+            source.write_bytes(b"fake mp3")
+            telemetry = cli_module.new_speaker_telemetry()
+            with patch.object(cli_module, "resolve_ffmpeg_path", return_value=None):
+                result = prepare_speaker_audio_cache(source, Path(tmp) / "output", telemetry=telemetry)
+
+            self.assertEqual(result, source)
+            self.assertEqual(telemetry["audio_cache_mode"], "unavailable")
+
     def test_cli_accepts_provider_and_pipeline_benchmark_options(self):
         with patch.object(
             sys,
@@ -180,6 +387,80 @@ class ReviewBackfillTests(unittest.TestCase):
         runtime = runtime_config_payload(args)
         self.assertEqual(runtime["review_context_budget"], 64000)
         self.assertEqual(runtime["preferred_terms"], ["ChromaDB"])
+
+    def test_anonymous_meeting_profile_disables_identity_and_review(self):
+        with patch.object(sys, "argv", [
+            "podcast_transcribe_host.py", "--input-dir", "source",
+            "--workflow-profile", "anonymous_meeting", "--backend", "vllm",
+            "--transcript-cleanup-review", "--assume-dominant-speaker-is-host",
+        ]):
+            args = parse_args()
+        runtime = runtime_config_payload(args)
+        self.assertEqual("anonymous_meeting", runtime["workflow_profile"])
+        self.assertEqual("none", runtime["backend"])
+        self.assertFalse(runtime["review_runtime"]["any_review_enabled"])
+        self.assertFalse(runtime["assume_dominant_speaker_is_host"])
+        self.assertNotIn("speaker_embedding", {item.stage for item in selected_provider_identities(args)})
+        command = build_child_process_command(args, Path("source/Episode.mp3"), Path("output"))
+        self.assertEqual(command[command.index("--workflow-profile") + 1], "anonymous_meeting")
+
+    def test_anonymous_profile_rebuilds_prior_podcast_identity_bundle(self):
+        cleaned_payload = {
+            "speaker_identity_evidence": [{"local_speaker": "SPEAKER_00"}],
+            "metadata": {
+                "stage_provenance": {
+                    "speaker_embedding": {"provider": {"provider": "speechbrain_ecapa"}},
+                },
+            },
+        }
+        self.assertIn(
+            "workflow_profile",
+            provider_configuration_shortfall(
+                cleaned_payload,
+                {"workflow_profile": "anonymous_meeting"},
+            ),
+        )
+
+    def test_anonymous_speaker_attribution_maps_labels_without_embedding_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "Episode.mp3"
+            audio.write_bytes(b"audio")
+            segments = [
+                SegmentItem(1, 0.0, 1.0, "One", None, None, None, [WordItem(0.0, 1.0, "One", None)]),
+                SegmentItem(2, 1.0, 2.0, "Two", None, None, None, [WordItem(1.0, 2.0, "Two", None)]),
+            ]
+            turns = [
+                {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_A"},
+                {"start": 1.0, "end": 2.0, "speaker": "SPEAKER_B"},
+            ]
+            result = run_anonymous_speaker_attribution_stage(
+                output_dir=root / "output", audio_path=audio, segments=segments, diarized_turns=turns,
+                alignment_fingerprint={"hash": "alignment"}, diarization_fingerprint={"hash": "diarization"},
+                resume_intermediates=False,
+            )
+            self.assertIsNone(result[0])
+            self.assertEqual({}, result[3])
+            self.assertEqual({}, result[4])
+            self.assertEqual([], result[7])
+            self.assertEqual({"SPEAKER_A": "SPEAKER_01", "SPEAKER_B": "SPEAKER_02"}, result[5])
+
+    def test_anonymous_chunk_reconciliation_skips_embeddings(self):
+        mapping, stats = reconcile_chunk_speakers(
+            None,
+            "unused.mp3",
+            [
+                {"chunk": {"start": 0.0, "end": 10.0}, "turns": [{"speaker": "chunk0_SPEAKER_00"}]},
+                {"chunk": {"start": 9.0, "end": 19.0}, "turns": [{"speaker": "chunk1_SPEAKER_00"}]},
+            ],
+            30.0,
+        )
+        self.assertEqual(
+            {"chunk0_SPEAKER_00": "SPEAKER_00", "chunk1_SPEAKER_00": "SPEAKER_01"},
+            mapping,
+        )
+        self.assertTrue(stats["reconciliation_skipped"])
+        self.assertEqual(0, stats["reconciliation_merge_count"])
 
     def test_isolated_worker_preserves_explicit_review_and_custom_profile_controls(self):
         with tempfile.TemporaryDirectory() as tmp:

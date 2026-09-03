@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("Prompt", "Run", "Debug", "Migrate", "Benchmark", "PipelineBenchmark", "Workbench", "ConfigureLLM")]
+    [ValidateSet("Prompt", "Run", "Debug", "Migrate", "Benchmark", "PipelineBenchmark", "DownloadModels", "AnonymousMeeting", "Workbench", "ConfigureLLM")]
     [string]$Action = "Prompt"
 )
 
@@ -14,7 +14,10 @@ function Invoke-LauncherScript {
     param(
         [string]$Path,
         [switch]$ReviewBenchmark,
-        [switch]$PipelineBenchmark
+        [switch]$PipelineBenchmark,
+        [switch]$DownloadProviderModels,
+        [ValidateSet("podcast", "anonymous_meeting")]
+        [string]$WorkflowProfile = "podcast"
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -25,6 +28,10 @@ function Invoke-LauncherScript {
         & $Path -ReviewBenchmark
     } elseif ($PipelineBenchmark) {
         & $Path -PipelineBenchmark
+    } elseif ($DownloadProviderModels) {
+        & $Path -DownloadProviderModels
+    } elseif ($WorkflowProfile -eq "anonymous_meeting") {
+        & $Path -WorkflowProfile anonymous_meeting
     } else {
         & $Path
     }
@@ -41,8 +48,10 @@ function Read-LauncherAction {
     Write-Host "  5. Launch transcript review workbench"
     Write-Host "  6. Run pipeline quality benchmark"
     Write-Host "  7. Configure external review LLM"
+    Write-Host "  8. Download pinned transcription models"
+    Write-Host "  9. Transcribe committee meeting (anonymous speakers)"
     Write-Host "  Q. Quit"
-    $selection = (Read-Host "Enter 1, 2, 3, 4, 5, 6, 7, or Q").Trim()
+    $selection = (Read-Host "Enter 1, 2, 3, 4, 5, 6, 7, 8, 9, or Q").Trim()
 
     switch ($selection.ToUpperInvariant()) {
         "1" { return "Debug" }
@@ -52,6 +61,8 @@ function Read-LauncherAction {
         "5" { return "Workbench" }
         "6" { return "PipelineBenchmark" }
         "7" { return "ConfigureLLM" }
+        "8" { return "DownloadModels" }
+        "9" { return "AnonymousMeeting" }
         "Q" { return "Quit" }
         default {
             Write-Host "Unrecognized selection. Please try again." -ForegroundColor Yellow
@@ -72,6 +83,8 @@ function Invoke-SelectedLauncherAction {
         "Migrate" { Invoke-LauncherScript -Path $MigrateScript }
         "Benchmark" { Invoke-LauncherScript -Path $RunScript -ReviewBenchmark }
         "PipelineBenchmark" { Invoke-LauncherScript -Path $RunScript -PipelineBenchmark }
+        "DownloadModels" { Invoke-LauncherScript -Path $RunScript -DownloadProviderModels }
+        "AnonymousMeeting" { Invoke-LauncherScript -Path $RunScript -WorkflowProfile anonymous_meeting }
         "Workbench" { Invoke-LauncherScript -Path $WorkbenchScript }
         "ConfigureLLM" { Invoke-LauncherScript -Path $ConfigureLlmScript }
         default { throw "Unsupported launcher action: $SelectedAction" }

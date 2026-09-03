@@ -10,13 +10,14 @@ import urllib.error
 import urllib.request
 from hashlib import sha1
 from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from podcast_transcribe.config import resolve_review_runtime_config
 from podcast_transcribe.learned_rules import active_rules_for_stage
-from podcast_transcribe.models import SegmentItem
-from podcast_transcribe.state import ARTIFACT_DIRNAME
+from podcast_transcribe.models import SegmentItem, WordItem
+from podcast_transcribe.state import ARTIFACT_DIRNAME, atomic_write_text, audio_file_fingerprint
 
 
 REVIEW_PIPELINE_VERSION = 2
@@ -92,22 +93,200 @@ STAGE_DEFINITIONS = [
 ReviewProgressCallback = Callable[[Dict[str, object]], None]
 
 
+def _review_progress_path(debug_context: Optional[Dict[str, object]]) -> Optional[Path]:
+    if not isinstance(debug_context, dict):
+        return None
+    output_dir = str(debug_context.get("output_dir") or "").strip()
+    audio_path = str(debug_context.get("audio_path") or "").strip()
+    if not output_dir or not audio_path:
+        return None
+    return Path(output_dir) / ARTIFACT_DIRNAME / Path(audio_path).stem / "review_progress.json"
+
+
+def _review_progress_fingerprint(
+    backend_capabilities: Dict[str, object],
+    flags: Dict[str, bool],
+    review_input_source: str,
+) -> Dict[str, object]:
+    return {
+        "pipeline_version": REVIEW_PIPELINE_VERSION,
+        "runtime_profile": str(backend_capabilities.get("runtime_profile") or ""),
+        "backend_name": str(backend_capabilities.get("backend_name") or ""),
+        "review_base_url": str(backend_capabilities.get("review_base_url") or ""),
+        "review_model_name": str(backend_capabilities.get("review_model_name") or ""),
+        "review_reasoning_effort": str(backend_capabilities.get("review_reasoning_effort") or ""),
+        "review_batch_token_limit": int(backend_capabilities.get("review_batch_token_limit") or 0),
+        "review_candidate_filter": bool(backend_capabilities.get("review_candidate_filter")),
+        "stage_flags": dict(flags),
+        "review_input_source": review_input_source,
+    }
+
+
+def _segment_from_progress_payload(payload: Dict[str, object]) -> SegmentItem:
+    words = [
+        WordItem(
+            start=word.get("start"),
+            end=word.get("end"),
+            word=str(word.get("word") or ""),
+            speaker=word.get("speaker"),
+        )
+        for word in payload.get("words") or []
+        if isinstance(word, dict)
+    ]
+    return SegmentItem(
+        id=int(payload["id"]),
+        start=float(payload["start"]),
+        end=float(payload["end"]),
+        text=str(payload.get("text") or ""),
+        speaker=payload.get("speaker"),
+        avg_logprob=payload.get("avg_logprob"),
+        no_speech_prob=payload.get("no_speech_prob"),
+        words=words,
+        original_text=payload.get("original_text"),
+        cleanup_applied=bool(payload.get("cleanup_applied")),
+        cleanup_level=str(payload.get("cleanup_level") or ""),
+        manual_correction_applied=bool(payload.get("manual_correction_applied")),
+        original_speaker=payload.get("original_speaker"),
+        llm_reviewed_text=payload.get("llm_reviewed_text"),
+        review_runtime_profile=payload.get("review_runtime_profile"),
+        review_backend=payload.get("review_backend"),
+        review_model_name=payload.get("review_model_name"),
+        review_stage_flags=payload.get("review_stage_flags"),
+    )
+
+
+def _load_review_progress(
+    debug_context: Optional[Dict[str, object]],
+    backend_capabilities: Dict[str, object],
+    flags: Dict[str, bool],
+    review_input_source: str,
+) -> Dict[str, object]:
+    path = _review_progress_path(debug_context)
+    if path is None or not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        audio_path = Path(str((debug_context or {}).get("audio_path") or ""))
+        if payload.get("source_fingerprint") != audio_file_fingerprint(audio_path):
+            return {}
+        if payload.get("runtime_fingerprint") != _review_progress_fingerprint(backend_capabilities, flags, review_input_source):
+            return {}
+        segments = [
+            _segment_from_progress_payload(item)
+            for item in payload.get("segments") or []
+            if isinstance(item, dict) and item.get("id") is not None
+        ]
+        return {**payload, "segments": segments} if segments else {}
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return {}
+
+
+def _save_review_progress(
+    debug_context: Optional[Dict[str, object]],
+    backend_capabilities: Dict[str, object],
+    flags: Dict[str, bool],
+    review_input_source: str,
+    segments: List[SegmentItem],
+    completed_stages: List[str],
+    stage_results: Dict[str, Dict[str, object]],
+    episode_notes: List[str],
+):
+    path = _review_progress_path(debug_context)
+    if path is None:
+        return
+    audio_path = Path(str((debug_context or {}).get("audio_path") or ""))
+    try:
+        source_fingerprint = audio_file_fingerprint(audio_path)
+    except OSError:
+        return
+    payload = {
+        "progress_version": 1,
+        "source_fingerprint": source_fingerprint,
+        "runtime_fingerprint": _review_progress_fingerprint(backend_capabilities, flags, review_input_source),
+        "completed_stages": list(completed_stages),
+        "stage_results": stage_results,
+        "episode_notes": list(episode_notes),
+        "segments": [asdict(segment) for segment in segments],
+    }
+    atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False))
+
+
 def _review_stage_family(stage_name: str) -> str:
     return REVIEW_STAGE_FAMILIES.get(stage_name, "local_text_review")
 
 
 def _family_default_budget(backend_capabilities: Dict[str, object], family_name: str) -> int:
     max_context_budget = int(backend_capabilities.get("max_context_budget") or 0)
+    batch_limit = int(backend_capabilities.get("review_batch_token_limit") or 12000)
+    batch_limit = batch_limit if backend_capabilities.get("review_batch_token_limit_configured") else max_context_budget
     if family_name == "long_context_review":
-        return max(4096, max_context_budget - 2048)
-    return min(LOCAL_REVIEW_CONTEXT_LIMIT, max(2048, max_context_budget - 1024))
+        return max(4096, min(batch_limit, max_context_budget - 2048))
+    return min(LOCAL_REVIEW_CONTEXT_LIMIT, batch_limit, max(2048, max_context_budget - 1024))
 
 
 def _family_hard_ceiling(backend_capabilities: Dict[str, object], family_name: str) -> int:
     max_context_budget = int(backend_capabilities.get("max_context_budget") or 0)
+    batch_limit = int(backend_capabilities.get("review_batch_token_limit") or 12000)
+    batch_limit = batch_limit if backend_capabilities.get("review_batch_token_limit_configured") else max_context_budget
     if family_name == "long_context_review":
-        return max(4096, max_context_budget - 2048)
-    return max(2048, max_context_budget - 1024)
+        return max(4096, min(batch_limit, max_context_budget - 2048))
+    return max(2048, min(LOCAL_REVIEW_CONTEXT_LIMIT, batch_limit, max_context_budget - 1024))
+
+
+def _segment_review_reasons(segment: SegmentItem) -> List[str]:
+    """Return conservative reasons for sending a segment to the LLM reviewer."""
+
+    reasons: List[str] = []
+    if bool(getattr(segment, "cleanup_applied", False)):
+        reasons.append("deterministic_cleanup")
+    if bool(getattr(segment, "manual_correction_applied", False)):
+        reasons.append("manual_correction")
+    original_text = getattr(segment, "original_text", None)
+    if original_text not in (None, "") and str(original_text) != str(segment.text):
+        reasons.append("text_changed")
+    original_speaker = getattr(segment, "original_speaker", None)
+    if original_speaker not in (None, "") and str(original_speaker) != str(segment.speaker):
+        reasons.append("speaker_changed")
+    if not str(getattr(segment, "text", "") or "").strip():
+        reasons.append("empty_text")
+
+    # Missing confidence is treated as uncertain. That keeps legacy cleaned
+    # JSON safe while allowing high-confidence, unchanged segments to skip.
+    try:
+        avg_logprob = float(segment.avg_logprob) if segment.avg_logprob is not None else None
+    except (TypeError, ValueError):
+        avg_logprob = None
+    try:
+        no_speech_prob = float(segment.no_speech_prob) if segment.no_speech_prob is not None else None
+    except (TypeError, ValueError):
+        no_speech_prob = None
+    if avg_logprob is None or avg_logprob < -1.0:
+        reasons.append("low_or_missing_avg_logprob")
+    if no_speech_prob is None or no_speech_prob > 0.6:
+        reasons.append("high_or_missing_no_speech_prob")
+    return reasons
+
+
+def _review_scope(
+    segments: List[SegmentItem],
+    candidate_ids: set[str],
+    stage_definition: Dict[str, object],
+) -> Tuple[List[SegmentItem], set[str]]:
+    """Return editable candidates plus small context windows for episode QA."""
+
+    if stage_definition["mode"] != "long_context":
+        return [segment for segment in segments if str(segment.id) in candidate_ids], candidate_ids
+
+    if not candidate_ids:
+        return [], set()
+    scope_indexes = set()
+    for index, segment in enumerate(segments):
+        if str(segment.id) not in candidate_ids:
+            continue
+        for context_index in range(max(0, index - EPISODE_QA_OVERLAP_SEGMENTS), min(len(segments), index + EPISODE_QA_OVERLAP_SEGMENTS + 1)):
+            scope_indexes.add(context_index)
+    scope = [segments[index] for index in sorted(scope_indexes)]
+    return scope, candidate_ids
 
 
 def _family_floor_budget(family_name: str) -> int:
@@ -209,17 +388,51 @@ class ReviewCalibrationSession:
             "backend_name": str(backend_capabilities.get("backend_name") or ""),
             "review_model_name": str(backend_capabilities.get("review_model_name") or ""),
             "review_base_url": str(backend_capabilities.get("review_base_url") or ""),
+            "review_reasoning_effort": str(backend_capabilities.get("review_reasoning_effort") or ""),
+            "review_batch_token_limit": int(backend_capabilities.get("review_batch_token_limit") or 0),
+            "review_candidate_filter": bool(backend_capabilities.get("review_candidate_filter")),
             "backend_identity_source": str(backend_capabilities.get("backend_identity_source") or ""),
             "backend_identity_model_id": str(backend_capabilities.get("backend_identity_model_id") or ""),
             "backend_identity_digest": str(backend_capabilities.get("backend_identity_digest") or ""),
             "backend_identity_reported_max_context": backend_capabilities.get("backend_identity_reported_max_context"),
         }
         saved_fingerprint = self.persisted_state.get("runtime_fingerprint")
-        fingerprint_matches = saved_fingerprint == self.runtime_fingerprint
+        # The /v1/models identity fields are opportunistic: a temporary health
+        # check failure must not invalidate otherwise reusable calibration.
+        fingerprint_keys = tuple(
+            key
+            for key in self.runtime_fingerprint
+            if not key.startswith("backend_identity_")
+        )
+
+        def fingerprint_value(payload: object, key: str):
+            if not isinstance(payload, dict) or key not in payload:
+                return {
+                    "review_reasoning_effort": "none",
+                    "review_batch_token_limit": 0,
+                    "review_candidate_filter": False,
+                }.get(key)
+            return payload.get(key)
+
+        fingerprint_matches = bool(
+            isinstance(saved_fingerprint, dict)
+            and all(
+                fingerprint_value(saved_fingerprint, key) == fingerprint_value(self.runtime_fingerprint, key)
+                for key in fingerprint_keys
+            )
+        )
         families_payload = self.persisted_state.get("families") if fingerprint_matches else {}
         self._session_events: List[Dict[str, object]] = []
         self.warm_start_used = bool(fingerprint_matches and isinstance(families_payload, dict) and families_payload)
-        self.calibrated = False
+        # Calibration is a runtime-level property. If the persisted budgets were
+        # calibrated for the same backend/model/prompt settings, reuse them and
+        # do not probe the live model again on every episode.
+        self.calibrated = bool(
+            fingerprint_matches
+            and self.persisted_state.get("calibrated") is True
+            and isinstance(families_payload, dict)
+            and families_payload
+        )
         self.calibrated_this_run = False
         self.families: Dict[str, Dict[str, object]] = {}
         for family_name in {"local_text_review", "local_speaker_review", "long_context_review"}:
@@ -258,7 +471,7 @@ class ReviewCalibrationSession:
     def serialize(self) -> Dict[str, object]:
         return {
             "runtime_fingerprint": self.runtime_fingerprint,
-            "calibrated": self.calibrated_this_run,
+            "calibrated": bool(self.calibrated or self.calibrated_this_run),
             "families": {
                 family_name: {
                     key: value
@@ -323,6 +536,7 @@ class ReviewCalibrationSession:
         progress_callback: Optional[ReviewProgressCallback] = None,
         debug_context: Optional[Dict[str, object]] = None,
     ):
+        calibration_started = time.perf_counter()
         if self.calibrated or not self.backend_capabilities.get("backend_ready"):
             return
         families_to_calibrate: List[str] = []
@@ -333,6 +547,14 @@ class ReviewCalibrationSession:
         if not families_to_calibrate:
             self.calibrated = True
             self.calibrated_this_run = True
+            if progress_callback:
+                progress_callback(
+                    {
+                        "event": "calibration_complete",
+                        "summary": "Review calibration complete (no enabled stage families).",
+                        "elapsed_seconds": time.perf_counter() - calibration_started,
+                    }
+                )
             return
         for family_name in families_to_calibrate:
             self._calibrate_family(family_name, segments, debug_context=debug_context)
@@ -343,6 +565,7 @@ class ReviewCalibrationSession:
                 {
                     "event": "calibration_complete",
                     "summary": self._console_summary(families_to_calibrate),
+                    "elapsed_seconds": time.perf_counter() - calibration_started,
                 }
             )
 
@@ -935,6 +1158,17 @@ def _openai_compatible_chat_completion(
             {"role": "user", "content": user_prompt},
         ],
     }
+    if backend_capabilities.get("backend_name") == "vllm" and "qwen" in model_name.lower():
+        reasoning_effort = str(backend_capabilities.get("review_reasoning_effort") or "none").strip().lower()
+        if reasoning_effort == "none":
+            # Qwen3.8 defaults to thinking. This hard per-request switch is
+            # stronger and more reliable than relying on a /no_think prompt.
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        else:
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": True,
+                "reasoning_effort": reasoning_effort,
+            }
     if payload["response_format"] is None:
         payload.pop("response_format")
 
@@ -957,7 +1191,8 @@ def _openai_compatible_chat_completion(
 def _should_force_no_think(runtime_review_config: Dict[str, object]) -> bool:
     backend_name = str(runtime_review_config.get("backend_name") or "").strip().lower()
     model_name = str(runtime_review_config.get("review_model_name") or "").strip().lower()
-    return backend_name == "vllm" and "qwen" in model_name
+    effort = str(runtime_review_config.get("review_reasoning_effort") or "none").strip().lower()
+    return backend_name == "vllm" and "qwen" in model_name and effort == "none"
 
 
 def _normalize_episode_notes(payload: Dict[str, object]) -> List[str]:
@@ -1430,6 +1665,7 @@ def _apply_stage_updates(
     updates_by_id: Dict[str, Dict[str, object]],
     stage_definition: Dict[str, object],
     preferred_terms: Optional[List[str]] = None,
+    editable_segment_ids: Optional[set[str]] = None,
 ) -> Tuple[List[SegmentItem], Dict[str, int], List[str]]:
     corrected_segment_count = 0
     updated_segments: List[SegmentItem] = []
@@ -1444,7 +1680,8 @@ def _apply_stage_updates(
 
     for segment in segments:
         reviewed = deepcopy(segment)
-        update = updates_by_id.get(str(segment.id), {})
+        is_editable = editable_segment_ids is None or str(segment.id) in editable_segment_ids
+        update = updates_by_id.get(str(segment.id), {}) if is_editable else {}
         intended_change = False
         if allow_text_edits and "text" in update:
             intended_text = str(update.get("text") or segment.text).strip() or segment.text
@@ -1511,6 +1748,9 @@ def _disabled_stage_result(stage_definition: Dict[str, object]) -> Dict[str, obj
         "budget_used": 0,
         "mode": "disabled",
         "edit_scope": stage_definition["edit_scope"],
+        "candidate_count": 0,
+        "context_segment_count": 0,
+        "skipped_segment_count": 0,
     }
 
 
@@ -1530,6 +1770,9 @@ def _skipped_stage_result(stage_definition: Dict[str, object], reason: str, atte
         "budget_used": 0,
         "mode": "skipped",
         "edit_scope": stage_definition["edit_scope"],
+        "candidate_count": 0,
+        "context_segment_count": 0,
+        "skipped_segment_count": 0,
     }
 
 
@@ -1542,6 +1785,7 @@ def _run_review_stage(
     calibration_session: Optional[ReviewCalibrationSession] = None,
     progress_callback: Optional[ReviewProgressCallback] = None,
     debug_context: Optional[Dict[str, object]] = None,
+    editable_segment_ids: Optional[set[str]] = None,
 ) -> Tuple[List[SegmentItem], Dict[str, object], List[str], str]:
     stage_started = time.perf_counter()
     family_name = _review_stage_family(stage_definition["name"])
@@ -1624,6 +1868,7 @@ def _run_review_stage(
                     updates_by_id,
                     stage_definition,
                     preferred_terms=preferred_terms,
+                    editable_segment_ids=editable_segment_ids,
                 )
                 result = (
                     updated_segments,
@@ -1685,6 +1930,7 @@ def _run_review_stage(
             updates_by_id,
             stage_definition,
             preferred_terms=preferred_terms,
+            editable_segment_ids=editable_segment_ids,
         )
         result = (
             updated_segments,
@@ -1738,6 +1984,7 @@ def _run_review_stage(
         updates_by_id,
         stage_definition,
         preferred_terms=preferred_terms,
+        editable_segment_ids=editable_segment_ids,
     )
     result = (
         updated_segments,
@@ -1906,6 +2153,11 @@ def review_segments(
         "review_change_summary": {},
         "review_stage_value": {},
         "review_guard_interventions": {},
+        "review_candidate_filter": bool(backend_capabilities.get("review_candidate_filter")),
+        "review_candidate_count": 0,
+        "review_context_segment_count": 0,
+        "review_skipped_segment_count": 0,
+        "review_candidate_reason_counts": {},
         "active_learned_rule_ids": active_rule_ids,
         "learned_rule_stage_summary": {},
         "contributing_learned_rule_ids": [],
@@ -1954,25 +2206,82 @@ def review_segments(
             "metadata": metadata,
         }
 
+    candidate_reason_counts: Dict[str, int] = {}
+    candidate_ids: set[str] = set()
+    if backend_capabilities.get("review_candidate_filter"):
+        for segment in segments:
+            reasons = _segment_review_reasons(segment)
+            if not reasons:
+                continue
+            candidate_ids.add(str(segment.id))
+            for reason in reasons:
+                candidate_reason_counts[reason] = candidate_reason_counts.get(reason, 0) + 1
+    else:
+        candidate_ids = {str(segment.id) for segment in segments}
+    metadata["review_candidate_count"] = len(candidate_ids)
+    metadata["review_skipped_segment_count"] = max(0, len(segments) - len(candidate_ids))
+    metadata["review_candidate_reason_counts"] = candidate_reason_counts
+
     if calibration_session is not None and backend_capabilities.get("review_auto_calibrate"):
         calibration_session.calibrate_for_run(
             enabled_stages,
-            segments,
+            [segment for segment in segments if str(segment.id) in candidate_ids],
             progress_callback=progress_callback,
             debug_context=debug_context,
         )
         metadata["review_calibration"] = calibration_session.metadata_snapshot()
 
     working_segments = _prepare_review_segments(segments, backend_capabilities, flags)
+    progress_state = _load_review_progress(
+        debug_context,
+        backend_capabilities,
+        flags,
+        review_input_source,
+    )
+    restored_segments = progress_state.get("segments") if isinstance(progress_state, dict) else None
+    if isinstance(restored_segments, list):
+        restored_by_id = {str(segment.id): segment for segment in restored_segments}
+        if restored_by_id and all(str(segment.id) in restored_by_id for segment in working_segments):
+            working_segments = [restored_by_id.get(str(segment.id), segment) for segment in working_segments]
+            metadata["review_resume_source"] = "review_progress_checkpoint"
+        else:
+            progress_state = {}
+    else:
+        progress_state = {}
+    restored_completed_stages = [
+        str(stage_name)
+        for stage_name in progress_state.get("completed_stages") or []
+        if isinstance(stage_name, str) and stage_name in enabled_stages
+    ]
+    restored_stage_results = progress_state.get("stage_results") if isinstance(progress_state.get("stage_results"), dict) else {}
+    restored_episode_notes = [str(note) for note in progress_state.get("episode_notes") or [] if str(note).strip()]
+    metadata["review_resumed_completed_stages"] = list(restored_completed_stages)
     attempted_any = False
     total_corrected = 0
     episode_notes: List[str] = []
     total_enabled = len(enabled_stages)
     completed_count = 0
 
+    def record_completed_stage(stage_name: str, stage_result: Dict[str, object]):
+        nonlocal attempted_any, total_corrected, completed_count
+        metadata["review_completed_stages"].append(stage_name)
+        attempted_any = True
+        total_corrected += int(stage_result.get("corrected_segment_count") or 0)
+        metadata["protected_term_violation_count"] += int(stage_result.get("protected_term_violation_count") or 0)
+        completed_count += 1
+
     for stage_index, stage_definition in enumerate(STAGE_DEFINITIONS, start=1):
         stage_name = stage_definition["name"]
         if not flags.get(stage_name, False):
+            continue
+        if stage_name in restored_completed_stages:
+            stage_result = restored_stage_results.get(stage_name)
+            if not isinstance(stage_result, dict):
+                continue
+            metadata["review_stage_results"][stage_name] = stage_result
+            record_completed_stage(stage_name, stage_result)
+            if stage_name == "episode_qa_review":
+                metadata["episode_qa_mode"] = str(stage_result.get("mode") or "")
             continue
         if progress_callback:
             progress_callback(
@@ -1985,16 +2294,47 @@ def review_segments(
                 }
             )
         try:
-            working_segments, stage_result, stage_notes, stage_mode = _run_review_stage(
-                working_segments,
-                backend_capabilities,
-                stage_definition,
-                preferred_terms=preferred_terms,
-                learned_rules=learned_rules,
-                calibration_session=calibration_session,
-                progress_callback=progress_callback,
-                debug_context=debug_context,
-            )
+            stage_scope, editable_ids = _review_scope(working_segments, candidate_ids, stage_definition)
+            if not stage_scope:
+                stage_result = {
+                    **_skipped_stage_result(stage_definition, "no_changed_or_uncertain_segments"),
+                    "attempted": False,
+                    "status": "completed",
+                    "skip_reason": "no_changed_or_uncertain_segments",
+                    "budget_used": 0,
+                    "mode": "candidate_filter",
+                    "candidate_count": 0,
+                    "context_segment_count": 0,
+                    "skipped_segment_count": len(working_segments),
+                }
+                stage_notes = []
+                stage_mode = "candidate_filter"
+                metadata["review_context_segment_count"] = max(
+                    int(metadata.get("review_context_segment_count") or 0),
+                    0,
+                )
+            else:
+                stage_result_input = _run_review_stage(
+                    stage_scope,
+                    backend_capabilities,
+                    stage_definition,
+                    preferred_terms=preferred_terms,
+                    learned_rules=learned_rules,
+                    calibration_session=calibration_session,
+                    progress_callback=progress_callback,
+                    debug_context=debug_context,
+                    editable_segment_ids=editable_ids,
+                )
+                reviewed_scope, stage_result, stage_notes, stage_mode = stage_result_input
+                reviewed_by_id = {str(segment.id): segment for segment in reviewed_scope}
+                working_segments = [reviewed_by_id.get(str(segment.id), segment) for segment in working_segments]
+                stage_result["candidate_count"] = len(candidate_ids)
+                stage_result["context_segment_count"] = len(stage_scope)
+                stage_result["skipped_segment_count"] = max(0, len(working_segments) - len(candidate_ids))
+                metadata["review_context_segment_count"] = max(
+                    int(metadata.get("review_context_segment_count") or 0),
+                    len(stage_scope),
+                )
         except Exception as exc:
             reason = str(exc)
             if _is_transport_or_backend_failure(reason):
@@ -2026,11 +2366,7 @@ def review_segments(
                 )
         metadata["review_stage_results"][stage_name] = stage_result
         if stage_result["status"] == "completed":
-            attempted_any = True
-            metadata["review_completed_stages"].append(stage_name)
-            total_corrected += int(stage_result["corrected_segment_count"] or 0)
-            metadata["protected_term_violation_count"] += int(stage_result.get("protected_term_violation_count") or 0)
-            completed_count += 1
+            record_completed_stage(stage_name, stage_result)
         elif stage_result["status"] == "skipped":
             metadata["review_skipped_stages"].append(stage_name)
         if stage_name == "episode_qa_review":
@@ -2046,12 +2382,23 @@ def review_segments(
         }
         if stage_notes:
             episode_notes.extend(f"{stage_name}: {note}" for note in stage_notes)
+        if stage_result["status"] == "completed":
+            _save_review_progress(
+                debug_context,
+                backend_capabilities,
+                flags,
+                review_input_source,
+                working_segments,
+                metadata["review_completed_stages"],
+                metadata["review_stage_results"],
+                episode_notes,
+            )
 
     if attempted_any:
         metadata["review_status"] = "completed_with_stage_failures" if metadata["review_skipped_stages"] else "completed"
         metadata["reviewed_segment_count"] = len(working_segments)
         metadata["corrected_segment_count"] = total_corrected
-        metadata["episode_notes"] = episode_notes
+        metadata["episode_notes"] = restored_episode_notes + episode_notes
         if metadata["review_skipped_stages"]:
             first_stage = metadata["review_skipped_stages"][0]
             metadata["review_skip_reason"] = metadata["review_stage_results"][first_stage]["skip_reason"]

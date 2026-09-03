@@ -361,6 +361,31 @@ Model identifier exposed by the configured review backend.
 
 The safest way to set `backend`, `review_base_url`, and `review_model_name` is launcher option `7`. Its external-LLM wizard discovers available models, verifies the selected model through `/v1/chat/completions`, and updates only the intended review settings. It creates a timestamped config backup and writes UTF-8 JSON without a BOM.
 
+### `review_reasoning_effort`
+
+- Type: `string`
+- Allowed values: `none`, `low`, `medium`, `xhigh`
+- Default: `none`
+- Affects: vLLM review requests for Qwen models
+
+Controls Qwen thinking per request without restarting vLLM. `none` sends the hard `enable_thinking=false` chat-template switch; `low`, `medium`, and `xhigh` enable Qwen3.8 adaptive thinking at the selected depth. For constrained transcript cleanup and JSON edits, `none` or `low` is usually the best latency/quality tradeoff.
+
+### `review_batch_token_limit`
+
+- Type: `integer`
+- Default: `12000` when supplied by the launcher
+- Affects: review request size and latency
+
+Hard ceiling for each review request, including high-context episode QA. Keeping this bounded prevents a single large episode request from monopolizing the reviewer. Values are clamped to `2048`–`32000`.
+
+### `review_candidate_filter`
+
+- Type: `boolean`
+- Default: `true` for launcher runs
+- Affects: review workload
+
+When enabled, only segments changed by deterministic/manual cleanup or flagged as uncertain by transcription confidence are sent for editing. Episode QA may receive a small surrounding context window, but edits are still restricted to candidate segments. Use `--review-all-segments` only when a full re-review is intentional.
+
 ### `transcript_cleanup_review`
 
 - Type: `boolean`

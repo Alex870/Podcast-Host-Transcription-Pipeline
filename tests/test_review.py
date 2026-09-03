@@ -1,5 +1,7 @@
 import unittest
-from unittest.mock import patch
+import json
+import tempfile
+from unittest.mock import MagicMock, patch
 
 from podcast_transcribe.models import SegmentItem, WordItem
 from podcast_transcribe.review import (
@@ -7,6 +9,7 @@ from podcast_transcribe.review import (
     _execute_stage_backend_request,
     _normalize_backend_response_text,
     _normalize_episode_notes,
+    _openai_compatible_chat_completion,
     _segment_prompt_payload,
     enrich_backend_capabilities_with_identity,
     resolve_backend_capabilities,
@@ -28,6 +31,109 @@ def make_segment(segment_id: int, speaker: str, text: str) -> SegmentItem:
 
 
 class ReviewTests(unittest.TestCase):
+    def test_candidate_filter_reviews_only_uncertain_segments_and_keeps_full_output(self):
+        segments = [make_segment(1, "HOST", "high confidence"), make_segment(2, "HOST", "uncertain")]
+        segments[1].avg_logprob = -1.4
+        seen_ids = []
+
+        def fake_stage_call(window, backend_capabilities, stage_definition, stage_mode, debug_context=None, preferred_terms=None):
+            seen_ids.append([segment.id for segment in window])
+            return {
+                "reviewed_segments": [{"id": 2, "text": "uncertain corrected"}],
+                "corrected_segment_count": 1,
+                "episode_notes": [],
+            }
+
+        with patch("podcast_transcribe.review._execute_stage_backend_request", side_effect=fake_stage_call):
+            result = review_segments(
+                segments,
+                {
+                    "runtime_profile": "custom",
+                    "backend": "vllm",
+                    "review_base_url": "http://127.0.0.1:8000",
+                    "review_model_name": "qwen-review",
+                    "transcript_cleanup_review": True,
+                    "review_context_budget": 16000,
+                    "review_candidate_filter": True,
+                },
+            )
+
+        self.assertEqual(seen_ids, [[2]])
+        self.assertEqual(len(result["segments"]), 2)
+        self.assertEqual(result["segments"][0].text, "high confidence")
+        self.assertEqual(result["segments"][1].text, "uncertain corrected")
+        self.assertEqual(result["metadata"]["review_candidate_count"], 1)
+        self.assertEqual(result["metadata"]["review_skipped_segment_count"], 1)
+
+    def test_configured_review_batch_limit_caps_calibration_ceiling(self):
+        capabilities = resolve_backend_capabilities(
+            {
+                "runtime_profile": "high_context_5090",
+                "backend": "vllm",
+                "review_base_url": "http://127.0.0.1:8000",
+                "review_model_name": "qwen-review",
+                "review_batch_token_limit": 8192,
+            }
+        )
+        session = ReviewCalibrationSession(capabilities)
+        self.assertLessEqual(session.families["local_text_review"]["hard_ceiling"], 8192)
+        self.assertLessEqual(session.families["long_context_review"]["hard_ceiling"], 8192)
+
+    def test_completed_review_stage_is_reused_from_checkpoint(self):
+        segments = [make_segment(1, "HOST", "uncertain")]
+        segments[0].avg_logprob = -1.4
+        with tempfile.TemporaryDirectory() as tmp:
+            debug_context = {
+                "audio_path": str(__import__("pathlib").Path(tmp) / "episode.mp3"),
+                "output_dir": tmp,
+                "review_input_source": "inline_cleaned_segments",
+            }
+            __import__("pathlib").Path(debug_context["audio_path"]).write_bytes(b"audio")
+            runtime = {
+                "runtime_profile": "custom",
+                "backend": "vllm",
+                "review_base_url": "http://127.0.0.1:8000",
+                "review_model_name": "qwen-review",
+                "transcript_cleanup_review": True,
+                "review_context_budget": 16000,
+                "review_candidate_filter": True,
+            }
+            with patch(
+                "podcast_transcribe.review._execute_stage_backend_request",
+                return_value={
+                    "reviewed_segments": [{"id": 1, "text": "corrected"}],
+                    "corrected_segment_count": 1,
+                    "episode_notes": [],
+                },
+            ) as backend_call:
+                first = review_segments(segments, runtime, debug_context=debug_context)
+                backend_call.reset_mock()
+                second = review_segments(segments, runtime, debug_context=debug_context)
+
+            self.assertEqual(first["segments"][0].text, "corrected")
+            self.assertEqual(second["segments"][0].text, "corrected")
+            self.assertEqual(second["metadata"]["review_resume_source"], "review_progress_checkpoint")
+            backend_call.assert_not_called()
+
+    def test_qwen_reasoning_control_is_sent_per_request(self):
+        response = MagicMock()
+        response.read.return_value = b'{}'
+        backend = {
+            "backend_name": "vllm",
+            "review_base_url": "http://127.0.0.1:8000",
+            "review_model_name": "Qwen3.8-27B",
+        }
+
+        with patch("podcast_transcribe.review.urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value = response
+            for effort, expected in (("none", {"enable_thinking": False}), ("low", {"enable_thinking": True, "reasoning_effort": "low"})):
+                with self.subTest(effort=effort):
+                    backend["review_reasoning_effort"] = effort
+                    _openai_compatible_chat_completion(backend, "system", "user", 512)
+                    request = urlopen.call_args.args[0]
+                    payload = json.loads(request.data.decode("utf-8"))
+                    self.assertEqual(payload["chat_template_kwargs"], expected)
+
     def test_normalizer_falls_back_to_reasoning_field(self):
         response = {
             "choices": [
@@ -472,6 +578,32 @@ class ReviewTests(unittest.TestCase):
 
         self.assertTrue(session.warm_start_used)
         self.assertFalse(session.calibrated)
+        self.assertFalse(session.calibrated_this_run)
+        self.assertEqual(session.families["local_text_review"]["current_budget"], 2400)
+
+    def test_review_calibration_session_reuses_persisted_completed_calibration(self):
+        backend_capabilities = resolve_backend_capabilities(
+            {
+                "runtime_profile": "custom",
+                "backend": "vllm",
+                "review_base_url": "http://127.0.0.1:8000",
+                "review_model_name": "qwen-review",
+                "review_context_budget": 16000,
+                "review_batch_token_limit": 12000,
+                "review_candidate_filter": True,
+                "review_structured_output_support": True,
+                "review_transcript_qa_available": True,
+                "review_episode_wide_correction_available": True,
+            }
+        )
+        seed_session = ReviewCalibrationSession(backend_capabilities)
+        seed_session.calibrated = True
+        seed_session.families["local_text_review"]["current_budget"] = 2400
+
+        session = ReviewCalibrationSession(backend_capabilities, seed_session.serialize())
+
+        self.assertTrue(session.warm_start_used)
+        self.assertTrue(session.calibrated)
         self.assertFalse(session.calibrated_this_run)
         self.assertEqual(session.families["local_text_review"]["current_budget"], 2400)
 

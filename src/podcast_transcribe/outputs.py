@@ -470,6 +470,7 @@ def write_output_manifest(
     summary: Dict[str, object],
     stage_provenance: Optional[Dict[str, object]] = None,
     resource_usage: Optional[Dict[str, object]] = None,
+    speaker_telemetry: Optional[Dict[str, object]] = None,
 ):
     """Write a manifest that fingerprints inputs, config, outputs, timings, and summary state."""
 
@@ -502,6 +503,7 @@ def write_output_manifest(
         "summary": summary,
         "stage_provenance": stage_provenance or {},
         "resource_usage": resource_usage or {},
+        "speaker_telemetry": speaker_telemetry or {},
         "outputs": output_records,
     }
     atomic_write_text(path, json.dumps(manifest, indent=2))

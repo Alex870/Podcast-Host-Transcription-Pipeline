@@ -1,6 +1,9 @@
 param(
     [switch]$ReviewBenchmark,
-    [switch]$PipelineBenchmark
+    [switch]$PipelineBenchmark,
+    [switch]$DownloadProviderModels,
+    [ValidateSet("podcast", "anonymous_meeting")]
+    [string]$WorkflowProfile = "podcast"
 )
 
 $AnyBenchmark = $ReviewBenchmark -or $PipelineBenchmark
@@ -411,11 +414,16 @@ $WhisperModel = if ($AnyBenchmark) {
     Select-WhisperModel -CurrentValue $(if ($null -ne $Config.model) { [string]$Config.model } else { $null })
 }
 $AsrProvider = if ($Config.asr_provider) { [string]$Config.asr_provider } else { "faster_whisper" }
+$ModelId = if ($Config.model_id) { [string]$Config.model_id } else { "" }
+$ModelRevision = if ($Config.model_revision) { [string]$Config.model_revision } else { "" }
 $AlignmentProvider = if ($Config.alignment_provider) { [string]$Config.alignment_provider } else { "timestamp_passthrough" }
 $AlignmentModel = if ($Config.alignment_model) { [string]$Config.alignment_model } else { "" }
 $SpeakerEmbeddingProvider = if ($Config.speaker_embedding_provider) { [string]$Config.speaker_embedding_provider } else { "speechbrain_ecapa" }
 $DiarizationModel = if ($Config.diarization_model) { [string]$Config.diarization_model } else { "pyannote/speaker-diarization-community-1" }
+$DiarizationModelRevision = if ($Config.diarization_model_revision) { [string]$Config.diarization_model_revision } else { "" }
 $SpeakerModel = if ($Config.speaker_model) { [string]$Config.speaker_model } else { "speechbrain/spkrec-ecapa-voxceleb" }
+$SpeakerModelRevision = if ($Config.speaker_model_revision) { [string]$Config.speaker_model_revision } else { "" }
+$ProviderCacheDir = if ($Config.provider_cache_dir) { [string](Resolve-ConfigPathValue $Config.provider_cache_dir) } else { (Join-Path $ProjectRoot "config\provider-models") }
 if (-not $AnyBenchmark -and [string]::IsNullOrWhiteSpace($(if ($null -ne $Config.model) { [string]$Config.model } else { $null }))) {
     Set-ConfigValue -ConfigObject $Config -Name "model" -Value $WhisperModel
     Save-Config -ConfigObject $Config
@@ -437,6 +445,7 @@ $RuntimeProfile = if ($Config.runtime_profile) { [string]$Config.runtime_profile
 $ReviewBackend = if ($Config.backend) { [string]$Config.backend } else { "none" }
 $ReviewBaseUrl = if ($Config.review_base_url) { [string]$Config.review_base_url } else { "" }
 $ReviewModelName = if ($Config.review_model_name) { [string]$Config.review_model_name } else { "" }
+$ReviewReasoningEffort = if ($Config.review_reasoning_effort) { [string]$Config.review_reasoning_effort } else { "none" }
 $ReviewAutoCalibrate = if ($null -ne $Config.review_auto_calibrate) { [bool]$Config.review_auto_calibrate } else { $null }
 $ReviewAutoAdaptUpward = if ($null -ne $Config.review_auto_adapt_upward) { [bool]$Config.review_auto_adapt_upward } else { $null }
 $ReviewContextBudget = if ($null -ne $Config.review_context_budget) { [int]$Config.review_context_budget } else { 0 }
@@ -546,12 +555,18 @@ if (-not $AnyBenchmark) {
 }
 $args += @(
     "--output-dir", $OutputFolder
+    "--workflow-profile", $WorkflowProfile
     "--model", $WhisperModel
+    "--model-id", $ModelId
+    "--model-revision", $ModelRevision
     "--asr-provider", $AsrProvider
     "--alignment-provider", $AlignmentProvider
     "--speaker-embedding-provider", $SpeakerEmbeddingProvider
     "--diarization-model", $DiarizationModel
+    "--diarization-model-revision", $DiarizationModelRevision
     "--speaker-model", $SpeakerModel
+    "--speaker-model-revision", $SpeakerModelRevision
+    "--provider-cache-dir", $ProviderCacheDir
     "--language", $Language
     "--device", $Device
     "--compute-type", $ComputeType
@@ -567,6 +582,7 @@ $args += @(
     "--backend", $ReviewBackend
     "--review-base-url", $ReviewBaseUrl
     "--review-model-name", $ReviewModelName
+    "--review-reasoning-effort", $ReviewReasoningEffort
     "--corrections-dir", $ConfiguredCorrectionsDir
     "--host-threshold", "$HostThreshold"
     "--min-host-seconds", "$MinHostSeconds"
@@ -588,6 +604,8 @@ if ($ReviewBenchmark) {
         "--evaluation-pack-path", $evaluationPackPath
         "--benchmark-candidate-dir", $OutputFolder
     )
+} elseif ($DownloadProviderModels) {
+    $args += "--download-provider-models"
 } else {
     $args += @("--hf-token", $tokenResolution.Token)
 }

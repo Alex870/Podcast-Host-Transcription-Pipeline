@@ -148,7 +148,9 @@ The optional review layer is staged and additive. Cleanup, glossary, speaker con
 
 Approved project-local Teach-Me rules are passed to the relevant review stage as constrained guidance. They are never executable code, cannot override preferred-term protection, and are recorded in reviewed metadata and workbench audit artifacts.
 
-Review-backend configuration is centralized in `podcast_transcribe_config.json`. Changing the selected model invalidates review-specific fingerprints and calibration hints without invalidating reusable ASR, alignment, diarization, speaker-attribution, or deterministic-cleanup artifacts.
+Review-backend configuration is centralized in `podcast_transcribe_config.json`. The configured LAN vLLM backend is the production review path; local models are optional explicitly selected alternatives, not an automatic model-search loop. Changing the selected model invalidates review-specific fingerprints and calibration hints without invalidating reusable ASR, alignment, diarization, speaker-attribution, or deterministic-cleanup artifacts.
+
+Production review defaults to changed/uncertain-segment candidates and bounded requests. Episode QA can see a small neighboring context window, but edits remain restricted to the candidate IDs. Each completed review stage is persisted atomically under `_processing_artifacts`, while heavy speech stages retain their own source- and dependency-fingerprinted artifacts, so interruption resumes from the latest durable boundary.
 
 ## Quality Evaluation
 

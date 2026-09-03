@@ -92,6 +92,20 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(resolved["review_auto_calibrate"])
         self.assertTrue(resolved["review_auto_adapt_upward"])
 
+    def test_review_reasoning_effort_defaults_to_none_and_normalizes_invalid_values(self):
+        self.assertEqual(
+            resolve_review_runtime_config({})["review_reasoning_effort"],
+            "none",
+        )
+        self.assertEqual(
+            resolve_review_runtime_config({"review_reasoning_effort": "LOW"})["review_reasoning_effort"],
+            "low",
+        )
+        self.assertEqual(
+            resolve_review_runtime_config({"review_reasoning_effort": "maximum"})["review_reasoning_effort"],
+            "none",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

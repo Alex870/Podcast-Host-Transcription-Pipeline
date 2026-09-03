@@ -128,6 +128,8 @@ If no port is supplied, the wizard tries the current configured port for that ho
 
 On success, only the selected review-backend keys are changed. The wizard preserves tokens, paths, transcription settings, speaker settings, and every other unrelated field. It writes UTF-8 JSON without a BOM, creates a timestamped backup beside the config, and atomically replaces the original.
 
+For Qwen models served by vLLM, set `review_reasoning_effort` to `none` for direct responses, or `low`/`medium` for bounded adaptive thinking. This is sent per request, so changing it does not require stopping or reloading the model. `none` is the recommended starting point for transcript review.
+
 The script can also be launched directly:
 
 ```powershell
@@ -357,6 +359,10 @@ Option 6 evaluates the selected output directory against the versioned gold set.
 The benchmark uses permutation-aware diarization scoring with a configurable boundary collar. Speaker labels such as `SPEAKER_00` and `HOST` are mapped optimally before DER is calculated, avoiding false errors caused only by anonymous label names.
 
 Host profiles now record their embedding provider/model. A profile from an incompatible embedding family is ignored rather than silently compared.
+
+## Anonymous meeting profile
+
+Committee and other non-podcast recordings can be processed with menu option 9 or `--workflow-profile anonymous_meeting`. The profile retains timestamped anonymous diarization labels, while skipping reference-sample loading, speaker embeddings, host inference/profile updates, and all LLM review stages. The resulting cleaned JSON is suitable for downstream transcript-intelligence intake and does not alter podcast speaker state.
 
 ## How to Read Reviewed Outputs
 

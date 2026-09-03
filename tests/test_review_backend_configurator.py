@@ -355,6 +355,12 @@ try {{
         self.assertIn('if ($selectedAction -eq "Quit")', launcher)
         self.assertIn('Write-Host "Returning to the main menu..."', launcher)
 
+    def test_root_launcher_exposes_anonymous_meeting_profile(self) -> None:
+        launcher = ROOT_LAUNCHER.read_text(encoding="utf-8-sig")
+        self.assertIn('Write-Host "  9. Transcribe committee meeting (anonymous speakers)"', launcher)
+        self.assertIn('"9" { return "AnonymousMeeting" }', launcher)
+        self.assertIn('"AnonymousMeeting" { Invoke-LauncherScript -Path $RunScript -WorkflowProfile anonymous_meeting }', launcher)
+
     def test_interactive_launcher_returns_to_menu_after_action(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

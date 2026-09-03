@@ -123,6 +123,8 @@ Use `--pipeline-benchmark --speech-run-id <id>` to publish an immutable shadow r
 
 The optional review layer can also backfill reviewed outputs from existing `*_cleaned_speaker_transcript.json` files, so legacy tier-1 work does not need to be rerun just to add tier-2 review artifacts.
 
+For non-podcast recordings such as committee meetings, choose menu option 9, `Transcribe committee meeting (anonymous speakers)`, or pass `--workflow-profile anonymous_meeting`. This profile keeps pyannote diarization labels so speakers remain separable, but does not load reference clips, compute speaker embeddings, infer a host, update `host_profile.json`, or contact an LLM review backend. It is safe to use with a source folder containing no speaker reference audio.
+
 New runs write `episode-contract-v2`. Legacy v1 bundles are promoted on the next normal pass using output-only or cached reconstruction where possible, with automatic tier-1 reprocessing only when required evidence is unavailable. The workbench writes `correction-manifest-v2` histories and builds recurring-speaker candidates from compatible embeddings rather than reusable diarization labels.
 
 The validated Windows GPU environment uses PyTorch 2.9 with TorchCodec 0.8.1 and a shared FFmpeg 7 build. Keep that build in a dedicated directory such as `C:\ffmpeg7\bin`; the launcher preloads its DLLs so another FFmpeg installation on `PATH` cannot interfere. When the native decoder is available, pyannote can receive path-based audio; learned long-file routing still provides a chunked fallback for global diarization memory failures.
