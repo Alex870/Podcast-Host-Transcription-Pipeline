@@ -4,9 +4,10 @@ import hashlib
 from dataclasses import is_dataclass
 import json
 import re
+import time
 from dataclasses import asdict
 from pathlib import Path, PureWindowsPath
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from podcast_transcribe.contract import (
     PIPELINE_NAME,
@@ -471,21 +472,30 @@ def write_output_manifest(
     stage_provenance: Optional[Dict[str, object]] = None,
     resource_usage: Optional[Dict[str, object]] = None,
     speaker_telemetry: Optional[Dict[str, object]] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ):
     """Write a manifest that fingerprints inputs, config, outputs, timings, and summary state."""
 
     output_records = []
     for output_path in outputs:
         if output_path.exists():
+            hash_started = time.perf_counter()
+            if progress_callback:
+                progress_callback(f"hashing {output_path.name} ({output_path.stat().st_size} bytes)")
+            output_bytes = output_path.read_bytes()
             output_records.append(
                 {
                     "path": str(output_path),
                     "filename": output_path.name,
-                    "size_bytes": output_path.stat().st_size,
-                    "sha1": hashlib.sha1(output_path.read_bytes()).hexdigest(),
-                    "sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+                    "size_bytes": len(output_bytes),
+                    "sha1": hashlib.sha1(output_bytes).hexdigest(),
+                    "sha256": hashlib.sha256(output_bytes).hexdigest(),
                 }
             )
+            if progress_callback:
+                progress_callback(
+                    f"hashed {output_path.name} in {time.perf_counter() - hash_started:.1f}s"
+                )
 
     manifest = {
         "contract_version": EPISODE_CONTRACT_V2,

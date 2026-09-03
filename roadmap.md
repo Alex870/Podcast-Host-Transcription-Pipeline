@@ -1,6 +1,6 @@
 # Roadmap
 
-Updated: 2026-07-24
+Updated: 2026-09-03
 
 `podcast-host-transcription-pipeline` is the evidence-creation and human-correction boundary for the podcast ecosystem. The core pipeline, provider contracts, gold-set tooling, selective recomputation, speaker workflows, review workbench, and clean-machine diagnostics are implemented. The roadmap now prioritizes representative human evidence and a correction loop that remains traceable downstream.
 

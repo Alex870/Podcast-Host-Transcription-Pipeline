@@ -110,11 +110,11 @@ Directory containing the FFmpeg Windows binaries/DLLs.
 ### `asr_provider`
 
 - Type: `string`
-- Allowed values: `faster_whisper`
+- Allowed values: `faster_whisper`, `parakeet`
 - Default: `"faster_whisper"`
 - Affects: baseline transcription, stage-cache compatibility
 
-Selects the ASR provider contract. The initial provider release wraps the established faster-whisper path; candidate ASR providers remain gated on pipeline benchmark results.
+Selects the ASR provider contract. `faster_whisper` is the stable baseline. `parakeet` is an optional lazy NeMo/Parakeet path with explicit provider-artifact and Windows/CUDA checks; it remains a candidate until pipeline benchmark results justify promotion.
 
 ### Model acquisition and revisions
 
@@ -341,7 +341,7 @@ Profile behavior:
 - Default: `"none"`
 - Affects: review
 
-Configures the optional local review backend.
+Configures the optional OpenAI-compatible review backend, hosted locally or on a reachable LAN machine.
 
 ### `review_base_url`
 
@@ -431,6 +431,8 @@ An explicit `false` overrides stages implied by the selected runtime profile.
 - Affects: review debugging
 
 When `true`, writes prompt/response debug artifacts for staged review.
+
+Review progress checkpoints and speaker telemetry are stored under the episode's `_processing_artifacts` directory while processing. Successful runs clear the processing checkpoint; debug and stage-artifact retention is controlled by `archive_debug_artifacts` and `resume_intermediates`.
 
 ### `review_auto_calibrate`
 
@@ -536,6 +538,8 @@ Optional ordered explicit format list that overrides the preset behavior for dis
 - Affects: operations
 
 Allows reuse of `_processing_artifacts` when a prior run completed expensive intermediate stages.
+
+For compressed audio, the directory can also contain a fingerprinted `speaker_audio_16k_mono.wav` cache used to make repeated speaker-span reads seek-friendly. It is reused when the source fingerprint and cache metadata match.
 
 ### `archive_debug_artifacts`
 

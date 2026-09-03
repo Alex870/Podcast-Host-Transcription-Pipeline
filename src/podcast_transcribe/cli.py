@@ -411,6 +411,23 @@ def print_timing_component_summary(stage_label: str, component_timings: Dict[str
         print(f"    {name}: {elapsed:.1f}s")
 
 
+def start_finalization_operation(label: str) -> float:
+    return start_console_operation("finalization", label)
+
+
+def start_console_operation(scope: str, label: str) -> float:
+    print(f"  {scope}: {label}...")
+    return time.perf_counter()
+
+
+def finish_finalization_operation(label: str, started: float):
+    finish_console_operation("finalization", label, started)
+
+
+def finish_console_operation(scope: str, label: str, started: float):
+    print(f"  {scope}: {label} complete in {time.perf_counter() - started:.1f}s")
+
+
 def make_review_progress_callback(component_timings: Optional[Dict[str, float]] = None):
     state = {"current_stage": None, "stage_index": None, "stage_total": None}
 
@@ -5885,6 +5902,8 @@ def process_file(
         f"embedding_wall={speaker_telemetry_payload['embedding_wall_seconds']:.1f}s, "
         f"embedding_input={speaker_telemetry_payload['embedding_input_seconds']:.1f}s"
     )
+    finalization_started = time.perf_counter()
+    summary_operation_started = start_finalization_operation("building episode summary")
     summary_row = build_episode_summary_row(
         audio_path=audio_path,
         normalized_segments=normalized_segments,
@@ -5896,6 +5915,7 @@ def process_file(
         known_assignments=known_assignments,
         episode_metadata=episode_metadata,
     )
+    finish_finalization_operation("building episode summary", summary_operation_started)
     summary_row["cleanup_level"] = cleanup_level
     summary_row["cleanup_edit_count"] = len(cleanup_edits)
     summary_row["manual_correction_count"] = manual_corrections
@@ -5951,6 +5971,9 @@ def process_file(
         output_dir / f"{base_name}_cleaned_speaker_transcript.json",
     ]
     outputs.extend(reviewed_output_paths)
+    manifest_operation_started = start_finalization_operation(
+        f"writing output manifest and hashing {len(outputs)} outputs"
+    )
     output_write_output_manifest(
         output_dir / f"{base_name}_manifest.json",
         source_file=str(audio_path),
@@ -5962,13 +5985,21 @@ def process_file(
         stage_provenance=stage_provenance,
         resource_usage=dict(RESOURCE_USAGE_TRACKER),
         speaker_telemetry=speaker_telemetry_payload,
+        progress_callback=lambda message: print(f"    finalization: {message}"),
     )
+    finish_finalization_operation("writing output manifest", manifest_operation_started)
+    checkpoint_operation_started = start_finalization_operation("clearing processing checkpoint")
     clear_processing_checkpoint(output_dir, audio_path)
+    finish_finalization_operation("clearing processing checkpoint", checkpoint_operation_started)
     if not archive_debug_artifacts:
+        cleanup_label = "clearing debug artifacts" if resume_intermediates else "clearing stage artifacts"
+        cleanup_operation_started = start_finalization_operation(cleanup_label)
         if resume_intermediates:
             state_clear_debug_artifacts(output_dir, audio_path)
         else:
             state_clear_stage_artifacts(output_dir, audio_path)
+        finish_finalization_operation(cleanup_label, cleanup_operation_started)
+    print(f"  finalization complete in {time.perf_counter() - finalization_started:.1f}s")
     return summary_row
 
 
@@ -6473,12 +6504,14 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
         processed_audio_seconds += duration_seconds or 0.0
 
     existing_summary_rows = state_load_episode_summary_rows(summary_path, normalize_episode_summary_row)
+    operation_started = start_console_operation("batch finalization", "writing run-level reports")
     write_run_reports(
         output_dir,
         list(existing_summary_rows.values()),
         elapsed_seconds=time.perf_counter() - batch_started,
         workflow_profile=str(effective_runtime_config.get("workflow_profile") or "podcast"),
     )
+    finish_console_operation("batch finalization", "writing run-level reports", operation_started)
     print_final_review_summary(list(existing_summary_rows.values()))
     print(f"Wrote folder summary: {summary_path}")
 
@@ -6783,29 +6816,64 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
                 resume_intermediates=args.resume_intermediates,
                 archive_debug_artifacts=args.archive_debug_artifacts,
             )
+        post_episode_started = time.perf_counter()
+        operation_started = start_console_operation("post-episode", "updating in-memory batch state")
         episode_summary_rows_by_name[audio_path.name] = episode_summary
         historical_similarity_scores = build_historical_similarity_scores(list(episode_summary_rows_by_name.values()))
-        processed_files[audio_path.name] = audio_file_fingerprint(audio_path)
-        write_episode_summary_csv(summary_path, list(episode_summary_rows_by_name.values()))
-        state_save_processed_files(resume_state_path, processed_files)
-        save_review_calibration_session(output_dir, review_calibration_session)
-        processed_audio_seconds += duration_seconds or 0.0
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        finish_console_operation("post-episode", "updating in-memory batch state", operation_started)
 
+        operation_started = start_console_operation("post-episode", "recording source fingerprint")
+        processed_files[audio_path.name] = audio_file_fingerprint(audio_path)
+        finish_console_operation("post-episode", "recording source fingerprint", operation_started)
+
+        operation_started = start_console_operation("post-episode", "writing episode summary CSV")
+        write_episode_summary_csv(summary_path, list(episode_summary_rows_by_name.values()))
+        finish_console_operation("post-episode", "writing episode summary CSV", operation_started)
+
+        operation_started = start_console_operation("post-episode", "saving processed-file state")
+        state_save_processed_files(resume_state_path, processed_files)
+        finish_console_operation("post-episode", "saving processed-file state", operation_started)
+
+        operation_started = start_console_operation("post-episode", "saving review calibration state")
+        save_review_calibration_session(output_dir, review_calibration_session)
+        finish_console_operation("post-episode", "saving review calibration state", operation_started)
+        processed_audio_seconds += duration_seconds or 0.0
+        operation_started = start_console_operation("post-episode", "releasing Python objects")
+        gc.collect()
+        finish_console_operation("post-episode", "releasing Python objects", operation_started)
+        if torch.cuda.is_available():
+            operation_started = start_console_operation("post-episode", "releasing CUDA cache")
+            torch.cuda.empty_cache()
+            finish_console_operation("post-episode", "releasing CUDA cache", operation_started)
+        print(f"  post-episode complete in {time.perf_counter() - post_episode_started:.1f}s")
+
+    if args.input_file:
+        print("Isolated worker: episode state saved; deferring run-level reports to the parent.")
+        exit_isolated_worker_after_success(args.input_file)
+        return
+
+    operation_started = start_console_operation("batch finalization", "writing episode summary CSV")
     write_episode_summary_csv(summary_path, list(episode_summary_rows_by_name.values()))
+    finish_console_operation("batch finalization", "writing episode summary CSV", operation_started)
+
+    operation_started = start_console_operation("batch finalization", "saving processed-file state")
     state_save_processed_files(resume_state_path, processed_files)
+    finish_console_operation("batch finalization", "saving processed-file state", operation_started)
+
+    operation_started = start_console_operation("batch finalization", "saving review calibration state")
     save_review_calibration_session(output_dir, review_calibration_session)
+    finish_console_operation("batch finalization", "saving review calibration state", operation_started)
+
+    operation_started = start_console_operation("batch finalization", "writing run-level reports")
     write_run_reports(
         output_dir,
         list(episode_summary_rows_by_name.values()),
         elapsed_seconds=time.perf_counter() - batch_started,
         workflow_profile=str(effective_runtime_config.get("workflow_profile") or "podcast"),
     )
+    finish_console_operation("batch finalization", "writing run-level reports", operation_started)
     print_final_review_summary(list(episode_summary_rows_by_name.values()))
     print(f"Wrote folder summary: {summary_path}")
-    exit_isolated_worker_after_success(args.input_file)
 
 
 def main():

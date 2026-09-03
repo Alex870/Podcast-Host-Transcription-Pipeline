@@ -19,6 +19,8 @@ The menu options are:
 5. `Launch transcript review workbench`
 6. `Run pipeline quality benchmark`
 7. `Configure external review LLM`
+8. `Download pinned transcription models`
+9. `Transcribe committee meeting (anonymous speakers)`
 
 The interactive launcher returns to this menu after every completed action and after handled action errors. Select `Q` to close it. Passing an explicit action on the command line remains a one-shot operation for scripts and automation.
 
@@ -121,7 +123,7 @@ The wizard:
 2. accepts an IP address, hostname, `host:port`, or HTTP(S) URL
 3. probes OpenAI-compatible model endpoints and identifies vLLM or LM Studio
 4. lists the available models and tests the selected model with a small chat-completions request
-5. preserves the current review-stage settings by default, or explicitly enables local/all review stages
+5. preserves the current review-stage settings by default, or explicitly enables the desired review stages
 6. shows an exact before/after preview before writing
 
 If no port is supplied, the wizard tries the current configured port for that host, then `8000` for vLLM and `1234` for LM Studio. Enter `Q` at any prompt to cancel without changing the config.
@@ -171,7 +173,7 @@ Important migration behavior:
 - it prints a pass/warn checklist at the end
 - it pauses for Enter so the result stays visible
 - repo-local absolute paths in the migrated config are rewritten to fit the new repository layout
-- prior output directory contents
+- output directory contents
 
 ## Transcript Review Workbench
 
@@ -300,6 +302,20 @@ These artifacts are useful when:
 - inspecting prompt/response behavior
 - checking preferred-term regressions
 - comparing model behavior during review benchmarking
+
+## Timing, Caches, and Finalization
+
+The console reports completion time for stages and operations that do not already expose a progress-bar timer. Review component summaries list only components that take at least 60 seconds, and loops are reported as one total operation rather than once per item.
+
+Speaker matching reports audio-read and embedding telemetry. For compressed audio, it first creates or reuses a mono 16 kHz PCM WAV cache at:
+
+```text
+<output>\_processing_artifacts\<episode>\speaker_audio_16k_mono.wav
+```
+
+The cache is fingerprinted against the source audio and is reused only when it still matches. It is an intermediate artifact, not a replacement for the original input. With `resume_intermediates = true`, it remains available for later runs; when resume cleanup is disabled, the episode's intermediate artifact directory is removed after successful processing.
+
+After `writing complete`, episode finalization builds the summary, writes and hashes the output manifest, clears the processing checkpoint, and removes debug or stage artifacts according to the retention settings. The subsequent post-episode steps save summary/state files and release memory. Finally, batch finalization writes `_batch_report.md`, `_review_run_report.*`, and `_speaker_workflow_report.*`. In isolated mode, child workers defer those run-level reports to the parent so the output library is not rescanned after every episode.
 
 ## Preferred-Term Protection
 

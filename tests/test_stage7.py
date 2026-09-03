@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from podcast_transcribe.evaluation.pipeline_benchmark import run_pipeline_benchmark, write_pipeline_benchmark_reports
 from podcast_transcribe.evaluation.stage7 import (
@@ -16,6 +17,7 @@ from podcast_transcribe.speaker_workflow import (
     build_cross_episode_speaker_view,
     file_revision,
 )
+import podcast_transcribe.speaker_workflow as speaker_workflow
 from podcast_transcribe.speakers import (
     approve_speaker_profile_promotion,
     calibrate_speaker_thresholds,
@@ -132,8 +134,10 @@ class Stage7Tests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-            view = build_cross_episode_speaker_view(output, "speaker")
+            with patch.object(speaker_workflow, "file_revision", wraps=speaker_workflow.file_revision) as revision:
+                view = build_cross_episode_speaker_view(output, "speaker")
             self.assertEqual(view["row_count"], 2)
+            self.assertEqual(revision.call_count, 2)
             self.assertEqual(view["recurring_unknown_speakers"][0]["episode_count"], 2)
             self.assertEqual(
                 view["recurring_unknown_speakers"][0]["evidence_clips"][0]["evidence_id"],

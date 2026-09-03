@@ -63,6 +63,7 @@ def collect_speaker_evidence(output_dir: Path) -> List[Dict[str, object]]:
     for cleaned_path in sorted(output_dir.glob("*_cleaned_speaker_transcript.json")):
         episode_id = cleaned_path.name[: -len("_cleaned_speaker_transcript.json")]
         cleaned = _load_json(cleaned_path)
+        source_revision = file_revision(cleaned_path)
         contract_evidence = cleaned.get("speaker_identity_evidence")
         if not isinstance(contract_evidence, list):
             metadata = cleaned.get("metadata") if isinstance(cleaned.get("metadata"), dict) else {}
@@ -89,7 +90,7 @@ def collect_speaker_evidence(output_dir: Path) -> List[Dict[str, object]]:
                         "start": float(segment.get("start") or 0.0),
                         "end": float(segment.get("end") or 0.0),
                     },
-                    "source_revision": file_revision(cleaned_path),
+                    "source_revision": source_revision,
                     "identity_evidence": next(
                         (
                             item for item in contract_evidence
@@ -173,6 +174,7 @@ def group_recurring_unknown_speakers(rows: List[Dict[str, object]], min_episode_
 
 def build_cross_episode_speaker_view(output_dir: Path, view: str = "all") -> Dict[str, object]:
     rows = collect_speaker_evidence(output_dir)
+    all_rows = rows
     normalized_view = str(view or "all").lower()
     if normalized_view == "changed":
         rows = [row for row in rows if row["changed"]]
@@ -185,8 +187,8 @@ def build_cross_episode_speaker_view(output_dir: Path, view: str = "all") -> Dic
         "view": normalized_view,
         "row_count": len(rows),
         "rows": rows,
-        "recurring_unknown_speakers": group_recurring_unknown_speakers(collect_speaker_evidence(output_dir)),
-        "changed_count": sum(bool(row["changed"]) for row in collect_speaker_evidence(output_dir)),
+        "recurring_unknown_speakers": group_recurring_unknown_speakers(all_rows),
+        "changed_count": sum(bool(row["changed"]) for row in all_rows),
         "identity_basis": "embedding_evidence_complete_link",
         "similarity_threshold": 0.72,
     }

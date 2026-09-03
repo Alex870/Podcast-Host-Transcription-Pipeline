@@ -200,7 +200,9 @@ The launcher will:
 - write prompted values back into the config
 - pause at the end so results stay visible
 
-## 11. Optional: Enable Local LLM Review
+Option `8` explicitly downloads the selected revision-pinned provider artifacts after preflight. Normal processing never downloads models implicitly. Option `9` selects the `anonymous_meeting` profile, which keeps diarization labels but skips speaker identity, host profiling, and LLM review.
+
+## 11. Optional: Enable LLM Review
 
 If you have a stronger review machine or LAN-served vLLM backend, enable review in `podcast_transcribe_config.json`.
 
@@ -213,7 +215,10 @@ Example:
   "runtime_profile": "high_context_5090",
   "backend": "vllm",
   "review_base_url": "http://192.168.1.230:8000",
-  "review_model_name": "Qwen/Qwen2.5-14B-Instruct-AWQ",
+  "review_model_name": "Inferact/Qwen3.8-27B-NVFP4",
+  "review_reasoning_effort": "none",
+  "review_batch_token_limit": 12000,
+  "review_candidate_filter": true,
   "transcript_cleanup_review": true,
   "glossary_correction_review": true,
   "speaker_consistency_review": true,
@@ -277,7 +282,7 @@ Important files:
 - `_review_run_report.json`
 - `_speaker_workflow_report.json`
 - `_workbench/` for semantic scan cache files
-- `_processing_artifacts/` for resume/debug artifacts
+- `_processing_artifacts/` for resume/debug artifacts and the fingerprinted `speaker_audio_16k_mono.wav` cache used for repeated speaker-span reads
 
 ## 15. If You Are Migrating from an Older Working Directory
 

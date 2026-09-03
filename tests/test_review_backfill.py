@@ -289,6 +289,28 @@ class ReviewBackfillTests(unittest.TestCase):
         )
         self.assertEqual(exit_codes, [0])
 
+    def test_isolated_worker_defers_run_reports_to_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio_path = root / "episode.mp3"
+            audio_path.write_bytes(b"audio")
+            args = SimpleNamespace(
+                input_file=str(audio_path),
+                preferred_terms_file=None,
+                preferred_terms=[],
+                replacement_map_json=None,
+                workflow_profile="podcast",
+            )
+            with patch.object(cli_module, "classify_episode_processing_state", return_value={"state": "complete"}), patch.object(
+                cli_module, "audio_duration_map", return_value={}
+            ), patch.object(cli_module, "exit_isolated_worker_after_success", return_value=True) as exit_mock, patch.object(
+                cli_module, "write_run_reports"
+            ) as reports_mock, redirect_stdout(io.StringIO()):
+                process_audio_batch(args, root, root / "output", [audio_path])
+
+            reports_mock.assert_not_called()
+            exit_mock.assert_called_once_with(str(audio_path))
+
     def test_ffprobe_resolution_rejects_conda_binary_when_no_external_build_is_configured(self):
         with tempfile.TemporaryDirectory() as tmp:
             conda_prefix = Path(tmp) / "conda"

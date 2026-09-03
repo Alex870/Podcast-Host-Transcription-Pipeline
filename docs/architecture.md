@@ -115,6 +115,8 @@ Legacy stage artifacts without fingerprints remain readable only for the establi
 
 When `resume_intermediates` is enabled, successful runs retain the reusable stage artifacts. Disabling resume allows normal cleanup of those artifacts.
 
+Speaker matching may materialize compressed input as a mono 16 kHz PCM WAV cache in the same episode directory. The cache is fingerprinted against the source audio, used only for repeated speaker-span reads, and does not replace the original source used by transcription or diarization.
+
 ## Alignment
 
 Alignment is now a first-class stage between transcription and speaker assignment.
@@ -151,6 +153,8 @@ Approved project-local Teach-Me rules are passed to the relevant review stage as
 Review-backend configuration is centralized in `podcast_transcribe_config.json`. The configured LAN vLLM backend is the production review path; local models are optional explicitly selected alternatives, not an automatic model-search loop. Changing the selected model invalidates review-specific fingerprints and calibration hints without invalidating reusable ASR, alignment, diarization, speaker-attribution, or deterministic-cleanup artifacts.
 
 Production review defaults to changed/uncertain-segment candidates and bounded requests. Episode QA can see a small neighboring context window, but edits remain restricted to the candidate IDs. Each completed review stage is persisted atomically under `_processing_artifacts`, while heavy speech stages retain their own source- and dependency-fingerprinted artifacts, so interruption resumes from the latest durable boundary.
+
+Stage and finalization telemetry is intentionally operational rather than verbose: stages without an existing progress timer report their total duration, review component summaries include only operations lasting at least 60 seconds, and loops are timed as a whole. Episode finalization records manifest hashing and cleanup work; batch finalization records state writes and run-level report generation. Isolated workers defer run-level reports to the parent process so the cross-episode speaker report is not regenerated after every episode.
 
 ## Quality Evaluation
 
