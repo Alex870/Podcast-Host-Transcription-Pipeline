@@ -1,0 +1,30 @@
+name: Speech quality contracts
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  speech-contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependency-light test requirements
+        run: python -m pip install numpy
+      - name: Run speech governance and evaluation contracts
+        env:
+          PYTHONPATH: src
+        run: >-
+          python -m unittest
+          tests.test_m4_speech_governance
+          tests.test_pipeline_evaluation
+          tests.test_stage7
+          tests.test_speakers

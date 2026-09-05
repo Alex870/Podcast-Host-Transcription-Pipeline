@@ -1,0 +1,83 @@
+{
+  "name": "speaker_label_drift",
+  "focus_stage": "speaker_consistency_review",
+  "description": "A guest line is mislabeled as HOST and should be corrected back to GUEST.",
+  "cleaned_payload": {
+    "schema_version": 2,
+    "pipeline": "podcast-host-transcription-pipeline",
+    "source_file": "Speaker Drift 20260604.mp3",
+    "metadata": {
+      "source_file": "Speaker Drift 20260604.mp3",
+      "source_filename": "Speaker Drift 20260604.mp3",
+      "episode_date": "2026-06-04",
+      "episode_date_compact": "20260604",
+      "episode_year": 2026,
+      "episode_month": 6,
+      "episode_day": 4,
+      "episode_sort_key": 20260604
+    },
+    "episode_date": "2026-06-04",
+    "episode_date_compact": "20260604",
+    "episode_sort_key": 20260604,
+    "transcription": {
+      "duration": 24.0
+    },
+    "host_detected": true,
+    "host_original_speaker_id": "SPEAKER_00",
+    "speaker_mapping": {
+      "SPEAKER_00": "HOST",
+      "SPEAKER_01": "GUEST"
+    },
+    "known_speaker_assignments": {},
+    "speaker_durations_seconds": {
+      "SPEAKER_00": 12.0,
+      "SPEAKER_01": 12.0
+    },
+    "diarization_turns": [],
+    "segments": [
+      {
+        "id": 1,
+        "start": 0.0,
+        "end": 4.0,
+        "speaker": "HOST",
+        "text": "Welcome back to the show.",
+        "avg_logprob": -0.1,
+        "no_speech_prob": 0.01,
+        "episode_date": "2026-06-04",
+        "episode_sort_key": 20260604,
+        "transcription_confidence": {
+          "quality": "high",
+          "avg_logprob": -0.1,
+          "no_speech_prob": 0.01,
+          "warnings": []
+        },
+        "words": []
+      },
+      {
+        "id": 2,
+        "start": 4.0,
+        "end": 8.0,
+        "speaker": "HOST",
+        "text": "Thanks for having me on.",
+        "avg_logprob": -0.1,
+        "no_speech_prob": 0.01,
+        "episode_date": "2026-06-04",
+        "episode_sort_key": 20260604,
+        "transcription_confidence": {
+          "quality": "high",
+          "avg_logprob": -0.1,
+          "no_speech_prob": 0.01,
+          "warnings": []
+        },
+        "words": []
+      }
+    ]
+  },
+  "expected": {
+    "changed_segment_ids": [2],
+    "text_by_id": {},
+    "speaker_by_id": {
+      "2": "GUEST"
+    }
+  }
+}

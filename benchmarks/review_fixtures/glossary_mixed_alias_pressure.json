@@ -1,0 +1,45 @@
+{
+  "name": "glossary_mixed_alias_pressure",
+  "focus_stage": "glossary_correction_review",
+  "description": "A mixed window contains one already-correct preferred term and one incorrect alias; only the alias should change.",
+  "preferred_terms": ["ChromaDB"],
+  "expected_unchanged_segment_ids": [1],
+  "max_allowed_changed_segment_count": 1,
+  "benchmark_tags": ["glossary", "mixed_alias"],
+  "cleaned_payload": {
+    "schema_version": 2,
+    "pipeline": "podcast-host-transcription-pipeline",
+    "source_file": "Glossary Pressure 20260607.mp3",
+    "metadata": {
+      "source_file": "Glossary Pressure 20260607.mp3",
+      "source_filename": "Glossary Pressure 20260607.mp3",
+      "episode_date": "2026-06-07",
+      "episode_date_compact": "20260607",
+      "episode_year": 2026,
+      "episode_month": 6,
+      "episode_day": 7,
+      "episode_sort_key": 20260607
+    },
+    "episode_date": "2026-06-07",
+    "episode_date_compact": "20260607",
+    "episode_sort_key": 20260607,
+    "transcription": {"duration": 18.0},
+    "host_detected": true,
+    "host_original_speaker_id": "SPEAKER_00",
+    "speaker_mapping": {"SPEAKER_00": "HOST"},
+    "known_speaker_assignments": {},
+    "speaker_durations_seconds": {"SPEAKER_00": 18.0},
+    "diarization_turns": [],
+    "segments": [
+      {"id": 1, "start": 0.0, "end": 4.0, "speaker": "HOST", "text": "ChromaDB already handles the metadata layer.", "avg_logprob": -0.1, "no_speech_prob": 0.01, "episode_date": "2026-06-07", "episode_sort_key": 20260607, "transcription_confidence": {"quality": "high", "avg_logprob": -0.1, "no_speech_prob": 0.01, "warnings": []}, "words": []},
+      {"id": 2, "start": 4.0, "end": 8.0, "speaker": "HOST", "text": "Later I casually call it chroma db in conversation.", "avg_logprob": -0.1, "no_speech_prob": 0.01, "episode_date": "2026-06-07", "episode_sort_key": 20260607, "transcription_confidence": {"quality": "high", "avg_logprob": -0.1, "no_speech_prob": 0.01, "warnings": []}, "words": []}
+    ]
+  },
+  "expected": {
+    "changed_segment_ids": [2],
+    "text_by_id": {
+      "2": "Later I casually call it ChromaDB in conversation."
+    },
+    "speaker_by_id": {}
+  }
+}
