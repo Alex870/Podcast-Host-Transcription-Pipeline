@@ -40,6 +40,63 @@ Recommended episode date fields:
 
 The executable contract for this repository lives in `src/podcast_transcribe/contract.py`. It defines the current transcript schema version and required fields and is used before transcript JSON outputs are written.
 
+### Processing-space identity
+
+When a transcript is produced from a managed processing space, `metadata` and the episode manifest include additive partition identity:
+
+- `partition_id`: stable processing-space identifier;
+- `partition_display_name`: operator-facing name;
+- `context_type`: `podcast`, `meeting`, or `custom`;
+- `workflow_profile`: the selected processing behavior;
+- `partition_config_fingerprint`: identity of the partition-scoped settings.
+
+Podcast-RAG should carry `partition_id` as its corpus identity, and later corpus-release consumers should preserve it alongside their existing release IDs. Legacy path-based transcripts may omit these fields and remain valid.
+
+### Episode contract v2
+
+`episode-contract-v2` is the bundle-level processing contract layered additively over the transcript schema. Native new outputs and upgraded legacy outputs record:
+
+- `contract_version`
+- stable `episode_id` and `episode_uid`
+- `source_fingerprint`
+- `artifact_provenance`
+- `completed_processing_stages`
+- `correction_lineage`
+- `speaker_identity_evidence`
+- `contract_upgrade`
+
+The manifest uses the same contract and includes SHA-256 artifact hashes. Legacy v1 JSON/manifests are archived before promotion. Existing transcript fields and filenames remain valid for downstream readers.
+
+### Correction manifest v2
+
+`correction-manifest-v2` records deterministic correction IDs, correction kind/scope, exact source anchors, before-value guards, approval status, supersession links, and provenance. Readers continue to accept `correction-manifest-v1` and normalize it in memory; historical v1 files are never rewritten.
+
+Approved corrections produce additive `corrected_human` transcript siblings and a compatibility CSV projection. Podcast-RAG consumes correction notifications to plan document deltas. RAGScope consumes affected source-span IDs to mark judgments for re-review.
+
+### Speaker identity evidence
+
+Episode-local diarization labels are not globally meaningful. Cross-episode candidates must be derived from versioned embeddings that share the same provider/model family. Candidate clustering uses conservative complete-link similarity, and all promotion, merge, split, role, and rollback operations require explicit workbench actions.
+
+Optional reviewed transcript variants are additive siblings to the baseline transcript JSON. When enabled and successfully generated, reviewed files add:
+
+- `review_schema_version`: reviewed-payload schema marker. Current version: `1`.
+- `review_metadata`: episode-level review provenance, including runtime profile, backend, model, stage flags, status, skip reason, and reviewed/corrected segment counts.
+- `review_metadata.review_pipeline_version`: reviewed-pipeline marker for staged review behavior.
+- `review_metadata.review_stage_results`: per-stage review status, skip reason, edit scope, and corrected counts.
+- `review_metadata.review_input_source`: whether review ran from inline cleaned segments or cleaned-JSON backfill.
+- `review_metadata.episode_qa_mode`: `disabled`, `full_episode`, `chunked`, or `skipped`.
+- reviewed per-segment fields:
+  - `original_text`
+  - `llm_reviewed_text`
+  - `review_runtime_profile`
+  - `review_backend`
+  - `review_model_name`
+  - `review_stage_flags`
+
+Reviewed payloads keep the existing required raw transcript fields intact and use `text_version` values such as `reviewed_llm` and `reviewed_llm_high_context`.
+
+Preferred glossary terms from `preferred_terms.txt` are treated as reserved spellings during optional LLM review. Cleanup, glossary, speaker-consistency, and episode-QA review may correct text toward the configured preferred term, but should not rewrite an already-correct preferred spelling away from that configured form. Benchmark and debug outputs are expected to surface protected-term regressions as glossary-safety failures.
+
 ## Processed RAG Cache
 
 Produced by `Podcast-RAG-pipeline` and consumed by `Chroma DB Import`.

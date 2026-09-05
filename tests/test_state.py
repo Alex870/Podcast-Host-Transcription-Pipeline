@@ -2,16 +2,20 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from podcast_transcribe.state import (
     audio_file_fingerprint,
     clear_stage_artifacts,
+    clear_transient_artifacts,
     expected_output_paths,
     is_file_already_processed,
     load_processed_files,
+    inspect_stage_artifact,
     load_stage_artifact,
     save_stage_artifact,
     save_processed_files,
+    atomic_write_text,
 )
 
 
@@ -21,7 +25,7 @@ TEST_TMP = Path(__file__).resolve().parents[1] / "test_tmp"
 class ResumeStateTests(unittest.TestCase):
     def test_processed_file_requires_outputs_and_matching_fingerprint(self):
         TEST_TMP.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             audio = root / "episode.mp3"
             output_dir = root / "output"
@@ -42,14 +46,14 @@ class ResumeStateTests(unittest.TestCase):
 
     def test_legacy_processed_list_is_loaded_but_still_requires_summary(self):
         TEST_TMP.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "_processed_files.json"
             state_path.write_text(json.dumps({"processed_files": ["episode.mp3"]}), encoding="utf-8")
             self.assertEqual(load_processed_files(state_path), {"episode.mp3": {}})
 
     def test_processed_state_round_trips_fingerprints(self):
         TEST_TMP.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "_processed_files.json"
             records = {"b.mp3": {"size_bytes": 2, "mtime_ns": 20}, "a.mp3": {"size_bytes": 1, "mtime_ns": 10}}
             save_processed_files(state_path, records)
@@ -57,7 +61,7 @@ class ResumeStateTests(unittest.TestCase):
 
     def test_stage_artifact_round_trip_and_fingerprint_validation(self):
         TEST_TMP.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             audio = root / "episode.mp3"
             audio.write_bytes(b"abc")
@@ -68,9 +72,24 @@ class ResumeStateTests(unittest.TestCase):
             audio.write_bytes(b"changed")
             self.assertIsNone(load_stage_artifact(root, audio, "transcription"))
 
+    def test_stage_artifact_reuse_respects_provider_fingerprint(self):
+        TEST_TMP.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "episode.mp3"
+            audio.write_bytes(b"abc")
+            first = {"hash": "first", "stage": "transcription"}
+            second = {"hash": "second", "stage": "transcription"}
+            save_stage_artifact(root, audio, "transcription", {"value": 1}, stage_fingerprint=first)
+
+            self.assertEqual(load_stage_artifact(root, audio, "transcription", first), {"value": 1})
+            inspection = inspect_stage_artifact(root, audio, "transcription", second)
+            self.assertFalse(inspection["reusable"])
+            self.assertEqual(inspection["reason"], "stage_fingerprint_changed")
+
     def test_clear_stage_artifacts_removes_episode_artifact_dir(self):
         TEST_TMP.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             audio = root / "episode.mp3"
             audio.write_bytes(b"abc")
@@ -80,7 +99,65 @@ class ResumeStateTests(unittest.TestCase):
 
             self.assertIsNone(load_stage_artifact(root, audio, "diarization"))
 
+    def test_clear_transient_artifacts_removes_runtime_caches_but_preserves_stage_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "episode.mp3"
+            audio.write_bytes(b"abc")
+            artifact_dir = root / "_processing_artifacts" / audio.stem
+            checkpoint_dir = root / "_processing_checkpoints"
+            artifact_dir.mkdir(parents=True)
+            checkpoint_dir.mkdir(parents=True)
+            (artifact_dir / "transcription.json").write_text("{}", encoding="utf-8")
+            (artifact_dir / "speaker_audio_16k_mono.wav").write_bytes(b"wav")
+            (artifact_dir / "speaker_audio_16k_mono.json").write_text("{}", encoding="utf-8")
+            (artifact_dir / "review_progress.json").write_text("{}", encoding="utf-8")
+            (artifact_dir / ".speaker_audio_16k_mono.wav.123.tmp").write_bytes(b"tmp")
+            (checkpoint_dir / "episode_speaker_telemetry.json").write_text("{}", encoding="utf-8")
+
+            result = clear_transient_artifacts(root, audio)
+
+            self.assertEqual(len(result["failed"]), 0)
+            self.assertFalse((artifact_dir / "speaker_audio_16k_mono.wav").exists())
+            self.assertFalse((artifact_dir / "speaker_audio_16k_mono.json").exists())
+            self.assertFalse((artifact_dir / "review_progress.json").exists())
+            self.assertFalse((artifact_dir / ".speaker_audio_16k_mono.wav.123.tmp").exists())
+            self.assertFalse((checkpoint_dir / "episode_speaker_telemetry.json").exists())
+            self.assertTrue((artifact_dir / "transcription.json").exists())
+
+    def test_stage_artifact_rejects_changed_dependency_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "episode.mp3"
+            audio.write_bytes(b"abc")
+            fingerprint = {"hash": "alignment", "dependency_hashes": ["asr-a"]}
+            save_stage_artifact(
+                root, audio, "alignment", {"value": 1},
+                stage_fingerprint=fingerprint, dependencies=[{"hash": "asr-a"}],
+            )
+            changed = {"hash": "alignment", "dependency_hashes": ["asr-b"]}
+            self.assertIsNone(load_stage_artifact(root, audio, "alignment", changed))
+
+    def test_corrupt_stage_artifact_is_not_reused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "episode.mp3"
+            audio.write_bytes(b"abc")
+            path = root / "_processing_artifacts" / "episode" / "transcription.json"
+            path.parent.mkdir(parents=True)
+            path.write_text("{partial", encoding="utf-8")
+            self.assertEqual(inspect_stage_artifact(root, audio, "transcription")["reason"], "invalid_json")
+
+    def test_atomic_write_preserves_previous_file_when_replace_is_interrupted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_text('{"version": 1}', encoding="utf-8")
+            with patch("podcast_transcribe.state.os.replace", side_effect=OSError("interrupted")):
+                with self.assertRaises(OSError):
+                    atomic_write_text(path, '{"version": 2}')
+            self.assertEqual(path.read_text(encoding="utf-8"), '{"version": 1}')
+            self.assertEqual(list(path.parent.glob("*.tmp")), [])
+
 
 if __name__ == "__main__":
     unittest.main()
-

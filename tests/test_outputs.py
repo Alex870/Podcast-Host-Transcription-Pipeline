@@ -6,20 +6,20 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from podcast_transcribe.outputs import (
+    REVIEWED_TRANSCRIPT_SCHEMA_VERSION,
     TRANSCRIPT_SCHEMA_VERSION,
     build_episode_metadata,
     segment_confidence,
+    validate_reviewed_transcript_payload,
     validate_transcript_payload,
     write_batch_report_md,
     write_json_output,
     write_output_manifest,
+    write_review_run_report,
     write_speaker_identity_review_csv,
+    write_speaker_workflow_report,
     write_text_transcript,
 )
-
-
-TEST_TMP = Path(__file__).resolve().parents[1] / "test_tmp"
-
 
 class OutputTests(unittest.TestCase):
     def test_episode_metadata_uses_last_valid_yyyymmdd_in_filename(self):
@@ -79,8 +79,7 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(metadata["episode_sort_key"], "")
 
     def test_host_only_transcript_accepts_named_host_label(self):
-        TEST_TMP.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "host_only.txt"
             segments = [
                 SimpleNamespace(start=0, speaker="Alex", text="host line"),
@@ -97,9 +96,39 @@ class OutputTests(unittest.TestCase):
 
             self.assertEqual(output_path.read_text(encoding="utf-8"), "[00][Alex] host line")
 
+    def test_json_output_accepts_dict_words_for_review_backfill_safety(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "speaker_transcript.json"
+            metadata = build_episode_metadata("Podcast 20260204.mp3")
+            segment = SimpleNamespace(
+                id=1,
+                start=0.0,
+                end=1.0,
+                speaker="HOST",
+                text="hello",
+                avg_logprob=-0.1,
+                no_speech_prob=0.01,
+                words=[{"start": 0.0, "end": 0.5, "word": "hello", "speaker": "HOST"}],
+            )
+
+            write_json_output(
+                output_path,
+                source_file="Podcast 20260204.mp3",
+                info_payload={"duration": 1.0},
+                diarized_turns=[],
+                segments=[segment],
+                speaker_mapping={"SPEAKER_00": "HOST"},
+                host_speaker="SPEAKER_00",
+                durations={"SPEAKER_00": 1.0},
+                known_assignments={},
+                metadata=metadata,
+            )
+
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["segments"][0]["words"][0]["word"], "hello")
+
     def test_text_transcript_writes_episode_metadata_header(self):
-        TEST_TMP.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "speaker_transcript.txt"
             segments = [SimpleNamespace(start=0, speaker="HOST", text="opening line")]
             metadata = build_episode_metadata("Podcast 20260204.mp3")
@@ -134,8 +163,7 @@ class OutputTests(unittest.TestCase):
             word: str
             speaker: str
 
-        TEST_TMP.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "speaker_transcript.json"
             segment = SimpleNamespace(
                 id=1,
@@ -180,8 +208,7 @@ class OutputTests(unittest.TestCase):
             word: str
             speaker: str = "UNKNOWN"
 
-        TEST_TMP.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "speaker_transcript.json"
             segment = SimpleNamespace(
                 id=17,
@@ -219,8 +246,7 @@ class OutputTests(unittest.TestCase):
             word: str
             speaker: str
 
-        TEST_TMP.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "cleaned_speaker_transcript.json"
             segment = SimpleNamespace(
                 id=1,
@@ -254,6 +280,93 @@ class OutputTests(unittest.TestCase):
             self.assertEqual(payload["segments"][0]["original_text"], "Otherwise, otherwise, this changed.")
             self.assertTrue(payload["segments"][0]["cleanup_applied"])
 
+    def test_reviewed_json_emits_additive_review_metadata(self):
+        @dataclass
+        class Word:
+            start: float
+            end: float
+            word: str
+            speaker: str
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "reviewed_speaker_transcript.json"
+            segment = SimpleNamespace(
+                id=1,
+                start=12.0,
+                end=14.0,
+                speaker="HOST",
+                text="Reviewed wording.",
+                original_text="Original wording.",
+                cleanup_applied=False,
+                cleanup_level="",
+                manual_correction_applied=False,
+                original_speaker=None,
+                llm_reviewed_text="Reviewed wording.",
+                review_runtime_profile="high_context_5090",
+                review_backend="vllm",
+                review_model_name="qwen-review",
+                review_stage_flags={
+                    "transcript_cleanup_review": True,
+                    "glossary_correction_review": True,
+                    "speaker_consistency_review": True,
+                    "episode_qa_review": True,
+                },
+                avg_logprob=-0.1,
+                no_speech_prob=0.01,
+                words=[Word(12.0, 12.5, "Reviewed", "HOST")],
+            )
+
+            write_json_output(
+                output_path,
+                source_file="Podcast 20260204.mp3",
+                info_payload={"duration": 120.0},
+                diarized_turns=[],
+                segments=[segment],
+                speaker_mapping={"SPEAKER_00": "HOST"},
+                host_speaker="SPEAKER_00",
+                durations={"SPEAKER_00": 60.0},
+                known_assignments={},
+                text_version="reviewed_llm_high_context",
+                review_metadata={
+                    "review_pipeline_version": 2,
+                    "review_runtime_profile": "high_context_5090",
+                    "review_backend": "vllm",
+                    "review_model_name": "qwen-review",
+                    "review_stage_flags": {
+                        "transcript_cleanup_review": True,
+                        "glossary_correction_review": True,
+                        "speaker_consistency_review": True,
+                        "episode_qa_review": True,
+                    },
+                    "review_status": "completed",
+                    "review_skip_reason": "",
+                    "reviewed_segment_count": 1,
+                    "corrected_segment_count": 1,
+                    "episode_notes": ["One correction applied."],
+                    "review_stage_results": {
+                        "transcript_cleanup_review": {
+                            "attempted": True,
+                            "status": "completed",
+                            "skip_reason": "",
+                            "corrected_segment_count": 1,
+                            "edit_scope": "text_only",
+                        }
+                    },
+                    "review_enabled_stages": ["transcript_cleanup_review"],
+                    "review_completed_stages": ["transcript_cleanup_review"],
+                    "review_skipped_stages": [],
+                    "episode_qa_mode": "disabled",
+                    "review_input_source": "inline_cleaned_segments",
+                },
+            )
+
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["review_schema_version"], REVIEWED_TRANSCRIPT_SCHEMA_VERSION)
+            self.assertEqual(payload["review_metadata"]["review_backend"], "vllm")
+            self.assertEqual(payload["segments"][0]["original_text"], "Original wording.")
+            self.assertEqual(payload["segments"][0]["llm_reviewed_text"], "Reviewed wording.")
+            self.assertEqual(validate_reviewed_transcript_payload(payload), [])
+
     def test_segment_confidence_flags_low_quality(self):
         confidence = segment_confidence(avg_logprob=-1.2, no_speech_prob=0.7)
 
@@ -262,8 +375,7 @@ class OutputTests(unittest.TestCase):
         self.assertIn("high_no_speech_prob", confidence["warnings"])
 
     def test_speaker_identity_review_csv_highlights_uncertain_speakers(self):
-        TEST_TMP.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "speaker_identity_review.csv"
 
             write_speaker_identity_review_csv(
@@ -280,8 +392,7 @@ class OutputTests(unittest.TestCase):
             self.assertIn("short speaker duration", text)
 
     def test_output_manifest_records_outputs_and_config_fingerprint(self):
-        TEST_TMP.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             output_file = tmp_path / "episode_speaker_transcript.json"
             output_file.write_text("{}", encoding="utf-8")
@@ -303,8 +414,7 @@ class OutputTests(unittest.TestCase):
             self.assertTrue(payload["config_fingerprint"])
 
     def test_batch_report_summarizes_rows(self):
-        TEST_TMP.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "_batch_report.md"
 
             write_batch_report_md(
@@ -318,6 +428,21 @@ class OutputTests(unittest.TestCase):
                         "review_row_count": 2,
                         "review_priority_score": 12.5,
                         "review_priority_reason": "needs review",
+                        "review_attempted": True,
+                        "reviewed_output_written": True,
+                        "review_corrected_segment_count": 1,
+                        "cleanup_review_corrected_count": 1,
+                        "glossary_review_corrected_count": 0,
+                        "speaker_consistency_review_corrected_count": 0,
+                        "episode_qa_review_corrected_count": 0,
+                        "review_material_change": True,
+                        "episode_qa_added_value": False,
+                        "preferred_term_intervention_count": 1,
+                        "speaker_drift_flag": True,
+                        "recurring_unnamed_speaker_flag": True,
+                        "host_profile_stability_flag": False,
+                        "review_applied_change_count": 1,
+                        "review_unique_stage_count": 1,
                     }
                 ],
                 elapsed_seconds=90,
@@ -327,8 +452,54 @@ class OutputTests(unittest.TestCase):
             self.assertIn("# Podcast Transcription Batch Report", text)
             self.assertIn("Episodes: 1", text)
             self.assertIn("episode.mp3", text)
+            self.assertIn("Review attempted: 1/1", text)
+            self.assertIn("Cleanup-review corrections: 1", text)
+            self.assertIn("Episodes with material review changes: 1", text)
+            self.assertIn("Highest Unresolved Risk Episodes", text)
+
+    def test_review_and_speaker_reports_are_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            rows = [
+                {
+                    "episode": "episode.mp3",
+                    "review_attempted": True,
+                    "reviewed_output_written": True,
+                    "review_material_change": True,
+                    "episode_qa_added_value": True,
+                    "preferred_term_intervention_count": 1,
+                    "speaker_drift_flag": True,
+                    "recurring_unnamed_speaker_flag": True,
+                    "host_profile_stability_flag": True,
+                    "review_priority_score": 12.5,
+                    "review_applied_change_count": 2,
+                    "review_unique_stage_count": 2,
+                    "cleanup_review_corrected_count": 1,
+                    "glossary_review_corrected_count": 1,
+                    "speaker_consistency_review_corrected_count": 0,
+                    "episode_qa_review_corrected_count": 1,
+                    "review_completed_stages": "transcript_cleanup_review;glossary_correction_review;episode_qa_review",
+                    "host_label": "SPEAKER_02",
+                    "top_host_similarity": 0.44,
+                    "host_similarity_margin": 0.03,
+                    "review_priority_reason": "host drift",
+                    "host_share_of_speech": 0.31,
+                    "host_duration_seconds": 820.0,
+                }
+            ]
+
+            review_paths = write_review_run_report(output_dir, rows, elapsed_seconds=12.0)
+            speaker_paths = write_speaker_workflow_report(output_dir, rows)
+
+            self.assertTrue(review_paths["json"].exists())
+            self.assertTrue(review_paths["md"].exists())
+            self.assertTrue(speaker_paths["json"].exists())
+            self.assertTrue(speaker_paths["md"].exists())
+            review_payload = json.loads(review_paths["json"].read_text(encoding="utf-8"))
+            speaker_payload = json.loads(speaker_paths["json"].read_text(encoding="utf-8"))
+            self.assertEqual(review_payload["material_change_count"], 1)
+            self.assertEqual(len(speaker_payload["recurring_unnamed_speaker_candidates"]), 1)
 
 
 if __name__ == "__main__":
     unittest.main()
-

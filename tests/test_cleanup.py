@@ -59,7 +59,32 @@ class SpeechCleanupTests(unittest.TestCase):
             "Now, this changed.",
         )
 
+    def test_aggressive_cleanup_prunes_restart_fragments(self):
+        original = (
+            "But the government, you know, they, what law did you break? "
+            "What right do they have to do that? "
+            "They didn't, they're not, they're not accusing you of a crime."
+        )
+
+        self.assertEqual(
+            clean_speech_text(original, level="aggressive"),
+            "But the government, what law did you break? What right do they have to do that? They're not accusing you of a crime.",
+        )
+
+    def test_aggressive_cleanup_removes_parenthetical_you_know_when_it_is_a_restart(self):
+        self.assertEqual(
+            clean_speech_text("But the government, you know, they, what law did you break?", level="aggressive"),
+            "But the government, what law did you break?",
+        )
+
+    def test_aggressive_cleanup_keeps_complete_claims_intact(self):
+        text = "They didn't do it, they're not innocent, and the case is still open."
+        self.assertEqual(clean_speech_text(text, level="aggressive"), text)
+
+    def test_restart_pruning_is_aggressive_only(self):
+        text = "But the government, you know, they, what law did you break?"
+        self.assertEqual(clean_speech_text(text, level="normal"), text)
+
 
 if __name__ == "__main__":
     unittest.main()
-

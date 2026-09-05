@@ -1,0 +1,12 @@
+{
+  "manifest": {
+    "accepted_corrections": [{"adjudication_state":"accepted","after":"The color is blue.","before":"The colour is blue.","field":"text","reason_code":"spelling","source_span_id":"span-001"}],
+    "contract_version":"correction-manifest-v1",
+    "correction_set_id":"correction_193e1741de92a8788cbe2b66baaa5e417d28de429ed52c99d7f304714c8aefb7",
+    "producer":{"commit":"16f9af9","contract_version":"1","name":"podcast-host-transcription-pipeline"},
+    "result_transcript_hash":"3271f12b022314f1b1c51cf53b18bf19bf421d5f71909c3e5bae13de8444dda2",
+    "reviewer_pseudonym":"reviewer-synthetic",
+    "source_transcript_hash":"8448855399c60ca75286f4ce30fd330da670f00151d5107f006c145269f94a02"
+  },
+  "transcript":{"contract_version":"reviewed-transcript-v1","episode_id":"episode-synthetic-001","segments":[{"end":2.0,"source_span_id":"span-001","speaker":"Host","start":0.0,"text":"The colour is blue."}]}
+}

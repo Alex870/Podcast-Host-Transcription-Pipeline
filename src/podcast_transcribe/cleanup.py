@@ -18,6 +18,31 @@ def _replace_repeated_word(match: re.Match) -> str:
     return f"{first}{tail}"
 
 
+def _prune_aggressive_restart_fragments(text: str) -> str:
+    cleaned = text
+
+    # Remove short parenthetical filler fragments when they sit between two comma-bounded restarts.
+    cleaned = re.sub(r"(?i),\s*you know,\s*(?=they,\s)", ", ", cleaned)
+
+    # Collapse abandoned repeated negation/restatement starts into the final stable clause.
+    cleaned = re.sub(
+        r"(?i)\b(?P<subject>they|we|i|he|she|you)\s+didn't,\s*"
+        r"(?P=subject)(?:\s+are|'re)\s+not,\s*"
+        r"(?P=subject)(?P<rest>(?:\s+are|'re)\s+not\s+[^.?!,]+)",
+        lambda match: f"{match.group('subject').capitalize()}{match.group('rest')}",
+        cleaned,
+    )
+
+    # Remove short comma-bounded pronoun restart fragments before a clearly complete question/opening clause.
+    cleaned = re.sub(
+        r"(?i)(,\s*)(?:they|we|i|he|she|you),\s+(?=(?:what|why|how|when|where|who)\b)",
+        r"\1",
+        cleaned,
+    )
+
+    return cleaned
+
+
 def clean_speech_text(text: str, level: str = "normal") -> str:
     """Lightly remove repeated words and small speech restarts while preserving meaning."""
 
@@ -63,6 +88,12 @@ def clean_speech_text(text: str, level: str = "normal") -> str:
     for pattern, replacement in replacements:
         cleaned = pattern.sub(lambda match: _preserve_case(replacement, match.group(0)), cleaned)
 
+    if level == "aggressive":
+        previous = None
+        while previous != cleaned:
+            previous = cleaned
+            cleaned = _prune_aggressive_restart_fragments(cleaned)
+
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
     cleaned = re.sub(r"([,.;:!?])([A-Za-z])", r"\1 \2", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
@@ -84,4 +115,3 @@ def build_cleaned_segments(segments, level: str = "normal") -> Tuple[List[object
             edits.append((original_text, cleaned_text))
         cleaned_segments.append(cleaned_segment)
     return cleaned_segments, edits
-

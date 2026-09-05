@@ -1,14 +1,36 @@
 import csv
 import json
+import os
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
 
 RESUME_STATE_FILENAME = "_processed_files.json"
 SUMMARY_FILENAME = "_episode_review_summary.csv"
+REVIEW_CALIBRATION_FILENAME = "_review_calibration_state.json"
+DIARIZATION_HISTORY_FILENAME = "_diarization_history_state.json"
 CHECKPOINT_DIRNAME = "_processing_checkpoints"
 ARTIFACT_DIRNAME = "_processing_artifacts"
+STAGE_ARTIFACT_VERSION = 2
+
+
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8"):
+    """Replace a state file atomically so interruption cannot leave partial JSON."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding=encoding, newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
 
 
 def audio_file_fingerprint(audio_path: Path) -> Dict[str, object]:
@@ -39,38 +61,158 @@ def save_stage_artifact(
     stage: str,
     payload: Dict[str, object],
     source_fingerprint: Optional[Dict[str, object]] = None,
+    stage_fingerprint: Optional[Dict[str, object]] = None,
+    dependencies: Optional[List[Dict[str, object]]] = None,
 ):
     """Persist resumable intermediate data for a single heavy processing stage."""
 
     artifact_path = stage_artifact_path(output_dir, audio_path, stage)
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
     artifact_payload = {
+        "artifact_version": STAGE_ARTIFACT_VERSION,
         "stage": stage,
         "audio_file": audio_path.name,
         "source_fingerprint": source_fingerprint or audio_file_fingerprint(audio_path),
+        "stage_fingerprint": stage_fingerprint or {},
+        "dependencies": list(dependencies or []),
         "payload": payload,
     }
-    artifact_path.write_text(json.dumps(artifact_payload, indent=2), encoding="utf-8")
+    atomic_write_text(artifact_path, json.dumps(artifact_payload, indent=2))
 
 
-def load_stage_artifact(output_dir: Path, audio_path: Path, stage: str) -> Optional[Dict[str, object]]:
+def inspect_stage_artifact(
+    output_dir: Path,
+    audio_path: Path,
+    stage: str,
+    expected_stage_fingerprint: Optional[Dict[str, object]] = None,
+    allow_legacy: bool = True,
+) -> Dict[str, object]:
     artifact_path = stage_artifact_path(output_dir, audio_path, stage)
     if not artifact_path.exists():
-        return None
+        return {"reusable": False, "reason": "missing", "path": str(artifact_path), "payload": None}
     try:
         artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        return None
+        return {"reusable": False, "reason": "invalid_json", "path": str(artifact_path), "payload": None}
     if artifact_payload.get("source_fingerprint") != audio_file_fingerprint(audio_path):
-        return None
+        return {"reusable": False, "reason": "source_changed", "path": str(artifact_path), "payload": None}
     payload = artifact_payload.get("payload")
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return {"reusable": False, "reason": "invalid_payload", "path": str(artifact_path), "payload": None}
+
+    actual_stage_fingerprint = artifact_payload.get("stage_fingerprint")
+    if expected_stage_fingerprint:
+        if isinstance(actual_stage_fingerprint, dict) and actual_stage_fingerprint:
+            if actual_stage_fingerprint.get("hash") != expected_stage_fingerprint.get("hash"):
+                return {
+                    "reusable": False,
+                    "reason": "stage_fingerprint_changed",
+                    "path": str(artifact_path),
+                    "payload": None,
+                    "actual_stage_fingerprint": actual_stage_fingerprint,
+                }
+        elif not allow_legacy:
+            return {"reusable": False, "reason": "legacy_fingerprint_missing", "path": str(artifact_path), "payload": None}
+        else:
+            return {
+                "reusable": True,
+                "reason": "legacy_assumed_compatible",
+                "path": str(artifact_path),
+                "payload": payload,
+                "stage_fingerprint": {},
+            }
+    expected_dependency_hashes = list(expected_stage_fingerprint.get("dependency_hashes") or []) if expected_stage_fingerprint else []
+    actual_dependencies = artifact_payload.get("dependencies") if isinstance(artifact_payload.get("dependencies"), list) else []
+    if expected_dependency_hashes:
+        expected_hashes = [str(value) for value in expected_dependency_hashes]
+        actual_hashes = [str(item.get("hash") or "") for item in actual_dependencies if isinstance(item, dict)]
+        if actual_hashes != expected_hashes:
+            return {"reusable": False, "reason": "dependency_fingerprint_changed", "path": str(artifact_path), "payload": None}
+    return {
+        "reusable": True,
+        "reason": "fingerprint_match" if expected_stage_fingerprint else "source_match",
+        "path": str(artifact_path),
+        "payload": payload,
+        "stage_fingerprint": actual_stage_fingerprint if isinstance(actual_stage_fingerprint, dict) else {},
+        "dependencies": artifact_payload.get("dependencies") if isinstance(artifact_payload.get("dependencies"), list) else [],
+    }
+
+
+def load_stage_artifact(
+    output_dir: Path,
+    audio_path: Path,
+    stage: str,
+    expected_stage_fingerprint: Optional[Dict[str, object]] = None,
+    allow_legacy: bool = True,
+) -> Optional[Dict[str, object]]:
+    inspection = inspect_stage_artifact(
+        output_dir,
+        audio_path,
+        stage,
+        expected_stage_fingerprint=expected_stage_fingerprint,
+        allow_legacy=allow_legacy,
+    )
+    payload = inspection.get("payload")
+    return payload if inspection.get("reusable") and isinstance(payload, dict) else None
 
 
 def clear_stage_artifacts(output_dir: Path, audio_path: Path):
     artifact_dir = output_dir / ARTIFACT_DIRNAME / audio_path.stem
     if artifact_dir.exists():
         shutil.rmtree(artifact_dir)
+
+
+def clear_debug_artifacts(output_dir: Path, audio_path: Path):
+    artifact_dir = output_dir / ARTIFACT_DIRNAME / audio_path.stem
+    if not artifact_dir.exists():
+        return
+    for child in artifact_dir.iterdir():
+        if child.is_dir() and child.name in {"review_debug", "debug"}:
+            shutil.rmtree(child)
+
+
+def clear_transient_artifacts(output_dir: Path, audio_path: Path) -> Dict[str, List[str]]:
+    """Remove disposable per-episode runtime artifacts after successful processing.
+
+    Stage JSON artifacts remain available when ``resume_intermediates`` is enabled,
+    but generated audio caches and progress/checkpoint files are not authoritative
+    and should not accumulate after an episode has completed. Cleanup is best effort
+    so a locked diagnostic file cannot turn an otherwise successful episode into a
+    failed run.
+    """
+
+    artifact_dir = output_dir / ARTIFACT_DIRNAME / audio_path.stem
+    checkpoint_dir = output_dir / CHECKPOINT_DIRNAME
+    candidates = [
+        artifact_dir / "speaker_audio_16k_mono.wav",
+        artifact_dir / "speaker_audio_16k_mono.json",
+        artifact_dir / "review_progress.json",
+        checkpoint_dir / f"{audio_path.stem}_speaker_telemetry.json",
+    ]
+    if artifact_dir.exists():
+        candidates.extend(sorted(artifact_dir.glob(".*.tmp")))
+
+    result: Dict[str, List[str]] = {"removed": [], "failed": []}
+
+    def remove_candidate(path: Path):
+        try:
+            if not path.exists() and not path.is_symlink():
+                return
+            path.unlink()
+            result["removed"].append(str(path))
+        except OSError:
+            result["failed"].append(str(path))
+
+    for candidate in candidates:
+        remove_candidate(candidate)
+
+    for directory in (artifact_dir, checkpoint_dir):
+        try:
+            if directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+        except OSError:
+            pass
+
+    return result
 
 
 def load_processed_files(path: Path) -> Dict[str, Dict[str, object]]:
@@ -103,7 +245,35 @@ def save_processed_files(path: Path, processed_files: Dict[str, Dict[str, object
             for name in sorted(processed_files)
         },
     }
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    atomic_write_text(path, json.dumps(payload, indent=2))
+
+
+def load_review_calibration_state(path: Path) -> Dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_review_calibration_state(path: Path, payload: Dict[str, object]):
+    atomic_write_text(path, json.dumps(payload, indent=2))
+
+
+def load_diarization_history_state(path: Path) -> Dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_diarization_history_state(path: Path, payload: Dict[str, object]):
+    atomic_write_text(path, json.dumps(payload, indent=2))
 
 
 def load_episode_summary_rows(path: Path, normalize_row) -> Dict[str, Dict[str, object]]:
@@ -139,4 +309,3 @@ def is_file_already_processed(
         return record == audio_file_fingerprint(audio_path)
 
     return audio_path.name in existing_summary_rows
-

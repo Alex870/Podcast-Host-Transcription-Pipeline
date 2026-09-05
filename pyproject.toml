@@ -18,3 +18,6 @@ where = ["src"]
 
 [project.scripts]
 podcast-transcribe-host = "podcast_transcribe.cli:main"
+podcast-transcribe-workbench = "podcast_transcribe.workbench_api:main"
+podcast-transcribe-corrections = "podcast_transcribe.correction_cli:main"
+podcast-transcribe-hardening = "podcast_transcribe.hardening:main"

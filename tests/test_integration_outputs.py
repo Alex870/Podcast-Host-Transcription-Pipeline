@@ -31,7 +31,7 @@ class Word:
 class IntegrationOutputTests(unittest.TestCase):
     def test_tiny_episode_output_set_matches_contract(self):
         TEST_TMP.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source_file = "Tiny 20260512.mp3"
             metadata = build_episode_metadata(source_file)
@@ -100,4 +100,3 @@ class IntegrationOutputTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

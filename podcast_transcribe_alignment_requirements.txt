@@ -1,0 +1,4 @@
+# Optional forced-alignment environment.
+# WhisperX can impose torch/pyannote constraints that differ from the dependable
+# baseline environment, so install this only when alignment_provider=whisperx.
+whisperx==3.8.6

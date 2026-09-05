@@ -1,0 +1,25 @@
+{
+  "contract_version": "episode-contract-v2.0",
+  "schema_version": "2.0",
+  "episode_id": "episode-speech-shadow-001",
+  "episode_date": "2026-08-12",
+  "speech_provenance": [
+    {
+      "stage": "transcription",
+      "provider": "parakeet",
+      "model": "nvidia/parakeet-tdt-0.6b-v2",
+      "model_revision": "0123456789abcdef0123456789abcdef01234567",
+      "shadow_only": true
+    }
+  ],
+  "segments": [
+    {
+      "id": "episode-speech-shadow-001:segment:0",
+      "source_span_id": "episode-speech-shadow-001:segment:0",
+      "start": 0.0,
+      "end": 4.2,
+      "speaker": "HOST",
+      "text": "Stable evidence identity survives additive provider metadata."
+    }
+  ]
+}

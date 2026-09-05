@@ -1,206 +1,197 @@
-# Podcast Transcription & Host Identification Pipeline
+# Architecture
 
-This document describes the architecture and processing flow of `podcast_transcribe_host.py`.
+`podcast-host-transcription-pipeline` is a local-first, stage-oriented speech pipeline. Its stable public surface remains the root PowerShell launcher, transcript contracts, and additive output families. Internally, expensive model stages now carry provider identities and fingerprints so compatible work can be reused selectively.
 
----
-
-## 🧠 System Flow Diagram
+## Processing Flow
 
 ```mermaid
 flowchart TD
+    A[Audio input] --> B[ASR provider]
+    B --> C[Alignment provider]
+    C --> D[Pyannote diarization]
+    D --> E[Speaker attribution]
+    E --> F[Versioned speaker identity]
+    F --> G[Deterministic cleanup]
+    G --> H[Optional staged LLM review]
+    H --> I[Transcript outputs and manifests]
 
-    A[Start] --> 
-    B["Setup + Validation
-    ─ parse_args"] --> 
-    C["Load Configs + Models
-    ─ load_preferred_terms, load_replacement_map, get_device"] --> 
-    D["Scan Audio Files"]
+    B -. fingerprinted artifact .-> CB[Stage cache]
+    C -. fingerprinted artifact .-> CB
+    D -. fingerprinted artifact .-> CB
+    E -. fingerprinted artifact .-> CB
+    G -. fingerprinted artifact .-> CB
 
-    D --> E{Files Found?}
-    E -->|No| Z[Exit]
-    E -->|Yes| F["Process Each File
-    ─ process_file"]
-
-    subgraph Processing
-        direction TB
-        F --> G["Transcription + Diarization
-        ─ transcribe_audio, diarize_audio"]
-        G --> H["Speaker Assignment
-        ─ assign_speakers_to_segments"]
-        H --> I["Host Detection + Matching
-        ─ choose_host_speaker, match_known_speakers"]
-        I --> J["Speaker Renaming
-        ─ rename_speakers"]
-        J --> K["Text Normalization
-        ─ coalesce_segments"]
-        K --> L["Quality Review + QA
-        ─ collect_review_rows"]
-    end
-
-    subgraph Outputs
-        direction TB
-        L --> O1["Write Transcripts
-        ─ write_text_transcript"]
-        L --> O2["Write JSON + Review CSV
-        ─ write_json_output, write_review_csv"]
-    end
-
-    O2 --> P{Update Host Profile?}
-    P -->|Yes| Q["Save Profile
-    ─ save_host_profile"]
-    P -->|No| R[Skip]
-
-    Q --> S["Build Episode Summary
-    ─ build_episode_summary_row"]
-    R --> S
-
-    S --> F
-
-    F --> T["Write Batch Summary CSV
-    ─ write_episode_summary_csv"]
-    T --> U[End]
+    I --> J[Review workbench]
+    J --> K[Corrections, glossary, learned rules]
+    J --> L[Gold-set annotations]
+    L --> M[Pipeline quality benchmark]
 ```
 
----
+## Contract and Evidence Control Plane
 
-## 🔍 Architectural Layers
+`episode-contract-v2` makes bundle completeness independent from the older resume marker. The classifier can choose a JSON-only delta promotion, a cached rebuild, or a full tier-1 reprocess. A JSON-only promotion is allowed only when the bundle already proves completion of embedding-backed speaker identity evidence; otherwise cached stages are reused and missing speaker evidence is rebuilt from source audio. Legacy JSON/manifests are archived before canonical replacement, and completed v2 provenance prevents repeated upgrades.
 
-### 1. Input & Configuration Layer
+Human changes flow through `correction-manifest-v2`. The workbench writes corrected siblings and a compatibility CSV, then emits downstream notifications containing the correction-set ID and affected source spans. Podcast-RAG can plan selective document deltas; RAGScope can route stale judgments back to adjudication.
 
-Handles CLI arguments and environment setup.
+## Processing-Space Boundary
 
-**Key responsibilities:**
-- Parse runtime parameters (`parse_args`)
-- Validate input directory and Hugging Face token
-- Load:
-  - Preferred vocabulary terms
-  - Replacement mappings
-  - Known speaker configurations
-  - Host voice profile (if available)
+The project-local SQLite registry at `config/partitions.sqlite3` is the operator-managed boundary between independent intake contexts. A partition resolves to one intake directory, output directory, state directory, glossary/correction scope, speaker-reference scope, and downstream corpus identity. The CLI still accepts direct source/output paths for compatibility, while `--partition <id>` resolves a managed `PartitionContext` before discovery and processing.
 
----
+Partition metadata is additive in runtime configuration, transcript metadata, and episode manifests. Stage caches remain under the selected output directory, so cache reuse cannot cross partitions accidentally. The registry separately tracks intake status and processing runs, allowing the existing fingerprinted stage state to remain the authority for recomputation while the partition registry provides operator-facing status.
 
-### 2. Core Processing Pipeline (Per Audio File)
+Speaker attribution writes embedding evidence while the model is already loaded. The workbench clusters only compatible evidence vectors across episodes, so reusable diarization labels never become accidental identities. `speakers.json` schema v2 retains explicit promotion, role, merge/split, and rollback history.
 
-#### A. Transcription
-- **Function:** `transcribe_audio`
-- **Model:** Faster-Whisper
+The private evaluation pack is configured separately from the repository. Workbench queues and the guided campaign operate on that path, while only aggregate benchmark results and synthetic contract fixtures are suitable for Git.
 
-**Outputs:**
-- Time-aligned segments
-- Word-level timestamps
-- Confidence metadata
+## Stable Baseline
 
----
+The default provider set intentionally reproduces the established pipeline:
 
-#### B. Diarization
-- **Function:** `diarize_audio`
-- **Model:** Pyannote
+- ASR: `faster_whisper` with the configured Whisper model
+- alignment: `timestamp_passthrough`, preserving ASR-native word timestamps
+- diarization: pyannote Community-1 with learned long-file chunk routing
+- speaker embedding: `speechbrain_ecapa`
+- deterministic cleanup followed by optional local LLM review
 
-**Followed by:**
-- `assign_speakers_to_segments`
+Changing no provider settings should preserve existing output behavior.
 
-**Purpose:**
-- Identify speaker turns
-- Align speakers to transcript segments and words
+The current validated Windows GPU dependency set is PyTorch 2.9 with CUDA 12.8 wheels, TorchAudio 2.9, TorchVision 0.24, TorchCodec 0.8.1, and a shared FFmpeg 7 build. On Windows the runtime preloads DLLs from the configured `ffmpeg_bin_dir` before importing TorchCodec, preventing an incompatible FFmpeg elsewhere on `PATH` from intercepting ABI discovery. TorchCodec is used opportunistically for path-based pyannote audio input; the pipeline retains its own chunked loader and long-file fallback when the native decoder or global clustering cannot handle an episode safely.
 
----
+## Launcher and Review Backend Control Plane
 
-#### C. Speaker Intelligence
+The root PowerShell launcher is the operator control plane. Interactive use stays in a menu loop after each completed or failed action and exits only when the operator selects `Q`. Explicit invocations such as `-Action Debug` remain one-shot so automation does not become interactive unexpectedly.
 
-This is the most advanced part of the system.
+Launcher option `7` configures the shared external review backend used by:
 
-**Key functions:**
-- `choose_host_speaker`
-- `match_known_speakers`
-- `rename_speakers`
+- staged transcript review and tier-2 backfill
+- review-model benchmarking
+- workbench semantic scans
+- Teach-Me rule induction and validation
 
-**Capabilities:**
-- Speaker embedding generation (SpeechBrain)
-- Host identification via:
-  - Reference audio
-  - Persistent profile
-  - Cosine similarity
-- Fallback:
-  - Dominant speaker assumption
-- Known speaker matching
-- Final label normalization (HOST, SPEAKER_01, etc.)
+The wizard accepts an IP address, hostname, or HTTP(S) URL; probes OpenAI-compatible model endpoints; distinguishes vLLM from LM Studio; filters LM Studio entries to chat-capable model types; and verifies the selected model through a lightweight chat-completions request. It updates only the backend URL/model keys plus review profile or stage keys explicitly chosen by the operator. Every successful write is validated, backed up, encoded as UTF-8 without a BOM, and atomically replaces the prior project config.
 
----
+The backend remains a local/LAN boundary. API-key and cloud-provider credential management are intentionally outside this control plane.
 
-### 3. Text Normalization Layer
+## Provider Contracts
 
-**Function:** `coalesce_segments`
+Provider interfaces live under `src/podcast_transcribe/providers/`.
 
-**Features:**
-- Merge adjacent segments from same speaker
-- Apply glossary replacements
-- Normalize transcription output
-- Track replacement events for QA
+- `ProviderIdentity` records stage, provider, model, implementation version, package version, and capabilities.
+- `StageResult` carries normalized stage output, provider identity, and additive metadata.
+- ASR providers produce `SegmentItem` instances with optional word timing.
+- alignment providers accept normalized ASR segments and return the same contract with revised timing.
+- speaker embedding providers expose a versioned identity so incompatible vectors cannot be mixed.
 
----
+The optional `whisperx` alignment provider is imported lazily. Its dependency stack is not loaded or required by the baseline path.
 
-### 4. Quality & Review System
+## Stage Fingerprints and Reuse
 
-**Function:** `collect_review_rows`
+Resumable artifacts under `_processing_artifacts/<episode>/` use an additive version-2 envelope containing:
 
-Generates structured QA signals:
+- source-audio fingerprint
+- provider identity
+- stage configuration fingerprint
+- dependency fingerprints
+- normalized stage payload
 
-**Examples:**
-- Host not detected
-- Low-confidence host match
-- Ambiguous speaker identification
-- Low host speech coverage
-- Glossary corrections applied
+Artifacts are written through an atomic temporary-file replacement. A process interruption therefore leaves either the prior complete artifact or the new complete artifact; malformed partial JSON is rejected and recomputed.
 
----
+Reuse follows the dependency graph:
 
-### 5. Output Layer
+| Changed input | Work that can remain reusable |
+|---|---|
+| LLM review model or rules | ASR, alignment, diarization, speaker attribution, cleaned JSON |
+| cleanup or glossary configuration | ASR, alignment, diarization, speaker attribution |
+| speaker profile/provider | ASR, alignment, diarization |
+| alignment provider/model | ASR and diarization |
+| ASR provider/model | independent diarization only |
+| audio fingerprint | nothing for that episode |
 
-For each episode:
+The complementary invalidation view is:
 
-- **Speaker transcript (TXT)**
-- **Host-only transcript (TXT)**
-- **Structured transcript (JSON)**
-- **Review report (CSV)**
+| Changed input | Stages recomputed |
+|---|---|
+| ASR provider/model/config | ASR, alignment, speaker attribution, cleanup |
+| alignment provider/model | alignment, speaker attribution, cleanup |
+| diarization provider/model/config | diarization, speaker attribution, cleanup |
+| speaker embedder/profile inputs | speaker attribution and cleanup |
+| cleanup level/glossary/correction CSV | deterministic cleanup only |
 
-Batch-level:
+Legacy stage artifacts without fingerprints remain readable only for the established baseline assumptions. Newly written artifacts carry strict fingerprints. Speaker attribution persists labels and evidence, not embedding tensors; incompatible embedding families therefore cannot be mixed accidentally.
 
-- `_episode_review_summary.csv`
+When `resume_intermediates` is enabled, successful runs retain the reusable stage JSON artifacts. Disposable audio caches, review progress, speaker telemetry checkpoints, and atomic-write leftovers are removed after successful completion. Disabling resume allows normal cleanup of the remaining stage artifacts.
 
----
+Speaker matching may materialize compressed input as a mono 16 kHz PCM WAV cache in the same episode directory. The cache is fingerprinted against the source audio, used only for repeated speaker-span reads, and does not replace the original source used by transcription or diarization. It is deleted after successful episode finalization; an interrupted or failed run may leave it for diagnosis or restart.
 
-## ⚡ Notable Design Features
+## Alignment
 
-### 🔹 Adaptive Host Identification
-- Learns host voice over time
-- Updates embedding profile across episodes
+Alignment is now a first-class stage between transcription and speaker assignment.
 
----
+- `timestamp_passthrough` is the default and makes no semantic changes.
+- `whisperx` performs forced alignment and is opt-in.
+- alignment artifacts depend on the ASR fingerprint, so changing alignment does not rerun ASR.
+- aligned word timing flows into the existing diarization-to-word speaker assignment logic.
 
-### 🔹 Multi-Stage Speaker Resolution
-1. Diarization (raw speaker IDs)  
-2. Embedding similarity matching  
-3. Known speaker override  
-4. Final label normalization  
+## Speaker Profile Contract
 
----
+Host profiles use schema version 2 and record:
 
-### 🔹 Feedback Loop
-- Host profile persists and improves accuracy over time
+- embedding provider and model
+- embedding dimension
+- L2 normalization
+- source episode and update provenance
+- embedding vector
 
----
+Legacy profiles are treated as ECAPA profiles. A versioned profile is rejected when its provider/model differs from the active speaker embedding provider.
 
-### 🔹 Built-in QA System
-- Automatically flags:
-  - Weak matches
-  - Ambiguities
-  - Data quality issues
+## Long-File Diarization Routing
 
----
+The diarization orchestrator uses a deterministic frontier-plus-probe policy. It first attempts global diarization unless runtime-scoped history identifies the episode as clearly risky. A pyannote clustering `MemoryError` records a failure and immediately retries with overlapping chunks. Successful global runs record safe durations; later successes can invalidate shorter historical failures.
 
-## 📌 Summary
+The near-frontier probe band is 30 minutes above the current failure floor. Probing is suppressed when the cooldown has not expired or one of the last five probe decisions failed within 15 minutes of the current duration. Chunked runs reconcile adjacent chunk speakers conservatively and expose mode, probe, chunk, overlap, and ambiguity metadata without changing the downstream diarized-turn contract.
 
-This pipeline goes beyond transcription:
+## Review Intelligence
 
-> It is a **speaker-aware, self-improving podcast intelligence system** that combines ASR, diarization, speaker recognition, and QA into a unified workflow.
+The optional review layer is staged and additive. Cleanup, glossary, speaker consistency, and episode QA each have explicit prompts, edit scopes, adaptive budgets, protected-term validation, and stage-level provenance. Calibration runs once per processing run using real transcript text; production windows adapt downward on overflow and upward only after conservative success streaks. Overflow is retried at smaller windows rather than treated as an ordinary skip; only hard backend failures at the minimum floor can leave a stage incomplete.
+
+Approved project-local Teach-Me rules are passed to the relevant review stage as constrained guidance. They are never executable code, cannot override preferred-term protection, and are recorded in reviewed metadata and workbench audit artifacts.
+
+Review-backend configuration is centralized in `podcast_transcribe_config.json`. The configured LAN vLLM backend is the production review path; local models are optional explicitly selected alternatives, not an automatic model-search loop. Changing the selected model invalidates review-specific fingerprints and calibration hints without invalidating reusable ASR, alignment, diarization, speaker-attribution, or deterministic-cleanup artifacts.
+
+Production review defaults to changed/uncertain-segment candidates and bounded requests. Episode QA can see a small neighboring context window, but edits remain restricted to the candidate IDs. Each completed review stage is persisted atomically under `_processing_artifacts`, while heavy speech stages retain their own source- and dependency-fingerprinted artifacts, so interruption resumes from the latest durable boundary.
+
+Stage and finalization telemetry is intentionally operational rather than verbose: stages without an existing progress timer report their total duration, review component summaries include only operations lasting at least 60 seconds, and loops are timed as a whole. Episode finalization records manifest hashing and cleanup work; batch finalization records state writes and run-level report generation. Isolated workers defer run-level reports to the parent process so the cross-episode speaker report is not regenerated after every episode.
+
+## Quality Evaluation
+
+The full-pipeline benchmark is distinct from the tier-2 review benchmark.
+
+- Gold references live under `benchmarks/pipeline_gold_set/`.
+- The workbench creates human-approved reference spans and updates the manifest.
+- Only explicitly annotated segment IDs are scored.
+- Reports include WER, speaker-attributed WER, diarization error, timestamp error, host precision/recall, glossary preservation, completion rate, and available processing timings.
+- Reports are written as JSON and Markdown.
+
+The tier-2 review benchmark additionally reports model speed, stability, quality, protected-term safety, and practical usable context capacity. The full-pipeline benchmark is separate and evaluates generated outputs against annotated cleaned-transcript references.
+
+Bootstrap option `6` runs this benchmark against the configured output folder.
+
+## Output and Contract Compatibility
+
+Transcript schema version 2 remains unchanged. Provider and stage provenance is additive under transcript metadata and per-episode manifests. Existing downstream consumers can ignore the new fields.
+
+The pipeline continues to preserve separate raw, cleaned, reviewed, and human-input artifacts. Gold references and workbench state never replace production transcript outputs.
+
+## Workbench Boundary
+
+The React/FastAPI workbench reads processed artifacts and writes only sanctioned project inputs or workbench-owned state:
+
+- episode correction CSVs
+- preferred terms and replacement mappings
+- approved learned review rules
+- semantic scan caches and audit records
+- gold-set reference annotations
+
+The workbench does not mutate raw or cleaned transcript outputs directly.
+
+Option `5` automatically installs frontend dependencies and rebuilds stale React assets before serving the local browser app.
