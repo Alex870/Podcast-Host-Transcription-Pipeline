@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from podcast_transcribe.outputs import build_episode_metadata, write_json_output
 from podcast_transcribe.workbench_core import (
@@ -22,10 +22,29 @@ from podcast_transcribe.workbench_core import (
     run_semantic_scan,
     rollback_text_correction,
     save_gold_segment_annotation,
+    _openai_compatible_request,
 )
 
 
 class WorkbenchCoreTests(unittest.TestCase):
+    def test_vllm_workbench_request_disables_thinking_per_request(self):
+        response = MagicMock()
+        response.read.return_value = b'{"choices":[{"message":{"content":"{}"}}]}'
+
+        with patch("podcast_transcribe.workbench_core.urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value = response
+            _openai_compatible_request(
+                "http://127.0.0.1:8000",
+                "Qwen3.8-27B",
+                "system",
+                "user",
+                backend_name="vllm",
+            )
+
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
+
     def _write_cleaned_payload(self, output_dir: Path, episode_name: str):
         metadata = build_episode_metadata(f"{episode_name}.mp3")
         cleaned_metadata = {**metadata, "text_version": "cleaned"}

@@ -1136,6 +1136,24 @@ def _write_review_debug_artifact(
     (debug_dir / file_name).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _chat_template_request_controls(
+    backend_name: object,
+    model_name: str,
+    reasoning_effort: object = "none",
+) -> Optional[Dict[str, object]]:
+    """Return request-scoped chat-template controls for supported vLLM calls."""
+    if str(backend_name or "").strip().lower() != "vllm":
+        return None
+
+    effort = str(reasoning_effort or "none").strip().lower()
+    if "qwen" in model_name.lower() and effort != "none":
+        return {
+            "enable_thinking": True,
+            "reasoning_effort": effort,
+        }
+    return {"enable_thinking": False}
+
+
 def _openai_compatible_chat_completion(
     backend_capabilities: Dict[str, object],
     system_prompt: str,
@@ -1158,17 +1176,15 @@ def _openai_compatible_chat_completion(
             {"role": "user", "content": user_prompt},
         ],
     }
-    if backend_capabilities.get("backend_name") == "vllm" and "qwen" in model_name.lower():
-        reasoning_effort = str(backend_capabilities.get("review_reasoning_effort") or "none").strip().lower()
-        if reasoning_effort == "none":
-            # Qwen3.8 defaults to thinking. This hard per-request switch is
-            # stronger and more reliable than relying on a /no_think prompt.
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
-        else:
-            payload["chat_template_kwargs"] = {
-                "enable_thinking": True,
-                "reasoning_effort": reasoning_effort,
-            }
+    request_controls = _chat_template_request_controls(
+        backend_capabilities.get("backend_name"),
+        model_name,
+        backend_capabilities.get("review_reasoning_effort"),
+    )
+    if request_controls is not None:
+        # This is the wire-level form of the reference pipeline's
+        # extra_body={"chat_template_kwargs": ...} request binding.
+        payload["chat_template_kwargs"] = request_controls
     if payload["response_format"] is None:
         payload.pop("response_format")
 

@@ -44,7 +44,7 @@ from podcast_transcribe.outputs import (
     write_speaker_workflow_report,
     write_text_transcript,
 )
-from podcast_transcribe.review import review_segments
+from podcast_transcribe.review import _chat_template_request_controls, review_segments
 from podcast_transcribe.speaker_workflow import (
     assert_write_revision,
     build_cross_episode_speaker_view,
@@ -930,22 +930,33 @@ def _workbench_scan_system_prompt() -> str:
     )
 
 
-def _openai_compatible_request(base_url: str, model_name: str, system_prompt: str, user_prompt: str, max_tokens: int = 1600) -> Dict[str, object]:
+def _openai_compatible_request(
+    base_url: str,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 1600,
+    *,
+    backend_name: str = "",
+    reasoning_effort: str = "none",
+) -> Dict[str, object]:
+    payload = {
+        "model": model_name,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    request_controls = _chat_template_request_controls(backend_name, model_name, reasoning_effort)
+    if request_controls is not None:
+        payload["chat_template_kwargs"] = request_controls
+
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}/v1/chat/completions",
-        data=json.dumps(
-            {
-                "model": model_name,
-                "temperature": 0,
-                "max_tokens": max_tokens,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            },
-            ensure_ascii=True,
-        ).encode("utf-8"),
+        data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -1010,6 +1021,8 @@ def run_semantic_scan(project_root: Path, output_dir: Path, episode_id: str, for
         str(resolved.get("review_model_name") or ""),
         _workbench_scan_system_prompt(),
         json.dumps(prompt_payload, ensure_ascii=True),
+        backend_name=str(resolved.get("effective_backend") or resolved.get("backend") or ""),
+        reasoning_effort=str(resolved.get("review_reasoning_effort") or "none"),
     )
     findings = parsed.get("findings")
     if not isinstance(findings, list):
@@ -1160,6 +1173,8 @@ def _induce_learned_rule_candidate(
         _review_rule_prompt(),
         json.dumps(prompt_payload, ensure_ascii=True),
         max_tokens=1800,
+        backend_name=str(runtime_review.get("effective_backend") or runtime_review.get("backend") or ""),
+        reasoning_effort=str(runtime_review.get("review_reasoning_effort") or "none"),
     )
     candidate = parsed.get("rule_candidate")
     if not isinstance(candidate, dict):
@@ -1295,6 +1310,8 @@ def _refine_rule_candidate(
         _review_rule_prompt(),
         json.dumps(prompt_payload, ensure_ascii=True),
         max_tokens=1600,
+        backend_name=str(runtime_review.get("effective_backend") or runtime_review.get("backend") or ""),
+        reasoning_effort=str(runtime_review.get("review_reasoning_effort") or "none"),
     )
     candidate = parsed.get("rule_candidate")
     if not isinstance(candidate, dict):

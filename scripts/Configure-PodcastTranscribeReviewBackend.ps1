@@ -311,7 +311,8 @@ function Test-ReviewChatCompletion {
     param(
         [Parameter(Mandatory = $true)][string]$BaseUrl,
         [Parameter(Mandatory = $true)][string]$ModelId,
-        [scriptblock]$RequestInvoker = ${function:Invoke-ReviewJsonRequest}
+        [scriptblock]$RequestInvoker = ${function:Invoke-ReviewJsonRequest},
+        [string]$Backend = ""
     )
 
     $body = [ordered]@{
@@ -324,6 +325,11 @@ function Test-ReviewChatCompletion {
         )
         temperature = 0
         max_tokens  = 16
+    }
+    if ($Backend.Trim().ToLowerInvariant() -eq "vllm") {
+        $body.chat_template_kwargs = [ordered]@{
+            enable_thinking = $false
+        }
     }
     try {
         $response = & $RequestInvoker "POST" "$BaseUrl/v1/chat/completions" $body
@@ -593,7 +599,7 @@ function Invoke-ReviewBackendWizard {
     $selectedModel = $discovery.ModelIds[$modelNumber - 1]
 
     Write-Host "Testing chat completions for '$selectedModel'..."
-    $completionTest = Test-ReviewChatCompletion -BaseUrl $discovery.BaseUrl -ModelId $selectedModel
+    $completionTest = Test-ReviewChatCompletion -BaseUrl $discovery.BaseUrl -ModelId $selectedModel -Backend $backend
     if (-not $completionTest.Succeeded) {
         Write-Host "Selected-model completion test failed: $($completionTest.Detail)" -ForegroundColor Red
         throw "The configuration was not changed because the selected model could not serve chat completions."

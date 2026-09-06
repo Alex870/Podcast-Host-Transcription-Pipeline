@@ -148,6 +148,31 @@ $completion = Test-ReviewChatCompletion -BaseUrl $discovery.BaseUrl `
         self.assertTrue(result["completion"])
         self.assertEqual(result["models"], ["local-model"])
 
+    def test_vllm_completion_smoke_test_disables_thinking(self) -> None:
+        output = self.run_powershell(
+            """
+$script:seenBody = $null
+$request = {
+    param($Method, $Uri, $Body)
+    $script:seenBody = $Body
+    return [pscustomobject]@{
+        choices = @([pscustomobject]@{
+            message = [pscustomobject]@{ content = 'OK' }
+        })
+    }
+}
+$completion = Test-ReviewChatCompletion -BaseUrl 'http://server:8000' `
+    -ModelId 'Qwen3.8-27B' -Backend 'vllm' -RequestInvoker $request
+[pscustomobject]@{
+    succeeded = $completion.Succeeded
+    enable_thinking = $script:seenBody.chat_template_kwargs.enable_thinking
+} | ConvertTo-Json -Compress
+"""
+        )
+        result = json.loads(output)
+        self.assertTrue(result["succeeded"])
+        self.assertFalse(result["enable_thinking"])
+
     def test_atomic_write_preserves_unrelated_keys_and_uses_utf8_without_bom(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "podcast_transcribe_config.json"
