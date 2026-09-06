@@ -59,11 +59,46 @@ from podcast_transcribe.operations import (
     downstream_delivery_status,
     retry_downstream_delivery,
 )
+from podcast_transcribe.partitions import (
+    CONTEXT_TYPES,
+    PartitionError,
+    PartitionRegistry,
+    resolve_partition_context,
+)
 
 
 class SessionOpenRequest(BaseModel):
     project_root: str = Field(..., alias="projectRoot")
-    output_dir: str = Field(..., alias="outputDir")
+    output_dir: str = Field("", alias="outputDir")
+    partition_id: Optional[str] = Field(default=None, alias="partitionId")
+
+
+class PartitionCreateRequest(BaseModel):
+    project_root: str = Field(..., alias="projectRoot")
+    display_name: str = Field(..., alias="displayName")
+    context_type: str = Field("podcast", alias="contextType")
+    workflow_profile: Optional[str] = Field(default=None, alias="workflowProfile")
+    intake_dir: Optional[str] = Field(default=None, alias="intakeDir")
+    output_dir: Optional[str] = Field(default=None, alias="outputDir")
+    state_dir: Optional[str] = Field(default=None, alias="stateDir")
+    speaker_reference_dir: Optional[str] = Field(default=None, alias="speakerReferenceDir")
+    corrections_dir: Optional[str] = Field(default=None, alias="correctionsDir")
+    config_overrides: Dict[str, object] = Field(default_factory=dict, alias="configOverrides")
+    downstream_config: Dict[str, object] = Field(default_factory=dict, alias="downstreamConfig")
+
+
+class PartitionUpdateRequest(BaseModel):
+    display_name: Optional[str] = Field(default=None, alias="displayName")
+    context_type: Optional[str] = Field(default=None, alias="contextType")
+    workflow_profile: Optional[str] = Field(default=None, alias="workflowProfile")
+    intake_dir: Optional[str] = Field(default=None, alias="intakeDir")
+    output_dir: Optional[str] = Field(default=None, alias="outputDir")
+    state_dir: Optional[str] = Field(default=None, alias="stateDir")
+    speaker_reference_dir: Optional[str] = Field(default=None, alias="speakerReferenceDir")
+    corrections_dir: Optional[str] = Field(default=None, alias="correctionsDir")
+    config_overrides: Optional[Dict[str, object]] = Field(default=None, alias="configOverrides")
+    downstream_config: Optional[Dict[str, object]] = Field(default=None, alias="downstreamConfig")
+    archived: Optional[bool] = None
 
 
 class TextCorrectionRequest(BaseModel):
@@ -150,12 +185,22 @@ class WorkbenchSession:
     def __init__(self):
         self.project_root: Optional[Path] = None
         self.output_dir: Optional[Path] = None
+        self.partition_id: Optional[str] = None
+        self.partition_context = None
 
-    def open(self, project_root: str, output_dir: str):
+    def open(self, project_root: str, output_dir: str = "", partition_id: Optional[str] = None):
         project = Path(project_root).resolve()
         output = Path(output_dir).resolve()
         if not project.exists():
             raise RuntimeError(f"Project root does not exist: {project}")
+        if partition_id:
+            context = resolve_partition_context(project, partition_id)
+            output = context.output_dir
+            self.partition_context = context
+            self.partition_id = context.partition_id
+        else:
+            self.partition_context = None
+            self.partition_id = None
         if not output.exists():
             raise RuntimeError(f"Output directory does not exist: {output}")
         self.project_root = project
@@ -166,6 +211,11 @@ class WorkbenchSession:
         if self.project_root is None or self.output_dir is None:
             raise RuntimeError("Workbench session is not open yet.")
         return self.project_root, self.output_dir
+
+    def require_registry(self) -> tuple[Path, PartitionRegistry]:
+        if self.project_root is None:
+            raise RuntimeError("Workbench project is not open yet.")
+        return self.project_root, PartitionRegistry(self.project_root)
 
 
 SESSION = WorkbenchSession()
@@ -184,12 +234,28 @@ def _json_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(exc))
 
 
+def _redact_config(payload: Dict[str, object]) -> Dict[str, object]:
+    """Keep credentials out of the browser's effective-configuration view."""
+
+    result: Dict[str, object] = {}
+    for key, value in payload.items():
+        folded = str(key).lower()
+        if any(fragment in folded for fragment in ("token", "secret", "password", "api_key", "apikey")):
+            result[key] = "[configured]" if value not in (None, "") else ""
+        elif isinstance(value, dict):
+            result[key] = _redact_config(value)
+        else:
+            result[key] = value
+    return result
+
+
 @app.get("/api/health")
 def health():
     dist_dir = _frontend_dist_dir()
     return {
         "status": "ok",
         "session_open": SESSION.project_root is not None and SESSION.output_dir is not None,
+        "partition_id": SESSION.partition_id,
         "frontend_dist_present": dist_dir.exists(),
     }
 
@@ -197,12 +263,13 @@ def health():
 @app.post("/api/session/open")
 def open_session(payload: SessionOpenRequest):
     try:
-        SESSION.open(payload.project_root, payload.output_dir)
+        SESSION.open(payload.project_root, payload.output_dir, payload.partition_id)
         project_root, output_dir = SESSION.require()
         return {
             "status": "ok",
             "projectRoot": str(project_root),
             "outputDir": str(output_dir),
+            "partitionId": SESSION.partition_id,
         }
     except Exception as exc:
         raise _json_error(exc) from exc
@@ -216,7 +283,115 @@ def get_session():
         "sessionOpen": True,
         "projectRoot": str(SESSION.project_root),
         "outputDir": str(SESSION.output_dir),
+        "partitionId": SESSION.partition_id,
+        "partition": SESSION.partition_context.record.to_dict() if SESSION.partition_context else None,
     }
+
+
+@app.get("/api/partitions")
+def list_partitions(project_root: Optional[str] = None, include_archived: bool = True):
+    try:
+        root = Path(project_root).resolve() if project_root else SESSION.project_root
+        if root is None:
+            raise RuntimeError("Project root is required before listing processing spaces.")
+        registry = PartitionRegistry(root)
+        rows = []
+        for record in registry.list(include_archived=include_archived):
+            summary = registry.summary(record.partition_id, include_archived=True)
+            rows.append({**record.to_dict(), "status_counts": summary.get("counts", {})})
+        return {"partitions": rows, "projectRoot": str(root), "contextTypes": sorted(CONTEXT_TYPES)}
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/partitions")
+def create_partition(payload: PartitionCreateRequest):
+    try:
+        registry = PartitionRegistry(payload.project_root)
+        record = registry.create(
+            payload.display_name,
+            context_type=payload.context_type,
+            workflow_profile=payload.workflow_profile,
+            intake_dir=payload.intake_dir,
+            output_dir=payload.output_dir,
+            state_dir=payload.state_dir,
+            speaker_reference_dir=payload.speaker_reference_dir,
+            corrections_dir=payload.corrections_dir,
+            config_overrides=payload.config_overrides,
+            downstream_config=payload.downstream_config,
+        )
+        return {"status": "created", "partition": record.to_dict()}
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.get("/api/partitions/{partition_id}")
+def get_partition(partition_id: str):
+    try:
+        project_root, registry = SESSION.require_registry()
+        record = registry.get(partition_id, include_archived=True)
+        summary = registry.summary(partition_id, include_archived=True)
+        context = resolve_partition_context(project_root, partition_id)
+        return {"partition": record.to_dict(), "summary": summary, "effectiveConfig": _redact_config(context.effective_config)}
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.put("/api/partitions/{partition_id}")
+def update_partition(partition_id: str, payload: PartitionUpdateRequest):
+    try:
+        _project_root, registry = SESSION.require_registry()
+        changes = payload.model_dump(exclude_none=True, by_alias=False)
+        record = registry.update(partition_id, **changes)
+        return {"status": "updated", "partition": record.to_dict()}
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/partitions/{partition_id}/validate")
+def validate_partition(partition_id: str):
+    try:
+        _project_root, registry = SESSION.require_registry()
+        record = registry.get(partition_id, include_archived=True)
+        summary = registry.summary(partition_id, include_archived=True)
+        missing = [str(path) for path in (record.intake_dir, record.output_dir, record.state_dir) if not path.exists()]
+        return {"valid": not missing and not record.archived, "archived": record.archived, "missingPaths": missing, "summary": summary}
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/partitions/{partition_id}/scan")
+def scan_partition(partition_id: str):
+    try:
+        _project_root, registry = SESSION.require_registry()
+        return registry.scan(partition_id)
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/partitions/{partition_id}/adopt")
+def adopt_partition(partition_id: str, payload: PartitionUpdateRequest):
+    """Adopt existing folders into a registered processing space without moving data."""
+    try:
+        _project_root, registry = SESSION.require_registry()
+        changes = payload.model_dump(exclude_none=True, by_alias=False)
+        if not any(changes.get(key) for key in ("intake_dir", "output_dir", "state_dir")):
+            raise PartitionError("Adoption requires at least an existing intake, output, or state path.")
+        record = registry.update(partition_id, **changes)
+        summary = registry.scan(partition_id)
+        return {"status": "adopted", "partition": record.to_dict(), "summary": summary}
+    except Exception as exc:
+        raise _json_error(exc) from exc
+
+
+@app.post("/api/partitions/{partition_id}/archive")
+def archive_partition(partition_id: str):
+    try:
+        _project_root, registry = SESSION.require_registry()
+        record = registry.update(partition_id, archived=True)
+        return {"status": "archived", "partition": record.to_dict()}
+    except Exception as exc:
+        raise _json_error(exc) from exc
 
 
 @app.get("/api/episodes")
@@ -457,6 +632,9 @@ def speaker_workflow(view: str = "all"):
 
 def _speaker_library_path(project_root: Path) -> Path:
     from podcast_transcribe.workbench_core import load_project_config
+
+    if SESSION.partition_context is not None and SESSION.partition_context.record.speaker_reference_dir:
+        return SESSION.partition_context.record.speaker_reference_dir / "speakers.json"
 
     config = load_project_config(project_root)
     configured = str(config.get("known_speakers_dir") or "speaker_reference_samples")
@@ -743,11 +921,12 @@ def main():
     parser.add_argument("--port", type=int, default=int(os.getenv("PODCAST_TRANSCRIBE_WORKBENCH_PORT", "8765")))
     parser.add_argument("--project-root", default=os.getenv("PODCAST_TRANSCRIBE_WORKBENCH_PROJECT_ROOT", ""))
     parser.add_argument("--output-dir", default=os.getenv("PODCAST_TRANSCRIBE_WORKBENCH_OUTPUT_DIR", ""))
+    parser.add_argument("--partition", default=os.getenv("PODCAST_TRANSCRIBE_WORKBENCH_PARTITION", ""))
     parser.add_argument("--open-browser", action="store_true")
     args = parser.parse_args()
 
-    if args.project_root and args.output_dir:
-        SESSION.open(args.project_root, args.output_dir)
+    if args.project_root and (args.output_dir or args.partition):
+        SESSION.open(args.project_root, args.output_dir, args.partition or None)
 
     if args.open_browser:
         webbrowser.open(f"http://{args.host}:{args.port}")

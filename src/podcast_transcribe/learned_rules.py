@@ -176,4 +176,3 @@ def active_rules_for_stage(rules: List[Dict[str, object]], stage_name: str) -> L
         for rule in rules
         if str(rule.get("status") or "") == "approved" and str(rule.get("stage_target") or "") == stage_name
     ]
-

@@ -32,7 +32,7 @@ Basic podcast transcribers usually stop at "faithfully capture the words." That 
 - `src/podcast_transcribe/`: Python package for the pipeline
 - `workbench-ui/`: React + Vite frontend for the transcript review workbench
 - `examples/`: example config, glossary, and replacement files
-- `docs/`: Quick Start, user docs, config reference, architecture, and contract docs
+- `docs/`: Quick Start, processing-space, user, config, architecture, contract, and operations docs
 - `benchmarks/review_fixtures/`: checked-in cleaned-transcript fixtures for review benchmarking
 - `benchmarks/pipeline_gold_set/`: synthetic/template quality fixtures; real private evaluation packs are configured externally
 
@@ -55,6 +55,7 @@ Current bootstrap options:
 7. Configure external review LLM
 8. Download pinned transcription models
 9. Transcribe committee meeting (anonymous speakers)
+10. Manage processing spaces
 
 All PowerShell entrypoints pause at the end so the console window stays open long enough to read the result.
 After an interactive menu action finishes, the bootstrap returns to the main menu; only `Q` closes it. Explicit `-Action` invocations remain one-shot.
@@ -62,6 +63,7 @@ Option `5` will also install workbench frontend dependencies and rebuild the bun
 Option `7` discovers models exposed by a vLLM or LM Studio server, tests the selected model, previews the exact config changes, and safely updates the project config.
 Option `8` explicitly downloads the selected revision-pinned provider artifacts after preflight; normal processing never downloads models implicitly.
 Option `9` runs the `anonymous_meeting` workflow for recordings where diarization labels are useful but host and recurring-speaker identity are not required.
+Option `10` creates, adopts, validates, scans, and backs up independent processing spaces without requiring manual JSON edits.
 
 ## Outputs
 
@@ -79,6 +81,8 @@ Batch-level outputs include `_episode_review_summary.csv`, `_batch_report.md`, `
 ## Getting Started
 
 For the practical first-run path, start with [`docs/quick-start.md`](docs/quick-start.md).
+
+For multiple independent podcasts, meetings, or interview collections, see [`docs/processing-spaces.md`](docs/processing-spaces.md).
 
 That guide covers:
 
@@ -100,7 +104,9 @@ Operator-facing docs:
 Engineering/supporting docs:
 
 - [`docs/architecture.md`](docs/architecture.md)
+- [`docs/processing-spaces.md`](docs/processing-spaces.md)
 - [`docs/podcast_pipeline_contract.md`](docs/podcast_pipeline_contract.md)
+- [`docs/M6-HARDENING.md`](docs/M6-HARDENING.md)
 - [`docs/state-of-the-art-comparison.md`](docs/state-of-the-art-comparison.md)
 - [`roadmap.md`](roadmap.md)
 - [`docs/workbench-implementation-plan.md`](docs/workbench-implementation-plan.md)

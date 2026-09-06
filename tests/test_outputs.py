@@ -23,9 +23,9 @@ from podcast_transcribe.outputs import (
 
 class OutputTests(unittest.TestCase):
     def test_episode_metadata_uses_last_valid_yyyymmdd_in_filename(self):
-        metadata = build_episode_metadata(r"D:\Podcasts\TFM 20250101 final 20260204.mp3")
+        metadata = build_episode_metadata(r"D:\Podcasts\Podcast 20250101 final 20260204.mp3")
 
-        self.assertEqual(metadata["source_filename"], "TFM 20250101 final 20260204.mp3")
+        self.assertEqual(metadata["source_filename"], "Podcast 20250101 final 20260204.mp3")
         self.assertEqual(metadata["episode_date"], "2026-02-04")
         self.assertEqual(metadata["episode_date_compact"], "20260204")
         self.assertEqual(metadata["episode_year"], 2026)
@@ -35,7 +35,7 @@ class OutputTests(unittest.TestCase):
 
     def test_episode_metadata_supports_configured_dashed_iso_format(self):
         metadata = build_episode_metadata(
-            "TFM 2026-02-04.mp3",
+            "Podcast 2026-02-04.mp3",
             {"formats": ["YYYY-MM-DD"]},
         )
 
@@ -54,7 +54,7 @@ class OutputTests(unittest.TestCase):
 
     def test_episode_metadata_can_use_first_match_when_configured(self):
         metadata = build_episode_metadata(
-            "TFM 20260101 final 20260204.mp3",
+            "Podcast 20260101 final 20260204.mp3",
             {"formats": ["YYYYMMDD"], "position": "first"},
         )
 
@@ -63,7 +63,7 @@ class OutputTests(unittest.TestCase):
 
     def test_episode_metadata_can_be_disabled(self):
         metadata = build_episode_metadata(
-            "TFM 20260204.mp3",
+            "Podcast 20260204.mp3",
             {"enabled": False},
         )
 
@@ -72,7 +72,7 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(metadata["episode_sort_key"], "")
 
     def test_episode_metadata_ignores_invalid_dates(self):
-        metadata = build_episode_metadata("TFM 20261340.mp3")
+        metadata = build_episode_metadata("Podcast 20261340.mp3")
 
         self.assertEqual(metadata["episode_date"], "")
         self.assertEqual(metadata["episode_date_compact"], "")
@@ -99,7 +99,7 @@ class OutputTests(unittest.TestCase):
     def test_json_output_accepts_dict_words_for_review_backfill_safety(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "speaker_transcript.json"
-            metadata = build_episode_metadata("TFM 20260204.mp3")
+            metadata = build_episode_metadata("Podcast 20260204.mp3")
             segment = SimpleNamespace(
                 id=1,
                 start=0.0,
@@ -113,7 +113,7 @@ class OutputTests(unittest.TestCase):
 
             write_json_output(
                 output_path,
-                source_file="TFM 20260204.mp3",
+                source_file="Podcast 20260204.mp3",
                 info_payload={"duration": 1.0},
                 diarized_turns=[],
                 segments=[segment],
@@ -131,7 +131,7 @@ class OutputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "speaker_transcript.txt"
             segments = [SimpleNamespace(start=0, speaker="HOST", text="opening line")]
-            metadata = build_episode_metadata("TFM 20260204.mp3")
+            metadata = build_episode_metadata("Podcast 20260204.mp3")
 
             write_text_transcript(
                 output_path,
@@ -144,8 +144,8 @@ class OutputTests(unittest.TestCase):
                 output_path.read_text(encoding="utf-8"),
                 "\n".join(
                     [
-                        "# source_file: TFM 20260204.mp3",
-                        "# source_filename: TFM 20260204.mp3",
+                        "# source_file: Podcast 20260204.mp3",
+                        "# source_filename: Podcast 20260204.mp3",
                         "# episode_date: 2026-02-04",
                         "# episode_date_compact: 20260204",
                         "# episode_sort_key: 20260204",
@@ -178,7 +178,7 @@ class OutputTests(unittest.TestCase):
 
             write_json_output(
                 output_path,
-                source_file="TFM 20260204.mp3",
+                source_file="Podcast 20260204.mp3",
                 info_payload={"duration": 120.0},
                 diarized_turns=[],
                 segments=[segment],
@@ -223,7 +223,7 @@ class OutputTests(unittest.TestCase):
 
             write_json_output(
                 output_path,
-                source_file="TFM 20260204.mp3",
+                source_file="Podcast 20260204.mp3",
                 info_payload={"duration": 120.0},
                 diarized_turns=[],
                 segments=[segment],
@@ -263,7 +263,7 @@ class OutputTests(unittest.TestCase):
 
             write_json_output(
                 output_path,
-                source_file="TFM 20260204.mp3",
+                source_file="Podcast 20260204.mp3",
                 info_payload={"duration": 120.0},
                 diarized_turns=[],
                 segments=[segment],
@@ -318,7 +318,7 @@ class OutputTests(unittest.TestCase):
 
             write_json_output(
                 output_path,
-                source_file="TFM 20260204.mp3",
+                source_file="Podcast 20260204.mp3",
                 info_payload={"duration": 120.0},
                 diarized_turns=[],
                 segments=[segment],

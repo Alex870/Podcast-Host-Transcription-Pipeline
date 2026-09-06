@@ -1,0 +1,130 @@
+diff --git a/src/podcast_transcribe/cli.py b/src/podcast_transcribe/cli.py
+index 1fc152c..8d680a9 100644
+--- a/src/podcast_transcribe/cli.py
++++ b/src/podcast_transcribe/cli.py
+@@ -2501,15 +2501,42 @@ def overlap_seconds(start_a: float, end_a: float, start_b: float, end_b: float)
+ def assign_speakers_to_segments(segments: List[SegmentItem], diarized_turns: List[Dict[str, object]]):
+     """Assign best-overlap diarized speakers to transcript segments and words."""
+ 
+-    for segment in segments:
++    # Both lists are time ordered in normal ASR output. The old implementation
++    # compared every segment and every word with every diarization turn, making
++    # a cached 4,000-segment / 2,000-turn episode spend tens of seconds doing
++    # work that did not invoke the diarization model at all.
++    ordered_turns = sorted(
++        diarized_turns,
++        key=lambda turn: (float(turn.get("start") or 0.0), float(turn.get("end") or 0.0)),
++    )
++
++    def best_speaker(start: float, end: float, cursor: int, previous_start: float) -> Tuple[Optional[str], int, float]:
++        if start < previous_start:
++            cursor = 0
++        while cursor < len(ordered_turns) and float(ordered_turns[cursor]["end"]) <= start:
++            cursor += 1
+         overlap_by_speaker = defaultdict(float)
+-        for turn in diarized_turns:
+-            overlap = overlap_seconds(segment.start, segment.end, turn["start"], turn["end"])
++        index = cursor
++        while index < len(ordered_turns) and float(ordered_turns[index]["start"]) < end:
++            turn = ordered_turns[index]
++            overlap = overlap_seconds(start, end, float(turn["start"]), float(turn["end"]))
+             if overlap > 0:
+                 overlap_by_speaker[turn["speaker"]] += overlap
+-
+-        if overlap_by_speaker:
+-            segment.speaker = max(overlap_by_speaker.items(), key=lambda item: item[1])[0]
++            index += 1
++        if not overlap_by_speaker:
++            return None, cursor, start
++        return max(overlap_by_speaker.items(), key=lambda item: item[1])[0], cursor, start
++
++    segment_cursor = 0
++    segment_previous_start = float("-inf")
++    word_cursor = 0
++    word_previous_start = float("-inf")
++    for segment in segments:
++        speaker, segment_cursor, segment_previous_start = best_speaker(
++            float(segment.start), float(segment.end), segment_cursor, segment_previous_start
++        )
++        if speaker:
++            segment.speaker = speaker
+         elif not segment.speaker:
+             segment.speaker = "UNKNOWN"
+ 
+@@ -2518,16 +2545,10 @@ def assign_speakers_to_segments(segments: List[SegmentItem], diarized_turns: Lis
+                 word.speaker = segment.speaker
+                 continue
+ 
+-            word_overlap = defaultdict(float)
+-            for turn in diarized_turns:
+-                overlap = overlap_seconds(word.start, word.end, turn["start"], turn["end"])
+-                if overlap > 0:
+-                    word_overlap[turn["speaker"]] += overlap
+-
+-            if word_overlap:
+-                word.speaker = max(word_overlap.items(), key=lambda item: item[1])[0]
+-            else:
+-                word.speaker = segment.speaker
++            word_speaker, word_cursor, word_previous_start = best_speaker(
++                float(word.start), float(word.end), word_cursor, word_previous_start
++            )
++            word.speaker = word_speaker or segment.speaker
+             if not word.speaker:
+                 word.speaker = "UNKNOWN"
+@@ -3746,6 +3767,13 @@ def provider_configuration_shortfall(
+     provenance = metadata.get("stage_provenance") if isinstance(metadata, dict) else None
+     config = runtime_config or {}
+     workflow_profile = str(config.get("workflow_profile") or "podcast")
++    configured_asr_model = str(config.get("model_id") or "").strip()
++    if not configured_asr_model:
++        configured_asr_model = str(config.get("model") or "").strip()
++        if str(config.get("asr_provider") or "faster_whisper") == "faster_whisper":
++            configured_asr_model = {
++                "distil-large-v3": "Systran/faster-distil-whisper-large-v3",
++            }.get(configured_asr_model, f"Systran/faster-whisper-{configured_asr_model}")
+     if not isinstance(provenance, dict) or not provenance:
+@@ -3765,7 +3793,7 @@ def provider_configuration_shortfall(
+     expectations = {
+         "transcription": (
+             str(config.get("asr_provider") or "faster_whisper"),
+-            str(config.get("model") or ""),
++            configured_asr_model,
+         ),
+diff --git a/src/podcast_transcribe/review.py b/src/podcast_transcribe/review.py
+index 9000c94..a5e10ed 100644
+--- a/src/podcast_transcribe/review.py
++++ b/src/podcast_transcribe/review.py
+@@ -209,6 +209,9 @@ class ReviewCalibrationSession:
+             "backend_name": str(backend_capabilities.get("backend_name") or ""),
+             "review_model_name": str(backend_capabilities.get("review_model_name") or ""),
+             "review_base_url": str(backend_capabilities.get("review_base_url") or ""),
++            "review_reasoning_effort": str(backend_capabilities.get("review_reasoning_effort") or ""),
++            "review_batch_token_limit": int(backend_capabilities.get("review_batch_token_limit") or 0),
++            "review_candidate_filter": bool(backend_capabilities.get("review_candidate_filter")),
+             "backend_identity_source": str(backend_capabilities.get("backend_identity_source") or ""),
+             "backend_identity_model_id": str(backend_capabilities.get("backend_identity_model_id") or ""),
+             "backend_identity_digest": str(backend_capabilities.get("backend_identity_digest") or ""),
+@@ -219,7 +222,15 @@ class ReviewCalibrationSession:
+         families_payload = self.persisted_state.get("families") if fingerprint_matches else {}
+         self._session_events: List[Dict[str, object]] = []
+         self.warm_start_used = bool(fingerprint_matches and isinstance(families_payload, dict) and families_payload)
+-        self.calibrated = False
++        # Calibration is a runtime-level property. If the persisted budgets were
++        # calibrated for the same backend/model/prompt settings, reuse them and
++        # do not probe the live model again on every episode.
++        self.calibrated = bool(
++            fingerprint_matches
++            and self.persisted_state.get("calibrated") is True
++            and isinstance(families_payload, dict)
++            and families_payload
++        )
+         self.calibrated_this_run = False
+         self.families: Dict[str, Dict[str, object]] = {}
+         for family_name in {"local_text_review", "local_speaker_review", "long_context_review"}:
+@@ -258,7 +269,7 @@ class ReviewCalibrationSession:
+     def serialize(self) -> Dict[str, object]:
+         return {
+             "runtime_fingerprint": self.runtime_fingerprint,
+-            "calibrated": self.calibrated_this_run,
++            "calibrated": bool(self.calibrated or self.calibrated_this_run),
+             "families": {

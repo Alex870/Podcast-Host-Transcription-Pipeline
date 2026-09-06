@@ -1,0 +1,458 @@
+{
+  "max_output_tokens": 1400,
+  "targets": [
+    4000,
+    8000,
+    16000,
+    24000
+  ],
+  "context_token_estimates": {
+    "4000": 3993,
+    "8000": 7992,
+    "16000": 15990,
+    "24000": 23988
+  },
+  "needle_ids": [
+    9101,
+    9102,
+    9103,
+    9104,
+    9105,
+    9106,
+    9107,
+    9108
+  ],
+  "local": {
+    "endpoint": "http://127.0.0.1:8001",
+    "model": "Qwen/Qwen3-4B-Instruct-2507",
+    "contexts": {
+      "4000": {
+        "measured": {
+          "json_valid": true,
+          "schema_valid": true,
+          "reasoning_chars": 0,
+          "prompt_tokens": 3993,
+          "completion_tokens": 340,
+          "reasoning_tokens": null,
+          "finish_reason": "stop",
+          "reviewed_segment_ids": [
+            9101,
+            9103,
+            9104,
+            9105,
+            9106,
+            9107,
+            9108
+          ],
+          "normalized_output": {
+            "reviewed_segments": [
+              {
+                "id": 9101,
+                "text": "The results were encouraging, and we receive feedback every week."
+              },
+              {
+                "id": 9103,
+                "text": "We need to separate the files before the final review."
+              },
+              {
+                "id": 9104,
+                "text": "That approach is definitely worth testing."
+              },
+              {
+                "id": 9105,
+                "text": "The team has already completed the first pass."
+              },
+              {
+                "id": 9106,
+                "text": "Please send the report when you are ready."
+              },
+              {
+                "id": 9107,
+                "text": "We should preserve the original meaning and speaker labels."
+              },
+              {
+                "id": 9108,
+                "text": "This is the final example for the comparison."
+              }
+            ],
+            "corrected_segment_count": 7,
+            "episode_notes": [
+              "Corrected subject-verb agreement in 'results was' to 'results were'.",
+              "Corrected 'recieve' to 'receive'.",
+              "Corrected 'seperate' to 'separate'.",
+              "Corrected 'team have' to 'team has'.",
+              "Corrected 'definately' to 'definitely'.",
+              "Corrected 'We should preserve' to maintain consistency with original meaning and speaker labels.",
+              "Corrected repeated segment text to reflect actual grammatical and spelling errors."
+            ]
+          },
+          "elapsed_seconds": 5.872
+        }
+      },
+      "8000": {
+        "measured": {
+          "json_valid": true,
+          "schema_valid": true,
+          "reasoning_chars": 0,
+          "prompt_tokens": 7992,
+          "completion_tokens": 341,
+          "reasoning_tokens": null,
+          "finish_reason": "stop",
+          "reviewed_segment_ids": [
+            9101,
+            9103,
+            9104,
+            9105,
+            9106,
+            9107,
+            9108
+          ],
+          "normalized_output": {
+            "reviewed_segments": [
+              {
+                "id": 9101,
+                "text": "The results were encouraging, and we receive feedback every week."
+              },
+              {
+                "id": 9103,
+                "text": "We need to separate the files before the final review."
+              },
+              {
+                "id": 9104,
+                "text": "That approach is definitely worth testing."
+              },
+              {
+                "id": 9105,
+                "text": "The team has already completed the first pass."
+              },
+              {
+                "id": 9106,
+                "text": "Please send the report when you are ready."
+              },
+              {
+                "id": 9107,
+                "text": "We should preserve the original meaning and speaker labels."
+              },
+              {
+                "id": 9108,
+                "text": "This is the final example for the comparison."
+              }
+            ],
+            "corrected_segment_count": 7,
+            "episode_notes": [
+              "Corrected subject-verb agreement in 'results was' to 'results were'.",
+              "Corrected 'recieve' to 'receive'.",
+              "Corrected 'seperate' to 'separate'.",
+              "Corrected 'team have' to 'team has'.",
+              "Corrected 'Its' to 'That' and 'definately' to 'definitely'.",
+              "Corrected repeated text segments that were identical and only varied in speaker or id; no content changes were needed beyond grammar and spelling."
+            ]
+          },
+          "elapsed_seconds": 6.287
+        }
+      },
+      "16000": {
+        "measured": {
+          "json_valid": true,
+          "schema_valid": true,
+          "reasoning_chars": 0,
+          "prompt_tokens": 15990,
+          "completion_tokens": 116,
+          "reasoning_tokens": null,
+          "finish_reason": "stop",
+          "reviewed_segment_ids": [],
+          "normalized_output": {
+            "reviewed_segments": [],
+            "corrected_segment_count": 0,
+            "episode_notes": [
+              "Corrected grammar and syntax errors in the transcript.",
+              "Identified and fixed subject-verb agreement issues (e.g., 'results was' \u2192 'results were').",
+              "Corrected article usage (e.g., 'Its a simple change' \u2192 'It's a simple change').",
+              "Ensured consistent verb tense and pronoun usage throughout the transcript.",
+              "Preserved original speaker labels and segment order."
+            ]
+          },
+          "elapsed_seconds": 4.193
+        }
+      },
+      "24000": {
+        "measured": {
+          "json_valid": true,
+          "schema_valid": true,
+          "reasoning_chars": 0,
+          "prompt_tokens": 23988,
+          "completion_tokens": 182,
+          "reasoning_tokens": null,
+          "finish_reason": "stop",
+          "reviewed_segment_ids": [],
+          "normalized_output": {
+            "reviewed_segments": [],
+            "corrected_segment_count": 0,
+            "episode_notes": [
+              "Grammar and syntax errors identified in the transcript: 'The results was' should be 'The results were', 'We recieve' should be 'We receive', 'Its a simple change' should be 'It's a simple change', 'We need to seperate' should be 'We need to separate', 'That approach is definately worth testing' should be 'That approach is definitely worth testing', 'The team have already completed' should be 'The team has already completed', 'Please send the report when you are ready' is grammatically correct.",
+              "Corrected instances of subject-verb agreement and possessive pronouns to maintain grammatical accuracy while preserving original meaning and speaker labels.",
+              "No changes to speaker labels or segment order were required."
+            ]
+          },
+          "elapsed_seconds": 7.401
+        }
+      }
+    }
+  },
+  "remote": {
+    "endpoint": "http://192.168.1.230:8000",
+    "model": "Inferact/Qwen3.8-27B-NVFP4",
+    "contexts": {
+      "4000": {
+        "measured": {
+          "json_valid": true,
+          "schema_valid": true,
+          "reasoning_chars": 0,
+          "prompt_tokens": 3997,
+          "completion_tokens": 281,
+          "reasoning_tokens": null,
+          "finish_reason": "stop",
+          "reviewed_segment_ids": [
+            9101,
+            9102,
+            9103,
+            9104
+          ],
+          "normalized_output": {
+            "reviewed_segments": [
+              {
+                "id": 9101,
+                "text": "The results were encouraging, and we receive feedback every week."
+              },
+              {
+                "id": 9102,
+                "text": "It's a simple change, but it affects the outcome."
+              },
+              {
+                "id": 9103,
+                "text": "We need to separate the files before the final review."
+              },
+              {
+                "id": 9104,
+                "text": "That approach is definitely worth testing."
+              }
+            ],
+            "corrected_segment_count": 4,
+            "episode_notes": [
+              "Corrected subject-verb agreement and spelling in segment 9101 ('was' to 'were', 'recieve' to 'receive').",
+              "Corrected spelling and grammar in segment 9102 ('Its' to 'It's', 'effects' to 'affects').",
+              "Corrected spelling in segment 9103 ('seperate' to 'separate').",
+              "Corrected spelling in segment 9104 ('definately' to 'definitely')."
+            ]
+          },
+          "elapsed_seconds": 4.809
+        }
+      },
+      "8000": {
+        "measured": {
+          "json_valid": true,
+          "schema_valid": true,
+          "reasoning_chars": 0,
+          "prompt_tokens": 7996,
+          "completion_tokens": 281,
+          "reasoning_tokens": null,
+          "finish_reason": "stop",
+          "reviewed_segment_ids": [
+            9101,
+            9102,
+            9103,
+            9104
+          ],
+          "normalized_output": {
+            "reviewed_segments": [
+              {
+                "id": 9101,
+                "text": "The results were encouraging, and we receive feedback every week."
+              },
+              {
+                "id": 9102,
+                "text": "It's a simple change, but it affects the outcome."
+              },
+              {
+                "id": 9103,
+                "text": "We need to separate the files before the final review."
+              },
+              {
+                "id": 9104,
+                "text": "That approach is definitely worth testing."
+              }
+            ],
+            "corrected_segment_count": 4,
+            "episode_notes": [
+              "Corrected subject-verb agreement and spelling in segment 9101 ('was' to 'were', 'recieve' to 'receive').",
+              "Corrected spelling and grammar in segment 9102 ('Its' to 'It's', 'effects' to 'affects').",
+              "Corrected spelling in segment 9103 ('seperate' to 'separate').",
+              "Corrected spelling in segment 9104 ('definately' to 'definitely')."
+            ]
+          },
+          "elapsed_seconds": 4.865
+        }
+      },
+      "16000": {
+        "measured": {
+          "json_valid": true,
+          "schema_valid": true,
+          "reasoning_chars": 0,
+          "prompt_tokens": 15994,
+          "completion_tokens": 281,
+          "reasoning_tokens": null,
+          "finish_reason": "stop",
+          "reviewed_segment_ids": [
+            9101,
+            9102,
+            9103,
+            9104
+          ],
+          "normalized_output": {
+            "reviewed_segments": [
+              {
+                "id": 9101,
+                "text": "The results were encouraging, and we receive feedback every week."
+              },
+              {
+                "id": 9102,
+                "text": "It's a simple change, but it affects the outcome."
+              },
+              {
+                "id": 9103,
+                "text": "We need to separate the files before the final review."
+              },
+              {
+                "id": 9104,
+                "text": "That approach is definitely worth testing."
+              }
+            ],
+            "corrected_segment_count": 4,
+            "episode_notes": [
+              "Corrected subject-verb agreement and spelling in segment 9101 ('was' to 'were', 'recieve' to 'receive').",
+              "Corrected spelling and grammar in segment 9102 ('Its' to 'It's', 'effects' to 'affects').",
+              "Corrected spelling in segment 9103 ('seperate' to 'separate').",
+              "Corrected spelling in segment 9104 ('definately' to 'definitely')."
+            ]
+          },
+          "elapsed_seconds": 4.93
+        }
+      },
+      "24000": {
+        "measured": {
+          "json_valid": true,
+          "schema_valid": true,
+          "reasoning_chars": 0,
+          "prompt_tokens": 23992,
+          "completion_tokens": 283,
+          "reasoning_tokens": null,
+          "finish_reason": "stop",
+          "reviewed_segment_ids": [
+            9101,
+            9102,
+            9103,
+            9104
+          ],
+          "normalized_output": {
+            "reviewed_segments": [
+              {
+                "id": 9101,
+                "text": "The results were encouraging, and we receive feedback every week."
+              },
+              {
+                "id": 9102,
+                "text": "It's a simple change, but it affects the outcome."
+              },
+              {
+                "id": 9103,
+                "text": "We need to separate the files before the final review."
+              },
+              {
+                "id": 9104,
+                "text": "That approach is definitely worth testing."
+              }
+            ],
+            "corrected_segment_count": 4,
+            "episode_notes": [
+              "Corrected subject-verb agreement and spelling in segment 9101 ('was' to 'were', 'recieve' to 'receive').",
+              "Corrected homophone and spelling errors in segment 9102 ('Its' to 'It's', 'effects' to 'affects').",
+              "Corrected spelling in segment 9103 ('seperate' to 'separate').",
+              "Corrected spelling in segment 9104 ('definately' to 'definitely')."
+            ]
+          },
+          "elapsed_seconds": 5.049
+        }
+      }
+    }
+  },
+  "comparisons": {
+    "4000": {
+      "local_seconds": 5.872,
+      "remote_seconds": 4.809,
+      "remote_to_local_latency_ratio": 0.819,
+      "outputs_equal": false,
+      "local_reviewed_ids": [
+        9101,
+        9103,
+        9104,
+        9105,
+        9106,
+        9107,
+        9108
+      ],
+      "remote_reviewed_ids": [
+        9101,
+        9102,
+        9103,
+        9104
+      ]
+    },
+    "8000": {
+      "local_seconds": 6.287,
+      "remote_seconds": 4.865,
+      "remote_to_local_latency_ratio": 0.774,
+      "outputs_equal": false,
+      "local_reviewed_ids": [
+        9101,
+        9103,
+        9104,
+        9105,
+        9106,
+        9107,
+        9108
+      ],
+      "remote_reviewed_ids": [
+        9101,
+        9102,
+        9103,
+        9104
+      ]
+    },
+    "16000": {
+      "local_seconds": 4.193,
+      "remote_seconds": 4.93,
+      "remote_to_local_latency_ratio": 1.176,
+      "outputs_equal": false,
+      "local_reviewed_ids": [],
+      "remote_reviewed_ids": [
+        9101,
+        9102,
+        9103,
+        9104
+      ]
+    },
+    "24000": {
+      "local_seconds": 7.401,
+      "remote_seconds": 5.049,
+      "remote_to_local_latency_ratio": 0.682,
+      "outputs_equal": false,
+      "local_reviewed_ids": [],
+      "remote_reviewed_ids": [
+        9101,
+        9102,
+        9103,
+        9104
+      ]
+    }
+  }
+}

@@ -1,8 +1,8 @@
 # Roadmap
 
-Updated: 2026-09-03
+Updated: 2026-09-06
 
-`podcast-host-transcription-pipeline` is the evidence-creation and human-correction boundary for the podcast ecosystem. The core pipeline, provider contracts, gold-set tooling, selective recomputation, speaker workflows, review workbench, and clean-machine diagnostics are implemented. The roadmap now prioritizes representative human evidence and a correction loop that remains traceable downstream.
+`podcast-host-transcription-pipeline` is the evidence-creation and human-correction boundary for the podcast ecosystem. The core pipeline, provider contracts, gold-set tooling, selective recomputation, speaker workflows, review workbench, and clean-machine diagnostics are implemented and covered by the repository suite. Operational acceptance still requires representative private episodes, a real correction drill, and measured provider decisions.
 
 ## Product Direction
 
@@ -22,10 +22,11 @@ Updated: 2026-09-03
 - Optional WhisperX, Parakeet, and candidate speaker-embedding paths with guarded diagnostics.
 - Cross-episode speaker evidence, reversible recurring-speaker promotion, and profile-family compatibility checks.
 - Versioned transcript contract consumed by downstream fixture tests.
+- SQLite-backed processing spaces with isolated intake/output/state paths, launcher/workbench management, intake status tracking, and partition metadata in episode outputs.
 
 ## Value-Ordered Priorities
 
-### 1. Populate and operate the real quality set — implemented
+### 1. Populate and operate the real quality set — tooling implemented; acceptance pending
 
 - The external private evaluation pack is configurable through `evaluation_pack_path`.
 - The workbench exposes unlabelled, pending-review, adjudication, and human-approved queues.
@@ -53,13 +54,20 @@ Updated: 2026-09-03
 - Calibrate candidate speaker embedders using versioned profiles and identical excerpts.
 - Keep provider installation and model licensing optional and isolated.
 
-### 5. Improve operator resilience and privacy
+### 5. Improve operator resilience and privacy — partially implemented; target proof pending
 
-- Add disk/capacity estimates, batch risk ranking, actionable recovery links, and background progress/cancellation.
+- Implemented in part: clean-machine diagnostics, safe external-model discovery, isolated processing, progress/timing telemetry, and recovery-oriented cache behavior.
+- Add disk/capacity estimates, batch risk ranking, actionable recovery links, and background progress/cancellation where still missing.
 - Validate backup/restore and interrupted-run recovery on a cache-free target.
 - Add configurable retention/redaction for audio clips, review exports, logs, and temporary workbench data.
 - Keep backend credentials and cloud-provider management out of the local/LAN configuration wizard unless a concrete provider requirement justifies a separate secure design.
 - Continue decomposing the large CLI where it reduces change risk or enables testing; avoid a rewrite for its own sake.
+
+### 6. Operate independent processing spaces — implemented; end-to-end proof pending
+
+- Implemented: processing-space registry, managed folder creation, legacy-folder adoption, overlap validation, intake status tracking, partition-aware CLI resolution, launcher management, and workbench selection/configuration.
+- Implemented: downstream consumers preserve partition identity in processed-cache, Chroma manifest, Chat database/target, and RAGScope provenance paths; mixed-partition imports fail closed by default.
+- Next: prove a two-space end-to-end run without cross-corpus mixing and add explicit operator guidance for the exceptional mixed-import override.
 
 ## Sequencing
 
@@ -70,6 +78,6 @@ Updated: 2026-09-03
 5. Complete target-machine resilience, privacy, and packaging checks.
 
 The ecosystem-level sequence and promotion rules live in `../PODCAST_ECOSYSTEM_ROADMAP.md` when these repositories share a workspace.
-## Phases 0–3 implementation status (2026-07-24)
+## Status as of 2026-09-06
 
-Quality-set operations, contract-aware v2 upgrades, first-class correction artifacts, downstream notifications, and embedding-backed recurring-speaker identity are implemented. The remaining work is operational evidence: complete the private campaign, accept its baseline, exercise a real cross-repository correction, and promote only speaker/provider changes supported by that evidence.
+Quality-set operations, contract-aware v2 upgrades, first-class correction artifacts, downstream notifications, embedding-backed recurring-speaker identity, and repository-local hardening are implemented. The remaining work is operational evidence: complete the private campaign, accept its baseline, exercise a real cross-repository correction, validate target-machine recovery/privacy behavior, and promote only speaker/provider changes supported by that evidence.

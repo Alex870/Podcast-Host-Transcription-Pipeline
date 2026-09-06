@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("Prompt", "Run", "Debug", "Migrate", "Benchmark", "PipelineBenchmark", "DownloadModels", "AnonymousMeeting", "Workbench", "ConfigureLLM")]
+    [ValidateSet("Prompt", "Run", "Debug", "Migrate", "Benchmark", "PipelineBenchmark", "DownloadModels", "AnonymousMeeting", "Workbench", "ConfigureLLM", "PartitionManager")]
     [string]$Action = "Prompt"
 )
 
@@ -50,8 +50,9 @@ function Read-LauncherAction {
     Write-Host "  7. Configure external review LLM"
     Write-Host "  8. Download pinned transcription models"
     Write-Host "  9. Transcribe committee meeting (anonymous speakers)"
+    Write-Host " 10. Manage processing spaces"
     Write-Host "  Q. Quit"
-    $selection = (Read-Host "Enter 1, 2, 3, 4, 5, 6, 7, 8, 9, or Q").Trim()
+    $selection = (Read-Host "Enter 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, or Q").Trim()
 
     switch ($selection.ToUpperInvariant()) {
         "1" { return "Debug" }
@@ -63,6 +64,7 @@ function Read-LauncherAction {
         "7" { return "ConfigureLLM" }
         "8" { return "DownloadModels" }
         "9" { return "AnonymousMeeting" }
+        "10" { return "PartitionManager" }
         "Q" { return "Quit" }
         default {
             Write-Host "Unrecognized selection. Please try again." -ForegroundColor Yellow
@@ -87,6 +89,10 @@ function Invoke-SelectedLauncherAction {
         "AnonymousMeeting" { Invoke-LauncherScript -Path $RunScript -WorkflowProfile anonymous_meeting }
         "Workbench" { Invoke-LauncherScript -Path $WorkbenchScript }
         "ConfigureLLM" { Invoke-LauncherScript -Path $ConfigureLlmScript }
+        "PartitionManager" {
+            $pythonWrapper = Join-Path $ScriptRoot "podcast_transcribe_host.py"
+            & python $pythonWrapper --partition-manager --project-root $ScriptRoot
+        }
         default { throw "Unsupported launcher action: $SelectedAction" }
     }
 }

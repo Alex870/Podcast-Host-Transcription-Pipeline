@@ -13,7 +13,6 @@ import subprocess
 import sys
 import time
 import warnings
-import wave
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -139,7 +138,6 @@ from rich.progress import (
 
 from podcast_transcribe.cleanup import build_cleaned_segments
 from podcast_transcribe.config import (
-    DEFAULT_REVIEW_BATCH_TOKEN_LIMIT,
     DEFAULT_REVIEW_BACKEND,
     DEFAULT_RUNTIME_PROFILE,
     REVIEW_BACKENDS,
@@ -171,7 +169,6 @@ from podcast_transcribe.outputs import (
     write_speaker_identity_review_csv as output_write_speaker_identity_review_csv,
     write_text_transcript as output_write_text_transcript,
 )
-from podcast_transcribe.partitions import apply_partition_to_args, partition_manager, PartitionRegistry
 from podcast_transcribe.models import SegmentItem, WordItem
 from podcast_transcribe.evaluation import run_pipeline_benchmark, write_pipeline_benchmark_reports
 from podcast_transcribe.orchestration.fingerprints import build_stage_fingerprint
@@ -205,10 +202,8 @@ from podcast_transcribe.state import (
     REVIEW_CALIBRATION_FILENAME,
     SUMMARY_FILENAME,
     audio_file_fingerprint,
-    atomic_write_text as state_atomic_write_text,
     clear_stage_artifacts as state_clear_stage_artifacts,
     clear_debug_artifacts as state_clear_debug_artifacts,
-    clear_transient_artifacts as state_clear_transient_artifacts,
     expected_output_paths as state_expected_output_paths,
     is_file_already_processed as state_is_file_already_processed,
     load_diarization_history_state as state_load_diarization_history_state,
@@ -234,18 +229,6 @@ from podcast_transcribe.speaker_workflow import build_cross_episode_speaker_view
 
 SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
 LONG_FILE_WARNING_HOURS = 4.0
-SPEAKER_AUDIO_CACHE_VERSION = 1
-SPEAKER_AUDIO_CACHE_SAMPLE_RATE = 16000
-SPEAKER_AUDIO_CACHE_SOURCE_SUFFIXES = {
-    ".mp3",
-    ".m4a",
-    ".aac",
-    ".flac",
-    ".ogg",
-    ".opus",
-    ".wma",
-    ".webm",
-}
 DIARIZATION_CHUNK_MINUTES = 25.0
 DIARIZATION_CHUNK_OVERLAP_SECONDS = 90.0
 DIARIZATION_PROBE_MARGIN_SECONDS = 30.0 * 60.0
@@ -413,23 +396,6 @@ def print_timing_component_summary(stage_label: str, component_timings: Dict[str
         print(f"    {name}: {elapsed:.1f}s")
 
 
-def start_finalization_operation(label: str) -> float:
-    return start_console_operation("finalization", label)
-
-
-def start_console_operation(scope: str, label: str) -> float:
-    print(f"  {scope}: {label}...")
-    return time.perf_counter()
-
-
-def finish_finalization_operation(label: str, started: float):
-    finish_console_operation("finalization", label, started)
-
-
-def finish_console_operation(scope: str, label: str, started: float):
-    print(f"  {scope}: {label} complete in {time.perf_counter() - started:.1f}s")
-
-
 def make_review_progress_callback(component_timings: Optional[Dict[str, float]] = None):
     state = {"current_stage": None, "stage_index": None, "stage_total": None}
 
@@ -472,31 +438,6 @@ def make_review_progress_callback(component_timings: Optional[Dict[str, float]] 
             new_budget = int(event.get("new_budget") or 0)
             family_label = family_name.replace("_review", "").replace("_", " ")
             print(f"  Review budget increased for {family_label}: {old_budget} -> {new_budget}")
-
-    return callback
-
-
-def make_checkpointed_review_progress_callback(
-    output_dir: Path,
-    audio_path: Path,
-    component_timings: Optional[Dict[str, float]] = None,
-):
-    console_callback = make_review_progress_callback(component_timings)
-
-    def callback(event: Dict[str, object]):
-        console_callback(event)
-        if str(event.get("event") or "") in {"stage_started", "stage_response_success", "stage_finished", "stage_skipped"}:
-            write_processing_checkpoint(
-                output_dir,
-                audio_path,
-                "review_in_progress",
-                {
-                    "event": str(event.get("event") or ""),
-                    "stage_name": str(event.get("stage_name") or ""),
-                    "current": event.get("current"),
-                    "total": event.get("total"),
-                },
-            )
 
     return callback
 
@@ -755,26 +696,6 @@ def parse_args():
     """Parse CLI options for parent batch runs and isolated child workers."""
 
     parser = argparse.ArgumentParser(description="Transcribe podcasts with diarization and host labeling.")
-    parser.add_argument(
-        "--project-root",
-        default="",
-        help="Project root containing the managed processing-space registry.",
-    )
-    parser.add_argument(
-        "--partition",
-        default="",
-        help="Process one managed processing space by partition ID.",
-    )
-    parser.add_argument(
-        "--partition-run-id",
-        default="",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--partition-manager",
-        action="store_true",
-        help="Open the terminal processing-space manager and return without loading ML models.",
-    )
     parser.add_argument("--input-dir", help="Directory containing audio files to process.")
     parser.add_argument("--input-file", help="Optional single audio file to process from input-dir.")
     parser.add_argument("--output-dir", help="Output directory. Defaults to input directory.")
@@ -935,18 +856,6 @@ def parse_args():
         choices=["none", "low", "medium", "xhigh"],
         default="none",
         help="Per-request Qwen reasoning mode for transcript review. 'none' disables thinking.",
-    )
-    parser.add_argument(
-        "--review-batch-token-limit",
-        type=int,
-        default=DEFAULT_REVIEW_BATCH_TOKEN_LIMIT,
-        help="Hard token ceiling for each review request. Smaller batches keep remote review latency bounded.",
-    )
-    parser.add_argument(
-        "--review-all-segments",
-        dest="review_candidate_filter",
-        action="store_false",
-        help="Review every segment instead of only changed or uncertain segments.",
     )
     parser.add_argument("--review-context-budget", type=int, default=0, help="Custom-profile review context budget.")
     parser.add_argument(
@@ -1157,7 +1066,6 @@ def parse_args():
         review_structured_output_support=False,
         review_transcript_qa_available=False,
         review_episode_wide_correction_available=False,
-        review_candidate_filter=True,
     )
     parser.set_defaults(isolate_files=False)
     parser.set_defaults(resume_intermediates=True)
@@ -1201,27 +1109,6 @@ def resolve_ffprobe_path() -> Optional[str]:
                 # Conda's ffprobe can resolve against incompatible GTK DLLs on Windows.
                 # The launcher supplies the supported external FFmpeg build; without it,
                 # returning no probe is safer than opening a native DLL error dialog.
-                return None
-        except (OSError, ValueError):
-            pass
-    return fallback
-
-
-def resolve_ffmpeg_path() -> Optional[str]:
-    ffmpeg_bin_dir = os.getenv("PODCAST_TRANSCRIBE_FFMPEG_BIN_DIR") or os.getenv("FFMPEG_BIN_DIR")
-    if ffmpeg_bin_dir:
-        candidate = Path(ffmpeg_bin_dir) / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-        if candidate.exists():
-            return str(candidate)
-
-    fallback = shutil.which("ffmpeg")
-    conda_prefix = os.getenv("CONDA_PREFIX")
-    if fallback and conda_prefix:
-        try:
-            if Path(fallback).resolve().is_relative_to(Path(conda_prefix).resolve()):
-                # Conda's FFmpeg can resolve against incompatible GTK DLLs on Windows.
-                # The launcher supplies the supported external build; without it,
-                # returning no encoder is safer than opening a native DLL error dialog.
                 return None
         except (OSError, ValueError):
             pass
@@ -1355,149 +1242,6 @@ def format_memory_mb(memory_mb: Optional[float]) -> str:
 
 
 RESOURCE_USAGE_TRACKER: Dict[str, float] = {}
-
-SPEAKER_TELEMETRY_VERSION = 1
-SPEAKER_TELEMETRY_PROGRESS_INTERVAL = 10
-
-
-def new_speaker_telemetry(progress_path: Optional[Path] = None) -> Dict[str, object]:
-    """Create counters for the audio and embedding portions of speaker work."""
-
-    return {
-        "telemetry_version": SPEAKER_TELEMETRY_VERSION,
-        "audio_cache_mode": "not_needed",
-        "audio_cache_reused": False,
-        "audio_cache_conversion_wall_seconds": 0.0,
-        "audio_cache_path": "",
-        "audio_span_read_count": 0,
-        "audio_span_error_count": 0,
-        "audio_span_requested_seconds": 0.0,
-        "audio_span_loaded_seconds": 0.0,
-        "audio_span_wall_seconds": 0.0,
-        "audio_span_wall_seconds_by_operation": {},
-        "embedding_call_count": 0,
-        "embedding_failed_call_count": 0,
-        "embedding_input_seconds": 0.0,
-        "embedding_wall_seconds": 0.0,
-        "embedding_dispatch_seconds": 0.0,
-        "embedding_sync_copy_seconds": 0.0,
-        "embedding_calls_by_kind": {},
-        "embedding_wall_seconds_by_kind": {},
-        "embedding_input_seconds_by_kind": {},
-        "chunk_reconciliation_boundary_count": 0,
-        "_progress_path": str(progress_path) if progress_path else "",
-        "_last_progress_operation_count": 0,
-    }
-
-
-def _telemetry_map_add(telemetry: Optional[Dict[str, object]], key: str, name: str, value: float):
-    if telemetry is None:
-        return
-    values = telemetry.setdefault(key, {})
-    if not isinstance(values, dict):
-        values = {}
-        telemetry[key] = values
-    values[name] = float(values.get(name, 0.0)) + float(value)
-
-
-def _telemetry_map_increment(telemetry: Optional[Dict[str, object]], key: str, name: str):
-    if telemetry is None:
-        return
-    values = telemetry.setdefault(key, {})
-    if not isinstance(values, dict):
-        values = {}
-        telemetry[key] = values
-    values[name] = int(values.get(name, 0)) + 1
-
-
-def finalize_speaker_telemetry(telemetry: Dict[str, object]) -> Dict[str, object]:
-    """Return JSON-safe telemetry without internal live-progress fields."""
-
-    result = {}
-    for key, value in telemetry.items():
-        if str(key).startswith("_"):
-            continue
-        if isinstance(value, float):
-            result[key] = round(value, 4)
-        elif isinstance(value, dict):
-            result[key] = {
-                str(item_key): round(item_value, 4) if isinstance(item_value, float) else item_value
-                for item_key, item_value in value.items()
-            }
-        else:
-            result[key] = value
-    return result
-
-
-def _maybe_emit_speaker_telemetry(telemetry: Optional[Dict[str, object]]):
-    """Print and checkpoint progress periodically during long speaker runs."""
-
-    if telemetry is None:
-        return
-    audio_reads = int(telemetry.get("audio_span_read_count") or 0)
-    embedding_calls = int(telemetry.get("embedding_call_count") or 0)
-    operation_count = audio_reads + embedding_calls
-    last_count = int(telemetry.get("_last_progress_operation_count") or 0)
-    if operation_count <= 0 or operation_count - last_count < SPEAKER_TELEMETRY_PROGRESS_INTERVAL:
-        return
-    telemetry["_last_progress_operation_count"] = operation_count
-    print(
-        "    speaker telemetry: "
-        f"audio_reads={audio_reads}, embeddings={embedding_calls}, "
-        f"audio_wall={float(telemetry.get('audio_span_wall_seconds') or 0.0):.1f}s, "
-        f"embedding_wall={float(telemetry.get('embedding_wall_seconds') or 0.0):.1f}s"
-    )
-    progress_path = str(telemetry.get("_progress_path") or "").strip()
-    if progress_path:
-        try:
-            state_atomic_write_text(
-                Path(progress_path),
-                json.dumps({**finalize_speaker_telemetry(telemetry), "updated_at_epoch": time.time()}, indent=2),
-            )
-        except OSError:
-            # Telemetry must never interrupt the processing path.
-            pass
-
-
-def _record_audio_span_telemetry(
-    telemetry: Optional[Dict[str, object]],
-    operation: str,
-    requested_seconds: float,
-    loaded_seconds: float,
-    elapsed_seconds: float,
-):
-    if telemetry is None:
-        return
-    telemetry["audio_span_read_count"] = int(telemetry.get("audio_span_read_count") or 0) + 1
-    telemetry["audio_span_requested_seconds"] = float(telemetry.get("audio_span_requested_seconds") or 0.0) + requested_seconds
-    telemetry["audio_span_loaded_seconds"] = float(telemetry.get("audio_span_loaded_seconds") or 0.0) + loaded_seconds
-    telemetry["audio_span_wall_seconds"] = float(telemetry.get("audio_span_wall_seconds") or 0.0) + elapsed_seconds
-    _telemetry_map_add(telemetry, "audio_span_wall_seconds_by_operation", operation, elapsed_seconds)
-    _maybe_emit_speaker_telemetry(telemetry)
-
-
-def _record_embedding_telemetry(
-    telemetry: Optional[Dict[str, object]],
-    kind: str,
-    input_seconds: float,
-    wall_seconds: float,
-    dispatch_seconds: float,
-    sync_copy_seconds: float,
-    failed: bool = False,
-):
-    if telemetry is None:
-        return
-    telemetry["embedding_call_count"] = int(telemetry.get("embedding_call_count") or 0) + 1
-    if failed:
-        telemetry["embedding_failed_call_count"] = int(telemetry.get("embedding_failed_call_count") or 0) + 1
-    telemetry["embedding_input_seconds"] = float(telemetry.get("embedding_input_seconds") or 0.0) + input_seconds
-    telemetry["embedding_wall_seconds"] = float(telemetry.get("embedding_wall_seconds") or 0.0) + wall_seconds
-    telemetry["embedding_dispatch_seconds"] = float(telemetry.get("embedding_dispatch_seconds") or 0.0) + dispatch_seconds
-    telemetry["embedding_sync_copy_seconds"] = float(telemetry.get("embedding_sync_copy_seconds") or 0.0) + sync_copy_seconds
-    _telemetry_map_increment(telemetry, "embedding_calls_by_kind", kind)
-    _telemetry_map_add(telemetry, "embedding_wall_seconds_by_kind", kind, wall_seconds)
-    _telemetry_map_add(telemetry, "embedding_input_seconds_by_kind", kind, input_seconds)
-    _maybe_emit_speaker_telemetry(telemetry)
 
 
 def log_memory_usage(stage_label: str):
@@ -1637,20 +1381,7 @@ def load_audio_span_mono_16k(
     if num_frames == 0:
         return torch.empty(0, dtype=torch.float32)
 
-    # Speaker matching normally reads the temporary 16 kHz PCM cache.  Read
-    # that format directly so a native compressed-audio decoder cannot retain
-    # or allocate a large file-sized buffer for every timestamped span.
-    if Path(path).suffix.lower() in {".wav", ".wave"} and sample_rate == 16000 and resampler is None:
-        pcm_span = _load_pcm_wav_span_mono_16k(path, start_frame, num_frames)
-        if pcm_span is not None:
-            return pcm_span
-
     waveform, _ = torchaudio.load(path, frame_offset=start_frame, num_frames=num_frames)
-    # Some backends are forgiving about frame requests and may return more
-    # samples than requested.  Never retain those extra samples in a speaker
-    # span; the requested duration is the memory bound for this operation.
-    if waveform.shape[-1] > num_frames:
-        waveform = waveform[..., :num_frames]
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
     if resampler is not None:
@@ -1658,198 +1389,6 @@ def load_audio_span_mono_16k(
     elif sample_rate != 16000:
         waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
     return waveform.squeeze(0).contiguous()
-
-
-def _load_pcm_wav_span_mono_16k(
-    path: str,
-    start_frame: int,
-    num_frames: int,
-) -> Optional[torch.Tensor]:
-    """Read a bounded span from the PCM WAV speaker cache.
-
-    The cache is deliberately mono, 16 kHz, signed 16-bit PCM.  The standard
-    library reader seeks to the requested frame and reads only that span, which
-    avoids the whole-file allocations seen with some native audio backends.
-    Returning ``None`` lets callers fall back to torchaudio for an unexpected
-    WAV variant.
-    """
-
-    try:
-        with wave.open(str(path), "rb") as reader:
-            if (
-                reader.getframerate() != 16000
-                or reader.getsampwidth() != 2
-                or reader.getnchannels() <= 0
-            ):
-                return None
-            total_frames = reader.getnframes()
-            bounded_start = min(max(0, int(start_frame)), total_frames)
-            bounded_count = min(max(0, int(num_frames)), max(0, total_frames - bounded_start))
-            if bounded_count == 0:
-                return torch.empty(0, dtype=torch.float32)
-            reader.setpos(bounded_start)
-            raw = reader.readframes(bounded_count)
-            channels = reader.getnchannels()
-    except (OSError, EOFError, wave.Error):
-        return None
-
-    if not raw:
-        return torch.empty(0, dtype=torch.float32)
-
-    pcm = np.frombuffer(raw, dtype="<i2")
-    complete_samples = pcm.size - (pcm.size % channels)
-    if complete_samples <= 0:
-        return torch.empty(0, dtype=torch.float32)
-    pcm = pcm[:complete_samples].reshape(-1, channels)
-    if channels == 1:
-        samples = pcm[:, 0].astype(np.float32) / 32768.0
-    else:
-        samples = pcm.astype(np.float32).mean(axis=1) / 32768.0
-    return torch.from_numpy(samples).contiguous()
-
-
-def speaker_audio_cache_paths(output_dir: Path, audio_path: Path) -> Tuple[Path, Path]:
-    cache_dir = output_dir / ARTIFACT_DIRNAME / audio_path.stem
-    return cache_dir / "speaker_audio_16k_mono.wav", cache_dir / "speaker_audio_16k_mono.json"
-
-
-def _speaker_audio_cache_metadata_matches(
-    metadata_path: Path,
-    cache_path: Path,
-    source_fingerprint: Dict[str, object],
-) -> bool:
-    try:
-        if not cache_path.exists() or cache_path.stat().st_size <= 44 or not metadata_path.exists():
-            return False
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return False
-    return (
-        isinstance(metadata, dict)
-        and metadata.get("cache_version") == SPEAKER_AUDIO_CACHE_VERSION
-        and metadata.get("source_fingerprint") == source_fingerprint
-        and int(metadata.get("sample_rate") or 0) == SPEAKER_AUDIO_CACHE_SAMPLE_RATE
-        and int(metadata.get("channels") or 0) == 1
-        and str(metadata.get("codec") or "") == "pcm_s16le"
-    )
-
-
-def prepare_speaker_audio_cache(
-    audio_path: Path,
-    output_dir: Path,
-    telemetry: Optional[Dict[str, object]] = None,
-    component_timings: Optional[Dict[str, float]] = None,
-) -> Path:
-    """Use a seek-friendly PCM source for repeated speaker-span reads.
-
-    The original source remains the input to transcription and diarization.  This
-    cache is only used after those stages, when speaker matching requests many
-    timestamped spans from a compressed source.
-    """
-
-    suffix = audio_path.suffix.lower()
-    if suffix not in SPEAKER_AUDIO_CACHE_SOURCE_SUFFIXES:
-        if telemetry is not None:
-            telemetry["audio_cache_mode"] = "not_needed"
-            telemetry["audio_cache_path"] = str(audio_path)
-        return audio_path
-
-    source_fingerprint = audio_file_fingerprint(audio_path)
-    cache_path, metadata_path = speaker_audio_cache_paths(output_dir, audio_path)
-    if _speaker_audio_cache_metadata_matches(metadata_path, cache_path, source_fingerprint):
-        if telemetry is not None:
-            telemetry["audio_cache_mode"] = "reused"
-            telemetry["audio_cache_reused"] = True
-            telemetry["audio_cache_path"] = str(cache_path)
-        print(f"  speaker audio cache: reusing {cache_path.name}")
-        return cache_path
-
-    ffmpeg_path = resolve_ffmpeg_path()
-    if not ffmpeg_path:
-        if telemetry is not None:
-            telemetry["audio_cache_mode"] = "unavailable"
-            telemetry["audio_cache_path"] = str(audio_path)
-        print("  speaker audio cache unavailable: FFmpeg was not found; using the original source")
-        return audio_path
-
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
-    conversion_started = time.perf_counter()
-    print("  speaker audio cache: converting source to mono 16 kHz PCM WAV")
-    succeeded = False
-    try:
-        subprocess.run(
-            [
-                ffmpeg_path,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-i",
-                str(audio_path),
-                "-map",
-                "0:a:0",
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                str(SPEAKER_AUDIO_CACHE_SAMPLE_RATE),
-                "-c:a",
-                "pcm_s16le",
-                "-f",
-                "wav",
-                str(temporary_path),
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        if not temporary_path.exists() or temporary_path.stat().st_size <= 44:
-            raise RuntimeError("FFmpeg completed without producing a valid WAV file")
-        os.replace(temporary_path, cache_path)
-        state_atomic_write_text(
-            metadata_path,
-            json.dumps(
-                {
-                    "cache_version": SPEAKER_AUDIO_CACHE_VERSION,
-                    "source_file": audio_path.name,
-                    "source_fingerprint": source_fingerprint,
-                    "sample_rate": SPEAKER_AUDIO_CACHE_SAMPLE_RATE,
-                    "channels": 1,
-                    "codec": "pcm_s16le",
-                },
-                indent=2,
-            ),
-        )
-        succeeded = True
-    except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
-        detail = str(getattr(exc, "stderr", "") or exc).strip().replace("\r", " ").replace("\n", " ")
-        print(f"  speaker audio cache unavailable: {detail or 'conversion failed'}; using the original source")
-        try:
-            if cache_path.exists() and not metadata_path.exists():
-                cache_path.unlink()
-        except OSError:
-            pass
-    finally:
-        try:
-            if temporary_path.exists():
-                temporary_path.unlink()
-        except OSError:
-            pass
-
-    conversion_elapsed = time.perf_counter() - conversion_started
-    if component_timings is not None:
-        component_timings["audio cache conversion"] = (
-            component_timings.get("audio cache conversion", 0.0) + conversion_elapsed
-        )
-    if telemetry is not None:
-        telemetry["audio_cache_mode"] = "created" if succeeded else "fallback"
-        telemetry["audio_cache_conversion_wall_seconds"] = conversion_elapsed
-        telemetry["audio_cache_path"] = str(cache_path if succeeded else audio_path)
-    if succeeded:
-        print(f"  speaker audio cache: ready in {conversion_elapsed:.1f}s")
-        return cache_path
-    return audio_path
 
 
 def load_host_profile(
@@ -2336,7 +1875,6 @@ def run_diarization_stage(
     num_speakers: Optional[int],
     max_embedding_seconds: float,
     resume_intermediates: bool,
-    speaker_telemetry: Optional[Dict[str, object]] = None,
 ) -> Tuple[List[Dict[str, object]], bool, Dict[str, object]]:
     diarization_identity = pyannote_provider_identity(diarization_model_id, diarization_model_revision)
     stage_fingerprint = build_stage_fingerprint(
@@ -2378,7 +1916,6 @@ def run_diarization_stage(
         audio_path=str(audio_path),
         num_speakers=num_speakers,
         max_embedding_seconds=max_embedding_seconds,
-        telemetry=speaker_telemetry,
     )
     metadata = {**metadata, "provider": diarization_identity.to_payload(), "stage_fingerprint": stage_fingerprint}
     save_diarization_artifact(output_dir, audio_path, diarized_turns, stage_fingerprint)
@@ -2613,15 +2150,8 @@ def build_chunk_speaker_embeddings(
     audio_path: str,
     diarized_turns: List[Dict[str, object]],
     max_seconds: float,
-    telemetry: Optional[Dict[str, object]] = None,
 ) -> Dict[str, np.ndarray]:
-    speaker_audio = build_speaker_audio_samples(
-        audio_path,
-        diarized_turns,
-        max_seconds,
-        telemetry=telemetry,
-        telemetry_operation="chunk_reconciliation",
-    )
+    speaker_audio = build_speaker_audio_samples(audio_path, diarized_turns, max_seconds)
     embeddings = {}
     for speaker, clip in speaker_audio.items():
         if clip.numel() == 0:
@@ -2630,12 +2160,7 @@ def build_chunk_speaker_embeddings(
         if clip_seconds < DIARIZATION_MIN_EMBEDDING_SECONDS:
             continue
         try:
-            embeddings[speaker] = compute_embedding(
-                verifier,
-                clip,
-                telemetry=telemetry,
-                telemetry_kind="chunk_reconciliation",
-            )
+            embeddings[speaker] = compute_embedding(verifier, clip)
         except RuntimeError as exc:
             if "Padding size should be less than the corresponding input dimension" in str(exc):
                 continue
@@ -2650,7 +2175,6 @@ def reconcile_chunk_speakers(
     audio_path: str,
     chunk_payloads: List[Dict[str, object]],
     max_embedding_seconds: float,
-    telemetry: Optional[Dict[str, object]] = None,
 ) -> Tuple[Dict[str, str], Dict[str, int]]:
     parent: Dict[str, str] = {}
     ambiguous_count = 0
@@ -2703,24 +2227,8 @@ def reconcile_chunk_speakers(
         right_overlap = turns_in_window(right["turns"], overlap_start, overlap_end)
         if not left_overlap or not right_overlap:
             continue
-        if telemetry is not None:
-            telemetry["chunk_reconciliation_boundary_count"] = int(
-                telemetry.get("chunk_reconciliation_boundary_count") or 0
-            ) + 1
-        left_embeddings = build_chunk_speaker_embeddings(
-            verifier,
-            audio_path,
-            left_overlap,
-            min(max_embedding_seconds, 45.0),
-            telemetry=telemetry,
-        )
-        right_embeddings = build_chunk_speaker_embeddings(
-            verifier,
-            audio_path,
-            right_overlap,
-            min(max_embedding_seconds, 45.0),
-            telemetry=telemetry,
-        )
+        left_embeddings = build_chunk_speaker_embeddings(verifier, audio_path, left_overlap, min(max_embedding_seconds, 45.0))
+        right_embeddings = build_chunk_speaker_embeddings(verifier, audio_path, right_overlap, min(max_embedding_seconds, 45.0))
         if not left_embeddings or not right_embeddings:
             continue
         score_pairs: List[Tuple[float, str, str]] = []
@@ -2802,7 +2310,6 @@ def diarize_audio_chunked(
     num_speakers: Optional[int],
     duration_seconds: float,
     max_embedding_seconds: float,
-    telemetry: Optional[Dict[str, object]] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
     kwargs = diarization_kwargs(num_speakers)
     chunks = plan_diarization_chunks(duration_seconds)
@@ -2835,7 +2342,6 @@ def diarize_audio_chunked(
         audio_path,
         chunk_payloads,
         max_embedding_seconds,
-        telemetry=telemetry,
     )
     final_turns = stitch_chunk_turns(chunk_payloads, local_to_global)
     metadata = {
@@ -2860,7 +2366,6 @@ def diarize_audio(
     audio_path: str,
     num_speakers: Optional[int],
     max_embedding_seconds: float,
-    telemetry: Optional[Dict[str, object]] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
     """Run pyannote diarization and return plain speaker-turn dictionaries plus route metadata."""
     duration_seconds = get_audio_duration_seconds(audio_path)
@@ -2882,7 +2387,6 @@ def diarize_audio(
             num_speakers,
             duration_seconds,
             max_embedding_seconds,
-            telemetry=telemetry,
         )
         metadata.update(route)
         metadata["mode"] = "chunked_preemptive"
@@ -2929,7 +2433,6 @@ def diarize_audio(
                 num_speakers,
                 duration_seconds,
                 max_embedding_seconds,
-                telemetry=telemetry,
             )
             metadata.update(route)
             metadata["mode"] = "chunked_fallback_after_failure"
@@ -3091,88 +2594,13 @@ def speaker_durations(diarized_turns: List[Dict[str, object]]) -> Dict[str, floa
     return dict(totals)
 
 
-def _build_speaker_audio_samples_for_turns(
-    audio_path: str,
-    speaker_turns: List[Dict[str, object]],
-    max_seconds: float,
-    telemetry: Optional[Dict[str, object]] = None,
-    telemetry_operation: str = "episode_speaker_samples",
-    sample_rate: Optional[int] = None,
-    resampler: Optional[Any] = None,
-) -> torch.Tensor:
-    clips = []
-    duration_seconds = 0.0
-    if sample_rate is None:
-        sample_rate, _, _ = get_audio_metadata(audio_path)
-    if sample_rate is None or sample_rate <= 0:
-        sample_rate = 16000
-    if resampler is None and sample_rate != 16000:
-        resampler = torchaudio.transforms.Resample(sample_rate, 16000)
-
-    for turn in speaker_turns:
-        if duration_seconds >= max_seconds:
-            break
-
-        remaining = max_seconds - duration_seconds
-        clipped_end = min(float(turn["end"]), float(turn["start"]) + remaining)
-        if clipped_end <= float(turn["start"]):
-            continue
-
-        requested_seconds = max(0.0, clipped_end - float(turn["start"]))
-        span_started = time.perf_counter()
-        try:
-            segment = load_audio_span_mono_16k(
-                audio_path,
-                start_seconds=float(turn["start"]),
-                end_seconds=clipped_end,
-                sample_rate=sample_rate,
-                resampler=resampler,
-            )
-        except Exception:
-            if telemetry is not None:
-                telemetry["audio_span_error_count"] = int(telemetry.get("audio_span_error_count") or 0) + 1
-            raise
-        _record_audio_span_telemetry(
-            telemetry,
-            telemetry_operation,
-            requested_seconds,
-            float(segment.numel()) / 16000.0,
-            time.perf_counter() - span_started,
-        )
-        if segment.numel() == 0:
-            continue
-
-        clips.append(segment)
-        duration_seconds += segment.shape[0] / 16000.0
-
-    if not clips:
-        return torch.empty(0, dtype=torch.float32)
-    if len(clips) == 1:
-        return clips[0]
-    merged = torch.cat(clips)
-    clips.clear()
-    return merged
-
-
 def build_speaker_audio_samples(
     audio_path: str,
     diarized_turns: List[Dict[str, object]],
     max_seconds: float,
-    telemetry: Optional[Dict[str, object]] = None,
-    telemetry_operation: str = "episode_speaker_samples",
 ) -> Dict[str, torch.Tensor]:
-    """Collect bounded audio samples, one speaker at a time.
-
-    The returned mapping is retained by callers that need all clips (for
-    example chunk reconciliation), but each speaker's collection is bounded by
-    ``max_seconds`` and is no longer assembled from an unbounded cross-speaker
-    list of native decoder results.
-    """
-
-    turns_by_speaker = defaultdict(list)
-    for turn in diarized_turns:
-        turns_by_speaker[turn["speaker"]].append(turn)
-
+    clips = defaultdict(list)
+    durations = defaultdict(float)
     sample_rate, _, _ = get_audio_metadata(audio_path)
     if sample_rate is None or sample_rate <= 0:
         sample_rate = 16000
@@ -3181,61 +2609,40 @@ def build_speaker_audio_samples(
         if sample_rate != 16000
         else None
     )
+    for turn in diarized_turns:
+        speaker = turn["speaker"]
+        if durations[speaker] >= max_seconds:
+            continue
 
-    return {
-        speaker: _build_speaker_audio_samples_for_turns(
+        remaining = max_seconds - durations[speaker]
+        clipped_end = min(float(turn["end"]), float(turn["start"]) + remaining)
+        if clipped_end <= float(turn["start"]):
+            continue
+
+        segment = load_audio_span_mono_16k(
             audio_path,
-            speaker_turns,
-            max_seconds,
-            telemetry=telemetry,
-            telemetry_operation=telemetry_operation,
+            start_seconds=float(turn["start"]),
+            end_seconds=clipped_end,
             sample_rate=sample_rate,
             resampler=resampler,
         )
-        for speaker, speaker_turns in turns_by_speaker.items()
-    }
+        if segment.numel() == 0:
+            continue
+
+        clips[speaker].append(segment)
+        durations[speaker] += segment.shape[0] / 16000.0
+
+    merged = {}
+    for speaker, chunks in clips.items():
+        merged[speaker] = torch.cat(chunks)
+    return merged
 
 
-def compute_embedding(
-    verifier: Any,
-    waveform_16k: torch.Tensor,
-    telemetry: Optional[Dict[str, object]] = None,
-    telemetry_kind: str = "unspecified",
-) -> np.ndarray:
-    started = time.perf_counter()
-    dispatch_seconds = 0.0
-    sync_copy_seconds = 0.0
-    input_seconds = float(waveform_16k.numel()) / 16000.0
+def compute_embedding(verifier: Any, waveform_16k: torch.Tensor) -> np.ndarray:
     signal = waveform_16k.unsqueeze(0)
-    try:
-        dispatch_started = time.perf_counter()
-        with torch.no_grad():
-            embedding = verifier.encode_batch(signal)
-        dispatch_seconds = time.perf_counter() - dispatch_started
-        sync_started = time.perf_counter()
-        # Tensor.cpu() is intentionally timed separately: on CUDA this is the
-        # synchronization point that waits for the model and copies its result.
-        vector = embedding.squeeze().detach().cpu().numpy().astype(np.float32)
-        sync_copy_seconds = time.perf_counter() - sync_started
-    except Exception:
-        _record_embedding_telemetry(
-            telemetry,
-            telemetry_kind,
-            input_seconds,
-            time.perf_counter() - started,
-            dispatch_seconds,
-            sync_copy_seconds,
-            failed=True,
-        )
-        raise
-    _record_embedding_telemetry(
-        telemetry,
-        telemetry_kind,
-        input_seconds,
-        time.perf_counter() - started,
-        dispatch_seconds,
-        sync_copy_seconds,
-    )
+    with torch.no_grad():
+        embedding = verifier.encode_batch(signal)
+    vector = embedding.squeeze().detach().cpu().numpy().astype(np.float32)
     norm = np.linalg.norm(vector)
     if norm == 0:
         return vector
@@ -3245,7 +2652,6 @@ def compute_embedding(
 def load_known_speaker_profiles(
     verifier: Any,
     known_speakers_dir: Optional[str],
-    telemetry: Optional[Dict[str, object]] = None,
 ) -> Dict[str, Dict[str, object]]:
     config_entries = load_known_speakers_config(known_speakers_dir)
     if not config_entries:
@@ -3275,14 +2681,7 @@ def load_known_speaker_profiles(
             sample_quality.append({"file": str(sample_path), **quality})
             if quality["rating"] == "poor":
                 print(f"  reference sample warning for {name}: {sample_path.name} -> {', '.join(quality['warnings'])}")
-            embeddings.append(
-                compute_embedding(
-                    verifier,
-                    waveform,
-                    telemetry=telemetry,
-                    telemetry_kind="known_profile",
-                )
-            )
+            embeddings.append(compute_embedding(verifier, waveform))
             resolved_files.append(str(sample_path))
 
         averaged = average_embeddings(embeddings)
@@ -3317,64 +2716,24 @@ def choose_host_speaker(
     assume_dominant: bool,
     max_embedding_seconds: float,
     min_host_seconds: float,
-    telemetry: Optional[Dict[str, object]] = None,
 ) -> Tuple[Optional[str], Dict[str, np.ndarray], Optional[np.ndarray], Dict[str, float], Dict[str, float]]:
     durations = speaker_durations(diarized_turns)
     if not durations:
         return None, {}, existing_profile, {}, {}
 
-    turns_by_speaker = defaultdict(list)
-    for turn in diarized_turns:
-        turns_by_speaker[turn["speaker"]].append(turn)
-
-    sample_rate, _, _ = get_audio_metadata(audio_path)
-    if sample_rate is None or sample_rate <= 0:
-        sample_rate = 16000
-    resampler = (
-        torchaudio.transforms.Resample(sample_rate, 16000)
-        if sample_rate != 16000
-        else None
-    )
-
+    speaker_audio = build_speaker_audio_samples(audio_path, diarized_turns, max_embedding_seconds)
     speaker_embeddings = {}
-    for speaker, speaker_turns in turns_by_speaker.items():
-        # Do not retain audio for every speaker while waiting to compute the
-        # embeddings.  A long episode can have enough diarized turns for that
-        # old pattern to exhaust system RAM before the first embedding runs.
-        clip = None
-        try:
-            clip = _build_speaker_audio_samples_for_turns(
-                audio_path,
-                speaker_turns,
-                max_embedding_seconds,
-                telemetry=telemetry,
-                telemetry_operation="episode_speaker_samples",
-                sample_rate=sample_rate,
-                resampler=resampler,
-            )
-            if durations.get(speaker, 0.0) >= min_host_seconds and clip.numel() > 0:
-                speaker_embeddings[speaker] = compute_embedding(
-                    verifier,
-                    clip,
-                    telemetry=telemetry,
-                    telemetry_kind="episode_speaker",
-                )
-        finally:
-            if clip is not None:
-                del clip
-            # Release Python/native decoder temporaries before reading the next
-            # speaker's spans.  The PCM WAV reader already bounds each read.
-            gc.collect()
+    for speaker, clip in speaker_audio.items():
+        if durations.get(speaker, 0.0) >= min_host_seconds:
+            speaker_embeddings[speaker] = compute_embedding(verifier, clip)
+        del clip
+    speaker_audio.clear()
+    gc.collect()
 
     reference_embedding = existing_profile
     if host_reference_path:
         ref_waveform = load_audio_mono_16k(host_reference_path)
-        reference_embedding = compute_embedding(
-            verifier,
-            ref_waveform,
-            telemetry=telemetry,
-            telemetry_kind="host_reference",
-        )
+        reference_embedding = compute_embedding(verifier, ref_waveform)
         del ref_waveform
         gc.collect()
 
@@ -3764,9 +3123,6 @@ def build_episode_summary_row(
         "review_model_name": "",
         "reviewed_segment_count": 0,
         "review_corrected_segment_count": 0,
-        "review_candidate_count": 0,
-        "review_context_segment_count": 0,
-        "review_skipped_segment_count": 0,
         "reviewed_output_written": False,
         "review_pipeline_version": "",
         "review_enabled_stages": "",
@@ -3810,13 +3166,6 @@ def build_episode_summary_row(
         "diarization_chunk_overlap_seconds": 0,
         "diarization_reconciliation_merge_count": 0,
         "diarization_reconciliation_ambiguous_count": 0,
-        "speaker_audio_span_read_count": 0,
-        "speaker_audio_span_wall_seconds": 0.0,
-        "speaker_embedding_call_count": 0,
-        "speaker_embedding_wall_seconds": 0.0,
-        "speaker_embedding_input_seconds": 0.0,
-        "speaker_embedding_calls_by_kind": "{}",
-        "speaker_reconciliation_boundary_count": 0,
         "speaker_attribution_artifact_reused": False,
         "deterministic_cleanup_artifact_reused": False,
     }
@@ -3873,9 +3222,6 @@ def write_episode_summary_csv(path: Path, rows: List[Dict[str, object]]):
         "review_model_name",
         "reviewed_segment_count",
         "review_corrected_segment_count",
-        "review_candidate_count",
-        "review_context_segment_count",
-        "review_skipped_segment_count",
         "reviewed_output_written",
         "review_pipeline_version",
         "review_enabled_stages",
@@ -3921,13 +3267,6 @@ def write_episode_summary_csv(path: Path, rows: List[Dict[str, object]]):
         "diarization_chunk_overlap_seconds",
         "diarization_reconciliation_merge_count",
         "diarization_reconciliation_ambiguous_count",
-        "speaker_audio_span_read_count",
-        "speaker_audio_span_wall_seconds",
-        "speaker_embedding_call_count",
-        "speaker_embedding_wall_seconds",
-        "speaker_embedding_input_seconds",
-        "speaker_embedding_calls_by_kind",
-        "speaker_reconciliation_boundary_count",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -3996,9 +3335,6 @@ def normalize_episode_summary_row(row: Dict[str, object]) -> Dict[str, object]:
         "manual_correction_count",
         "reviewed_segment_count",
         "review_corrected_segment_count",
-        "review_candidate_count",
-        "review_context_segment_count",
-        "review_skipped_segment_count",
         "review_local_text_budget",
         "review_local_speaker_budget",
         "review_long_context_budget",
@@ -4070,9 +3406,6 @@ def apply_review_metadata_to_summary(summary_row: Dict[str, object], review_resu
     summary_row["review_model_name"] = str(review_metadata.get("review_model_name") or "")
     summary_row["reviewed_segment_count"] = int(review_metadata.get("reviewed_segment_count") or 0)
     summary_row["review_corrected_segment_count"] = int(review_metadata.get("corrected_segment_count") or 0)
-    summary_row["review_candidate_count"] = int(review_metadata.get("review_candidate_count") or 0)
-    summary_row["review_context_segment_count"] = int(review_metadata.get("review_context_segment_count") or 0)
-    summary_row["review_skipped_segment_count"] = int(review_metadata.get("review_skipped_segment_count") or 0)
     summary_row["reviewed_output_written"] = bool(review_result["segments"])
     summary_row["review_pipeline_version"] = str(review_metadata.get("review_pipeline_version") or "")
     summary_row["review_enabled_stages"] = ";".join(str(item) for item in review_metadata.get("review_enabled_stages") or [])
@@ -4150,33 +3483,13 @@ def write_processing_checkpoint(
     checkpoint_file = checkpoint_path(output_dir, audio_path)
     checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "checkpoint_version": 2,
         "audio_file": audio_path.name,
-        "source_fingerprint": audio_file_fingerprint(audio_path),
         "stage": stage,
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     if details:
         payload["details"] = details
-    state_atomic_write_text(checkpoint_file, json.dumps(payload, indent=2))
-
-
-def load_processing_checkpoint(output_dir: Path, audio_path: Path) -> Optional[Dict[str, object]]:
-    checkpoint_file = checkpoint_path(output_dir, audio_path)
-    if not checkpoint_file.exists():
-        return None
-    try:
-        payload = json.loads(checkpoint_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict) or payload.get("audio_file") != audio_path.name:
-        return None
-    try:
-        if payload.get("source_fingerprint") != audio_file_fingerprint(audio_path):
-            return None
-    except OSError:
-        return None
-    return payload
+    checkpoint_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def clear_processing_checkpoint(output_dir: Path, audio_path: Path):
@@ -4239,21 +3552,7 @@ def reviewed_json_output_path(audio_path: Path, output_dir: Path) -> Path:
 
 def baseline_output_bundle_complete(audio_path: Path, output_dir: Path) -> bool:
     expected_paths = expected_output_paths(audio_path, output_dir) + expected_cleaned_output_paths(audio_path, output_dir)
-    if not all(path.exists() and path.is_file() for path in expected_paths):
-        return False
-    # File presence alone is not enough to skip an episode: a killed write can
-    # leave an empty or truncated companion beside otherwise valid outputs.
-    for path in (
-        output_dir / f"{audio_path.stem}_speaker_transcript.json",
-        output_dir / f"{audio_path.stem}_cleaned_speaker_transcript.json",
-    ):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, json.JSONDecodeError):
-            return False
-        if not isinstance(payload, dict) or not isinstance(payload.get("segments"), list) or not payload["segments"]:
-            return False
-    return True
+    return all(path.exists() for path in expected_paths)
 
 
 def load_cleaned_transcript_payload(path: Path) -> Dict[str, object]:
@@ -4331,7 +3630,7 @@ def reviewed_payload_is_usable(payload: Dict[str, object]) -> None:
                 f"Reviewed payload segment {index} is missing required legacy review fields: {', '.join(missing)}"
             )
 
-
+ 
 def extract_completed_review_stage_names(payload: Dict[str, object]) -> List[str]:
     review_metadata = payload.get("review_metadata")
     if not isinstance(review_metadata, dict):
@@ -4621,10 +3920,7 @@ def classify_episode_processing_state(
     if provider_shortfalls:
         state = "needs_tier1"
     elif not resolved_review["any_review_enabled"]:
-        # A valid output bundle is authoritative even if the bookkeeping files
-        # were lost. The source/provider checks above still prevent reuse after
-        # an input or required provider changed.
-        state = "complete" if baseline_bundle_complete else "needs_tier1"
+        state = "complete" if baseline_resume_complete and baseline_bundle_complete else "needs_tier1"
     elif baseline_complete and cleaned_json_usable:
         if reviewed_bundle["status"] == "current_review_complete":
             state = "complete"
@@ -4761,12 +4057,6 @@ def process_v2_delta_upgrade(
     print(f"  write episode-contract-v2 metadata complete in {metadata_elapsed:.1f}s")
     print_timing_component_summary("write episode-contract-v2 metadata", metadata_components)
     print(f"  upgraded files: {len(result['upgraded_files'])}")
-    transient_cleanup = state_clear_transient_artifacts(output_dir, audio_path)
-    if transient_cleanup.get("failed"):
-        print(
-            "  cleanup warning: could not remove transient artifacts: "
-            + ", ".join(Path(path).name for path in transient_cleanup["failed"])
-        )
     return summary
 
 
@@ -4906,22 +4196,10 @@ def process_review_backfill_from_cleaned_json(
     print(f"Processing {audio_path.name}")
     print_episode_mode("tier2-only backfill")
     output_dir.mkdir(parents=True, exist_ok=True)
-    prior_checkpoint = load_processing_checkpoint(output_dir, audio_path)
-    if prior_checkpoint:
-        print(
-            f"  resuming from durable checkpoint: "
-            f"{str(prior_checkpoint.get('stage') or 'unknown').replace('_', ' ')}"
-        )
     print_episode_stage(1, 3, "load cleaned transcript")
     cleaned_path = cleaned_json_output_path(audio_path, output_dir)
     with timed_component(stage1_components, "load cleaned transcript"):
         cleaned_payload = load_cleaned_transcript_payload(cleaned_path)
-    write_processing_checkpoint(
-        output_dir,
-        audio_path,
-        "cleaned_transcript_loaded",
-        {"segment_count": len(cleaned_payload.get("segments") or [])},
-    )
     with timed_component(stage1_components, "archive legacy artifacts"):
         archive_legacy_episode_bundle(audio_path, output_dir)
     with timed_component(stage1_components, "rebuild segment objects"):
@@ -4949,9 +4227,7 @@ def process_review_backfill_from_cleaned_json(
         runtime_review_config,
         review_input_source="cleaned_json_backfill",
         calibration_session=review_calibration_session,
-        progress_callback=make_checkpointed_review_progress_callback(
-            output_dir, audio_path, review_component_timings
-        ),
+        progress_callback=make_review_progress_callback(review_component_timings),
         debug_context={
             "audio_path": str(audio_path),
             "output_dir": str(output_dir),
@@ -4962,16 +4238,6 @@ def process_review_backfill_from_cleaned_json(
     print(f"  review complete in {review_elapsed:.1f}s")
     print_timing_component_summary("review", review_component_timings)
     review_metadata = review_result["metadata"]
-    write_processing_checkpoint(
-        output_dir,
-        audio_path,
-        "review_complete",
-        {
-            "review_status": review_metadata.get("review_status", ""),
-            "candidate_count": review_metadata.get("review_candidate_count", 0),
-            "corrected_segment_count": review_metadata.get("corrected_segment_count", 0),
-        },
-    )
 
     host_speaker = cleaned_payload.get("host_original_speaker_id")
     speaker_mapping = {
@@ -5059,32 +4325,6 @@ def process_review_backfill_from_cleaned_json(
     print(f"  writing reviewed outputs complete in {writing_elapsed:.1f}s")
     print_timing_component_summary("writing reviewed outputs", writing_components)
     print(f"  reviewed output written: {bool(reviewed_paths)}")
-    checkpoint_operation_started = start_finalization_operation("clearing processing checkpoint")
-    clear_processing_checkpoint(output_dir, audio_path)
-    finish_finalization_operation("clearing processing checkpoint", checkpoint_operation_started)
-    transient_cleanup_operation_started = start_finalization_operation(
-        "clearing transient processing artifacts"
-    )
-    transient_cleanup = state_clear_transient_artifacts(output_dir, audio_path)
-    finish_finalization_operation(
-        "clearing transient processing artifacts",
-        transient_cleanup_operation_started,
-    )
-    if transient_cleanup.get("failed"):
-        print(
-            "  finalization warning: could not remove transient artifacts: "
-            + ", ".join(Path(path).name for path in transient_cleanup["failed"])
-        )
-    archive_debug_artifacts = bool((runtime_config or {}).get("archive_debug_artifacts"))
-    resume_intermediates = bool((runtime_config or {}).get("resume_intermediates", True))
-    if not archive_debug_artifacts:
-        cleanup_label = "clearing debug artifacts" if resume_intermediates else "clearing stage artifacts"
-        cleanup_operation_started = start_finalization_operation(cleanup_label)
-        if resume_intermediates:
-            state_clear_debug_artifacts(output_dir, audio_path)
-        else:
-            state_clear_stage_artifacts(output_dir, audio_path)
-        finish_finalization_operation(cleanup_label, cleanup_operation_started)
     return summary_row
 
 
@@ -5180,8 +4420,6 @@ def runtime_config_payload(args) -> Dict[str, object]:
         "review_base_url",
         "review_model_name",
         "review_reasoning_effort",
-        "review_batch_token_limit",
-        "review_candidate_filter",
         "review_context_budget",
         "review_structured_output_support",
         "review_transcript_qa_available",
@@ -5203,7 +4441,6 @@ def runtime_config_payload(args) -> Dict[str, object]:
                 "review_base_url": "",
                 "review_model_name": "",
                 "review_reasoning_effort": "none",
-                "review_candidate_filter": False,
                 "review_debug": False,
                 "transcript_cleanup_review": False,
                 "glossary_correction_review": False,
@@ -5226,10 +4463,6 @@ def runtime_config_payload(args) -> Dict[str, object]:
         "formats": getattr(args, "filename_date_formats", None),
     }
     payload["review_runtime"] = resolve_review_runtime_config(payload)
-    partition_context = getattr(args, "partition_context", None)
-    if partition_context is not None:
-        payload["partition"] = partition_context.metadata()
-        payload.update(partition_context.metadata())
     return payload
 
 
@@ -5350,8 +4583,6 @@ def run_speaker_attribution_stage(
     assume_dominant: bool, max_embedding_seconds: float, min_host_seconds: float,
     historical_similarity_scores: Dict[str, List[float]], alignment_fingerprint: Dict[str, object],
     diarization_fingerprint: Dict[str, object], resume_intermediates: bool,
-    speaker_telemetry: Optional[Dict[str, object]] = None,
-    component_timings: Optional[Dict[str, float]] = None,
 ) -> Tuple[Optional[str], Optional[np.ndarray], Dict[str, float], Dict[str, float], Dict[str, Dict[str, object]], Dict[str, str], List[Dict[str, object]], List[Dict[str, object]], Dict[str, object], bool]:
     def file_revision(value: Optional[str]) -> Dict[str, object]:
         if not value:
@@ -5384,26 +4615,17 @@ def run_speaker_attribution_stage(
             cached = None
     if cached:
         print("  speaker attribution: reused cached artifact")
-        if speaker_telemetry is not None:
-            speaker_telemetry["audio_cache_mode"] = "stage_reused"
         segments[:] = cached["segments"]
         metadata = cached.get("metadata") if isinstance(cached.get("metadata"), dict) else {}
         return (metadata.get("host_speaker"), None, dict(metadata.get("durations") or {}),
                 dict(metadata.get("similarity_scores") or {}), dict(metadata.get("known_assignments") or {}),
                 dict(metadata.get("speaker_mapping") or {}), list(metadata.get("drift_alerts") or []),
                 list(metadata.get("speaker_identity_evidence") or []), fingerprint, True)
-    speaker_audio_path = prepare_speaker_audio_cache(
-        audio_path,
-        output_dir,
-        telemetry=speaker_telemetry,
-        component_timings=component_timings,
-    )
     existing_profile = load_host_profile(host_profile_path, speaker_embedding_identity)
     host_speaker, speaker_embeddings, updated_profile, durations, similarity_scores = choose_host_speaker(
-        verifier=verifier, audio_path=str(speaker_audio_path), diarized_turns=diarized_turns, host_reference_path=host_reference,
+        verifier=verifier, audio_path=str(audio_path), diarized_turns=diarized_turns, host_reference_path=host_reference,
         existing_profile=existing_profile, host_threshold=host_threshold, assume_dominant=assume_dominant,
         max_embedding_seconds=max_embedding_seconds, min_host_seconds=min_host_seconds,
-        telemetry=speaker_telemetry,
     )
     known_assignments = match_known_speakers(speaker_embeddings, known_speaker_profiles, host_threshold)
     known_host = next((speaker_id for speaker_id, assignment in known_assignments.items() if assignment.get("is_host")), None)
@@ -5467,7 +4689,6 @@ def run_speaker_attribution_stage(
 def run_anonymous_speaker_attribution_stage(
     *, output_dir: Path, audio_path: Path, segments: List[SegmentItem], diarized_turns: List[Dict[str, object]],
     alignment_fingerprint: Dict[str, object], diarization_fingerprint: Dict[str, object], resume_intermediates: bool,
-    speaker_telemetry: Optional[Dict[str, object]] = None,
 ) -> Tuple[None, None, Dict[str, float], Dict[str, float], Dict[str, Dict[str, object]], Dict[str, str], List[Dict[str, object]], List[Dict[str, object]], Dict[str, object], bool]:
     """Map diarization labels without computing or persisting speaker identity."""
 
@@ -5575,18 +4796,10 @@ def process_file(
     file_started = time.perf_counter()
     RESOURCE_USAGE_TRACKER.clear()
     stage_timings: Dict[str, float] = {}
-    speaker_telemetry = new_speaker_telemetry(
-        output_dir / CHECKPOINT_DIRNAME / f"{audio_path.stem}_speaker_telemetry.json"
-    )
     print(f"Processing {audio_path.name}")
     print_episode_mode("tier1+tier2" if resolve_review_runtime_config(runtime_config or {}).get("any_review_enabled") else "tier1-only")
     output_dir.mkdir(parents=True, exist_ok=True)
-    prior_checkpoint = load_processing_checkpoint(output_dir, audio_path)
-    if prior_checkpoint:
-        print(
-            f"  resuming from durable checkpoint: "
-            f"{str(prior_checkpoint.get('stage') or 'unknown').replace('_', ' ')}"
-        )
+    clear_processing_checkpoint(output_dir, audio_path)
     log_memory_usage("before_transcription")
 
     transcription_started = time.perf_counter()
@@ -5647,12 +4860,6 @@ def process_file(
         f"  alignment complete: {sum(len(segment.words) for segment in segments)} words "
         f"in {stage_timings['alignment']:.1f}s"
     )
-    write_processing_checkpoint(
-        output_dir,
-        audio_path,
-        "alignment_complete",
-        {"word_count": sum(len(segment.words) for segment in segments), "segment_count": len(segments)},
-    )
 
     diarization_started = time.perf_counter()
     print_episode_stage(3, 6, "diarization")
@@ -5666,7 +4873,6 @@ def process_file(
         num_speakers=num_speakers,
         max_embedding_seconds=max_embedding_seconds,
         resume_intermediates=resume_intermediates,
-        speaker_telemetry=speaker_telemetry,
     )
     assign_speakers_to_segments(segments, diarized_turns)
     print(
@@ -5689,14 +4895,12 @@ def process_file(
     print_episode_stage(4, 6, "speaker labeling" if anonymous_meeting else "speaker matching")
     matching_started = time.perf_counter()
     matching_component_timings: Dict[str, float] = {}
-    print("  speaker telemetry: collecting audio spans and embeddings")
     if anonymous_meeting:
         with timed_component(matching_component_timings, "speaker label assignment"):
             host_speaker, updated_profile, durations, similarity_scores, known_assignments, speaker_mapping, drift_alerts, speaker_identity_evidence, speaker_attribution_fingerprint, speaker_attribution_reused = run_anonymous_speaker_attribution_stage(
                 output_dir=output_dir, audio_path=audio_path, segments=segments, diarized_turns=diarized_turns,
                 alignment_fingerprint=alignment_fingerprint,
                 diarization_fingerprint=diarization_metadata.get("stage_fingerprint", {}), resume_intermediates=resume_intermediates,
-                speaker_telemetry=speaker_telemetry,
             )
     else:
         host_speaker, updated_profile, durations, similarity_scores, known_assignments, speaker_mapping, drift_alerts, speaker_identity_evidence, speaker_attribution_fingerprint, speaker_attribution_reused = run_speaker_attribution_stage(
@@ -5706,8 +4910,6 @@ def process_file(
             assume_dominant=assume_dominant, max_embedding_seconds=max_embedding_seconds, min_host_seconds=min_host_seconds,
             historical_similarity_scores=historical_similarity_scores or {}, alignment_fingerprint=alignment_fingerprint,
             diarization_fingerprint=diarization_metadata.get("stage_fingerprint", {}), resume_intermediates=resume_intermediates,
-            speaker_telemetry=speaker_telemetry,
-            component_timings=matching_component_timings,
         )
     filename_date_config = (runtime_config or {}).get("filename_date", {})
     episode_metadata_for_review = build_episode_metadata(str(audio_path), filename_date_config)
@@ -5796,9 +4998,7 @@ def process_file(
         runtime_review_config,
         review_input_source="inline_cleaned_segments",
         calibration_session=review_calibration_session,
-        progress_callback=make_checkpointed_review_progress_callback(
-            output_dir, audio_path, review_component_timings
-        ),
+        progress_callback=make_review_progress_callback(review_component_timings),
         debug_context={
             "audio_path": str(audio_path),
             "output_dir": str(output_dir),
@@ -5808,16 +5008,6 @@ def process_file(
     stage_timings["review"] = time.perf_counter() - review_started
     print(f"  review complete in {stage_timings['review']:.1f}s")
     print_timing_component_summary("review", review_component_timings)
-    write_processing_checkpoint(
-        output_dir,
-        audio_path,
-        "review_complete",
-        {
-            "review_status": review_result.get("metadata", {}).get("review_status", ""),
-            "candidate_count": review_result.get("metadata", {}).get("review_candidate_count", 0),
-            "corrected_segment_count": review_result.get("metadata", {}).get("corrected_segment_count", 0),
-        },
-    )
     print_episode_stage(6, 6, "writing outputs")
     writing_started = time.perf_counter()
     writing_component_timings: Dict[str, float] = {}
@@ -5846,18 +5036,6 @@ def process_file(
         "speaker_identity_evidence": speaker_identity_evidence,
         "correction_lineage": load_correction_lineage(output_dir, audio_path.stem),
     }
-    partition_metadata = (runtime_config or {}).get("partition")
-    if isinstance(partition_metadata, dict):
-        episode_metadata["partition"] = dict(partition_metadata)
-        episode_metadata.update(
-            {
-                "partition_id": partition_metadata.get("partition_id", ""),
-                "corpus_id": partition_metadata.get("corpus_id") or partition_metadata.get("partition_id", ""),
-                "partition_display_name": partition_metadata.get("partition_display_name", ""),
-                "context_type": partition_metadata.get("context_type", ""),
-                "partition_config_fingerprint": partition_metadata.get("partition_config_fingerprint", ""),
-            }
-        )
     cleaned_metadata = {**episode_metadata, "text_version": "cleaned"}
     with timed_component(writing_component_timings, "transcript text outputs"):
         output_write_text_transcript(
@@ -5961,19 +5139,6 @@ def process_file(
     print(f"  cleaned text edits: {len(cleanup_edits)}")
     print(f"  manual corrections: {manual_corrections}")
     print(f"  host detected: {host_speaker is not None}")
-    speaker_telemetry_payload = finalize_speaker_telemetry(speaker_telemetry)
-    print(
-        "  speaker telemetry summary: "
-        f"audio_cache={speaker_telemetry_payload['audio_cache_mode']}, "
-        f"audio_cache_wall={speaker_telemetry_payload['audio_cache_conversion_wall_seconds']:.1f}s, "
-        f"audio_reads={speaker_telemetry_payload['audio_span_read_count']}, "
-        f"audio_wall={speaker_telemetry_payload['audio_span_wall_seconds']:.1f}s, "
-        f"embedding_calls={speaker_telemetry_payload['embedding_call_count']}, "
-        f"embedding_wall={speaker_telemetry_payload['embedding_wall_seconds']:.1f}s, "
-        f"embedding_input={speaker_telemetry_payload['embedding_input_seconds']:.1f}s"
-    )
-    finalization_started = time.perf_counter()
-    summary_operation_started = start_finalization_operation("building episode summary")
     summary_row = build_episode_summary_row(
         audio_path=audio_path,
         normalized_segments=normalized_segments,
@@ -5985,7 +5150,6 @@ def process_file(
         known_assignments=known_assignments,
         episode_metadata=episode_metadata,
     )
-    finish_finalization_operation("building episode summary", summary_operation_started)
     summary_row["cleanup_level"] = cleanup_level
     summary_row["cleanup_edit_count"] = len(cleanup_edits)
     summary_row["manual_correction_count"] = manual_corrections
@@ -6017,18 +5181,6 @@ def process_file(
     summary_row["diarization_chunk_overlap_seconds"] = int(float(diarization_metadata.get("chunk_overlap_seconds") or 0.0))
     summary_row["diarization_reconciliation_merge_count"] = int(diarization_metadata.get("reconciliation_merge_count") or 0)
     summary_row["diarization_reconciliation_ambiguous_count"] = int(diarization_metadata.get("reconciliation_ambiguous_count") or 0)
-    summary_row["speaker_audio_span_read_count"] = int(speaker_telemetry_payload.get("audio_span_read_count") or 0)
-    summary_row["speaker_audio_span_wall_seconds"] = float(speaker_telemetry_payload.get("audio_span_wall_seconds") or 0.0)
-    summary_row["speaker_embedding_call_count"] = int(speaker_telemetry_payload.get("embedding_call_count") or 0)
-    summary_row["speaker_embedding_wall_seconds"] = float(speaker_telemetry_payload.get("embedding_wall_seconds") or 0.0)
-    summary_row["speaker_embedding_input_seconds"] = float(speaker_telemetry_payload.get("embedding_input_seconds") or 0.0)
-    summary_row["speaker_embedding_calls_by_kind"] = json.dumps(
-        speaker_telemetry_payload.get("embedding_calls_by_kind") or {},
-        sort_keys=True,
-    )
-    summary_row["speaker_reconciliation_boundary_count"] = int(
-        speaker_telemetry_payload.get("chunk_reconciliation_boundary_count") or 0
-    )
     stage_timings["total"] = time.perf_counter() - file_started
     outputs = [
         output_dir / f"{base_name}_speaker_transcript.txt",
@@ -6041,9 +5193,6 @@ def process_file(
         output_dir / f"{base_name}_cleaned_speaker_transcript.json",
     ]
     outputs.extend(reviewed_output_paths)
-    manifest_operation_started = start_finalization_operation(
-        f"writing output manifest and hashing {len(outputs)} outputs"
-    )
     output_write_output_manifest(
         output_dir / f"{base_name}_manifest.json",
         source_file=str(audio_path),
@@ -6054,35 +5203,13 @@ def process_file(
         summary=summary_row,
         stage_provenance=stage_provenance,
         resource_usage=dict(RESOURCE_USAGE_TRACKER),
-        speaker_telemetry=speaker_telemetry_payload,
-        progress_callback=lambda message: print(f"    finalization: {message}"),
     )
-    finish_finalization_operation("writing output manifest", manifest_operation_started)
-    checkpoint_operation_started = start_finalization_operation("clearing processing checkpoint")
     clear_processing_checkpoint(output_dir, audio_path)
-    finish_finalization_operation("clearing processing checkpoint", checkpoint_operation_started)
-    transient_cleanup_operation_started = start_finalization_operation(
-        "clearing transient processing artifacts"
-    )
-    transient_cleanup = state_clear_transient_artifacts(output_dir, audio_path)
-    finish_finalization_operation(
-        "clearing transient processing artifacts",
-        transient_cleanup_operation_started,
-    )
-    if transient_cleanup.get("failed"):
-        print(
-            "  finalization warning: could not remove transient artifacts: "
-            + ", ".join(Path(path).name for path in transient_cleanup["failed"])
-        )
     if not archive_debug_artifacts:
-        cleanup_label = "clearing debug artifacts" if resume_intermediates else "clearing stage artifacts"
-        cleanup_operation_started = start_finalization_operation(cleanup_label)
         if resume_intermediates:
             state_clear_debug_artifacts(output_dir, audio_path)
         else:
             state_clear_stage_artifacts(output_dir, audio_path)
-        finish_finalization_operation(cleanup_label, cleanup_operation_started)
-    print(f"  finalization complete in {time.perf_counter() - finalization_started:.1f}s")
     return summary_row
 
 
@@ -6287,28 +5414,6 @@ def estimate_audio_eta(processed_audio_seconds: float, elapsed_seconds: float, r
     return seconds_per_audio_second * remaining_audio_seconds
 
 
-def is_current_review_bundle_skip(state_info: Mapping[str, object]) -> bool:
-    """Return whether an episode is already complete with the current review bundle."""
-
-    return (
-        str(state_info.get("state") or "") == "complete"
-        and str(state_info.get("review_bundle_status") or "") == "current_review_complete"
-    )
-
-
-def eta_excluded_file_names(
-    audio_files: List[Path],
-    episode_states: Mapping[str, Mapping[str, object]],
-) -> set[str]:
-    """Identify already-reviewed episodes that should not affect batch ETA statistics."""
-
-    return {
-        audio_path.name
-        for audio_path in audio_files
-        if is_current_review_bundle_skip(episode_states.get(audio_path.name, {}))
-    }
-
-
 def build_child_process_command(args, audio_path: Path, output_dir: Path) -> List[str]:
     command = [
         sys.executable,
@@ -6353,10 +5458,6 @@ def build_child_process_command(args, audio_path: Path, output_dir: Path) -> Lis
         args.review_base_url,
         "--review-model-name",
         args.review_model_name,
-        "--review-reasoning-effort",
-        args.review_reasoning_effort,
-        "--review-batch-token-limit",
-        str(args.review_batch_token_limit),
         "--diarization-model",
         args.diarization_model,
         "--diarization-model-revision",
@@ -6377,13 +5478,6 @@ def build_child_process_command(args, audio_path: Path, output_dir: Path) -> Lis
         str(args.max_embedding_seconds),
         "--no-isolate-files",
     ]
-
-    if getattr(args, "partition", ""):
-        command.extend(["--partition", str(args.partition)])
-        if getattr(args, "project_root", ""):
-            command.extend(["--project-root", str(args.project_root)])
-        if getattr(args, "partition_run_id", ""):
-            command.extend(["--partition-run-id", str(args.partition_run_id)])
 
     if args.alignment_model:
         command.extend(["--alignment-model", args.alignment_model])
@@ -6438,8 +5532,6 @@ def build_child_process_command(args, audio_path: Path, output_dir: Path) -> Lis
         command.append("--no-review-auto-adapt-upward")
     if args.review_context_budget:
         command.extend(["--review-context-budget", str(args.review_context_budget)])
-    if not args.review_candidate_filter:
-        command.append("--review-all-segments")
     if args.review_structured_output_support:
         command.append("--review-structured-output-support")
     if args.review_transcript_qa_available:
@@ -6467,9 +5559,6 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
     existing_summary_rows = state_load_episode_summary_rows(summary_path, normalize_episode_summary_row)
     processed_files = state_load_processed_files(resume_state_path)
     effective_runtime_config = runtime_config_payload(args)
-    partition_registry = getattr(args, "partition_registry", None)
-    partition_id = str(getattr(args, "partition", "") or "")
-    partition_run_id = str(getattr(args, "partition_run_id", "") or "")
     episode_states = {
         audio_path.name: classify_episode_processing_state(
             audio_path,
@@ -6490,7 +5579,6 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
     total_files = len(audio_files)
     batch_started = time.perf_counter()
     durations = audio_duration_map(audio_files)
-    eta_excluded_names = eta_excluded_file_names(audio_files, episode_states)
     processed_audio_seconds = 0.0
 
     print("Using isolated per-file processing to release native memory between episodes.")
@@ -6503,15 +5591,12 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
             )
 
         elapsed = time.perf_counter() - batch_started
-        excluded_before = sum(1 for path in audio_files[: index - 1] if path.name in eta_excluded_names)
-        completed_file_count = index - 1 - excluded_before
-        average_seconds = elapsed / completed_file_count if completed_file_count > 0 else None
-        remaining_files = sum(1 for path in audio_files[index - 1 :] if path.name not in eta_excluded_names)
+        average_seconds = elapsed / (index - 1) if index > 1 else None
+        remaining_files = total_files - index + 1
         remaining_audio_seconds = sum(
             duration or 0.0
             for path_text, duration in durations.items()
             if Path(path_text) in audio_files[index - 1 :]
-            and Path(path_text).name not in eta_excluded_names
         )
         eta_seconds = estimate_audio_eta(processed_audio_seconds, elapsed, remaining_audio_seconds)
         if eta_seconds is None and average_seconds is not None:
@@ -6541,34 +5626,7 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
                 )
             else:
                 print(f"Skipping completed file: {audio_path.name}")
-            # A completed episode may have been processed by an older version
-            # that retained disposable caches. Clean those without reopening
-            # any model stage or invalidating reusable stage JSON artifacts.
-            clear_processing_checkpoint(output_dir, audio_path)
-            transient_cleanup = state_clear_transient_artifacts(output_dir, audio_path)
-            if transient_cleanup.get("failed"):
-                print(
-                    "  cleanup warning: could not remove transient artifacts: "
-                    + ", ".join(Path(path).name for path in transient_cleanup["failed"])
-                )
-            archive_debug_artifacts = bool(getattr(args, "archive_debug_artifacts", False))
-            resume_intermediates = bool(getattr(args, "resume_intermediates", True))
-            if not archive_debug_artifacts:
-                if resume_intermediates:
-                    state_clear_debug_artifacts(output_dir, audio_path)
-                else:
-                    state_clear_stage_artifacts(output_dir, audio_path)
-            if not is_current_review_bundle_skip(state_info):
-                processed_audio_seconds += duration_seconds or 0.0
-            if partition_registry is not None and partition_id:
-                partition_registry.mark_file(
-                    partition_id,
-                    audio_path,
-                    "completed",
-                    run_id=partition_run_id,
-                    stage="complete",
-                    output_valid=True,
-                )
+            processed_audio_seconds += duration_seconds or 0.0
             continue
         if state_info["state"] == "needs_tier2_only" and state_info.get("missing_review_stages"):
             print(
@@ -6590,25 +5648,7 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
         print(f"Processing mode for {audio_path.name}: {mode_labels.get(str(state_info['state']), 'tier1+tier2')}")
         if state_info["state"] == "v2_upgrade_blocked":
             print(f"V2 upgrade blocked for {audio_path.name}: source audio or required artifacts are unavailable.")
-            if partition_registry is not None and partition_id:
-                partition_registry.mark_file(
-                    partition_id,
-                    audio_path,
-                    "quarantined",
-                    run_id=partition_run_id,
-                    stage="contract_upgrade",
-                    error="Required source audio or cached artifacts are unavailable.",
-                )
             continue
-
-        if partition_registry is not None and partition_id:
-            partition_registry.mark_file(
-                partition_id,
-                audio_path,
-                "processing",
-                run_id=partition_run_id,
-                stage=str(state_info.get("state") or "processing"),
-            )
 
         command = build_child_process_command(args, audio_path, output_dir)
         try:
@@ -6617,15 +5657,6 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
                 timeout=args.child_timeout_seconds if args.child_timeout_seconds and args.child_timeout_seconds > 0 else None,
             )
         except subprocess.TimeoutExpired as exc:
-            if partition_registry is not None and partition_id:
-                partition_registry.mark_file(
-                    partition_id,
-                    audio_path,
-                    "failed",
-                    run_id=partition_run_id,
-                    stage="child_process",
-                    error=f"Child process timed out after {args.child_timeout_seconds} seconds.",
-                )
             raise RuntimeError(
                 f"Child process timed out for {audio_path.name} after {args.child_timeout_seconds} seconds. "
                 "Intermediate artifacts may allow the next run to resume inside the episode."
@@ -6645,46 +5676,17 @@ def run_isolated_batch(args, input_dir: Path, output_dir: Path, audio_files: Lis
                     f"Child process for {audio_path.name} exited with code {result.returncode} "
                     "after writing all expected outputs; continuing batch."
                 )
-                if partition_registry is not None and partition_id:
-                    partition_registry.mark_file(
-                        partition_id,
-                        audio_path,
-                        "completed",
-                        run_id=partition_run_id,
-                        stage="complete",
-                        output_valid=True,
-                    )
                 continue
-            if partition_registry is not None and partition_id:
-                partition_registry.mark_file(
-                    partition_id,
-                    audio_path,
-                    "failed",
-                    run_id=partition_run_id,
-                    stage="child_process",
-                    error=f"Child process exited with code {result.returncode}.",
-                )
             raise RuntimeError(f"Child process failed for {audio_path.name} with exit code {result.returncode}.")
-        if partition_registry is not None and partition_id:
-            partition_registry.mark_file(
-                partition_id,
-                audio_path,
-                "completed",
-                run_id=partition_run_id,
-                stage="complete",
-                output_valid=True,
-            )
         processed_audio_seconds += duration_seconds or 0.0
 
     existing_summary_rows = state_load_episode_summary_rows(summary_path, normalize_episode_summary_row)
-    operation_started = start_console_operation("batch finalization", "writing run-level reports")
     write_run_reports(
         output_dir,
         list(existing_summary_rows.values()),
         elapsed_seconds=time.perf_counter() - batch_started,
         workflow_profile=str(effective_runtime_config.get("workflow_profile") or "podcast"),
     )
-    finish_console_operation("batch finalization", "writing run-level reports", operation_started)
     print_final_review_summary(list(existing_summary_rows.values()))
     print(f"Wrote folder summary: {summary_path}")
 
@@ -6815,9 +5817,6 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
     episode_summary_rows_by_name = dict(existing_summary_rows)
     historical_similarity_scores = build_historical_similarity_scores(list(existing_summary_rows.values()))
     effective_runtime_config = runtime_config_payload(args)
-    partition_registry = getattr(args, "partition_registry", None)
-    partition_id = str(getattr(args, "partition", "") or "")
-    partition_run_id = str(getattr(args, "partition_run_id", "") or "")
     episode_states = {
         audio_path.name: classify_episode_processing_state(
             audio_path,
@@ -6868,7 +5867,6 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
     is_single_episode_worker = bool(args.input_file) or total_files == 1
     batch_started = time.perf_counter()
     durations = audio_duration_map(audio_files)
-    eta_excluded_names = eta_excluded_file_names(audio_files, episode_states)
     processed_audio_seconds = 0.0
     for index, audio_path in enumerate(audio_files, start=1):
         duration_seconds = durations.get(str(audio_path))
@@ -6879,15 +5877,12 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
                 "when pyannote's path decoder is unavailable in the local environment."
             )
         elapsed = time.perf_counter() - batch_started
-        excluded_before = sum(1 for path in audio_files[: index - 1] if path.name in eta_excluded_names)
-        completed_file_count = index - 1 - excluded_before
-        average_seconds = elapsed / completed_file_count if completed_file_count > 0 else None
-        remaining_files = sum(1 for path in audio_files[index - 1 :] if path.name not in eta_excluded_names)
+        average_seconds = elapsed / (index - 1) if index > 1 else None
+        remaining_files = total_files - index + 1
         remaining_audio_seconds = sum(
             duration or 0.0
             for path_text, duration in durations.items()
             if Path(path_text) in audio_files[index - 1 :]
-            and Path(path_text).name not in eta_excluded_names
         )
         eta_seconds = estimate_audio_eta(processed_audio_seconds, elapsed, remaining_audio_seconds)
         if eta_seconds is None and average_seconds is not None:
@@ -6917,33 +5912,7 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
                 )
             else:
                 print(f"Skipping completed file: {audio_path.name}")
-            # Clean disposable artifacts left by older successful runs without
-            # reopening any model stage or invalidating reusable stage JSON.
-            clear_processing_checkpoint(output_dir, audio_path)
-            transient_cleanup = state_clear_transient_artifacts(output_dir, audio_path)
-            if transient_cleanup.get("failed"):
-                print(
-                    "  cleanup warning: could not remove transient artifacts: "
-                    + ", ".join(Path(path).name for path in transient_cleanup["failed"])
-                )
-            archive_debug_artifacts = bool(getattr(args, "archive_debug_artifacts", False))
-            resume_intermediates = bool(getattr(args, "resume_intermediates", True))
-            if not archive_debug_artifacts:
-                if resume_intermediates:
-                    state_clear_debug_artifacts(output_dir, audio_path)
-                else:
-                    state_clear_stage_artifacts(output_dir, audio_path)
-            if not is_current_review_bundle_skip(state_info):
-                processed_audio_seconds += duration_seconds or 0.0
-            if partition_registry is not None and partition_id:
-                partition_registry.mark_file(
-                    partition_id,
-                    audio_path,
-                    "completed",
-                    run_id=partition_run_id,
-                    stage="complete",
-                    output_valid=True,
-                )
+            processed_audio_seconds += duration_seconds or 0.0
             continue
         if not is_single_episode_worker:
             if state_info["state"] == "needs_tier2_only" and state_info.get("missing_review_stages"):
@@ -6973,159 +5942,79 @@ def process_audio_batch(args, input_dir: Path, output_dir: Path, audio_files: Li
             )
         elif state_info["state"] == "v2_upgrade_blocked":
             print(f"V2 upgrade blocked for {audio_path.name}: source audio or required artifacts are unavailable.")
-            if partition_registry is not None and partition_id:
-                partition_registry.mark_file(
-                    partition_id,
-                    audio_path,
-                    "quarantined",
-                    run_id=partition_run_id,
-                    stage="contract_upgrade",
-                    error="Required source audio or cached artifacts are unavailable.",
-                )
             continue
         elif state_info["state"] == "needs_tier2_only":
-            if partition_registry is not None and partition_id:
-                partition_registry.mark_file(partition_id, audio_path, "processing", run_id=partition_run_id, stage="review")
-            try:
-                episode_summary = process_review_backfill_from_cleaned_json(
-                    audio_path=audio_path,
-                    output_dir=output_dir,
-                    runtime_config=effective_runtime_config,
-                    review_calibration_session=review_calibration_session,
-                    existing_summary_row=episode_summary_rows_by_name.get(audio_path.name),
-                )
-            except Exception as exc:
-                if partition_registry is not None and partition_id:
-                    partition_registry.mark_file(partition_id, audio_path, "failed", run_id=partition_run_id, stage="review", error=str(exc))
-                raise
+            episode_summary = process_review_backfill_from_cleaned_json(
+                audio_path=audio_path,
+                output_dir=output_dir,
+                runtime_config=effective_runtime_config,
+                review_calibration_session=review_calibration_session,
+                existing_summary_row=episode_summary_rows_by_name.get(audio_path.name),
+            )
         else:
             if state_info["state"] in {"needs_v2_cached_rebuild", "needs_v2_full_reprocess"}:
                 archive_path = archive_legacy_episode_bundle(audio_path, output_dir)
                 if archive_path is not None:
                     print(f"  archived legacy v1 contract artifacts: {archive_path}")
-            if partition_registry is not None and partition_id:
-                partition_registry.mark_file(partition_id, audio_path, "processing", run_id=partition_run_id, stage="tier1")
-            try:
-                episode_summary = process_file(
-                    audio_path=audio_path,
-                    output_dir=output_dir,
-                    asr_provider=asr_provider,
-                    alignment_provider=alignment_provider,
-                    diarization_pipeline=diarization_pipeline,
-                    verifier=verifier,
-                    speaker_embedding_identity=speaker_embedding_provider.identity,
-                    language=args.language,
-                    beam_size=args.beam_size,
-                    batch_size=args.batch_size,
-                    initial_prompt=initial_prompt,
-                    hotwords=hotwords,
-                    replacement_map=replacement_map,
-                    host_reference=args.host_reference,
-                    host_profile_path=args.host_profile_json,
-                    known_speaker_profiles=known_speaker_profiles,
-                    host_threshold=args.host_threshold,
-                    assume_dominant=args.assume_dominant_speaker_is_host,
-                    max_embedding_seconds=args.max_embedding_seconds,
-                    min_host_seconds=args.min_host_seconds,
-                    num_speakers=args.num_speakers,
-                    cleanup_level=args.cleanup_level,
-                    corrections_dir=args.corrections_dir,
-                    runtime_config=effective_runtime_config,
-                    review_calibration_session=review_calibration_session,
-                    historical_similarity_scores=historical_similarity_scores,
-                    resume_intermediates=args.resume_intermediates,
-                    archive_debug_artifacts=args.archive_debug_artifacts,
-                )
-            except Exception as exc:
-                if partition_registry is not None and partition_id:
-                    partition_registry.mark_file(partition_id, audio_path, "failed", run_id=partition_run_id, stage="tier1", error=str(exc))
-                raise
-        if partition_registry is not None and partition_id:
-            partition_registry.mark_file(
-                partition_id,
-                audio_path,
-                "completed",
-                run_id=partition_run_id,
-                stage="complete",
-                output_valid=True,
+            episode_summary = process_file(
+                audio_path=audio_path,
+                output_dir=output_dir,
+                asr_provider=asr_provider,
+                alignment_provider=alignment_provider,
+                diarization_pipeline=diarization_pipeline,
+                verifier=verifier,
+                speaker_embedding_identity=speaker_embedding_provider.identity,
+                language=args.language,
+                beam_size=args.beam_size,
+                batch_size=args.batch_size,
+                initial_prompt=initial_prompt,
+                hotwords=hotwords,
+                replacement_map=replacement_map,
+                host_reference=args.host_reference,
+                host_profile_path=args.host_profile_json,
+                known_speaker_profiles=known_speaker_profiles,
+                host_threshold=args.host_threshold,
+                assume_dominant=args.assume_dominant_speaker_is_host,
+                max_embedding_seconds=args.max_embedding_seconds,
+                min_host_seconds=args.min_host_seconds,
+                num_speakers=args.num_speakers,
+                cleanup_level=args.cleanup_level,
+                corrections_dir=args.corrections_dir,
+                runtime_config=effective_runtime_config,
+                review_calibration_session=review_calibration_session,
+                historical_similarity_scores=historical_similarity_scores,
+                resume_intermediates=args.resume_intermediates,
+                archive_debug_artifacts=args.archive_debug_artifacts,
             )
-        post_episode_started = time.perf_counter()
-        operation_started = start_console_operation("post-episode", "updating in-memory batch state")
         episode_summary_rows_by_name[audio_path.name] = episode_summary
         historical_similarity_scores = build_historical_similarity_scores(list(episode_summary_rows_by_name.values()))
-        finish_console_operation("post-episode", "updating in-memory batch state", operation_started)
-
-        operation_started = start_console_operation("post-episode", "recording source fingerprint")
         processed_files[audio_path.name] = audio_file_fingerprint(audio_path)
-        finish_console_operation("post-episode", "recording source fingerprint", operation_started)
-
-        operation_started = start_console_operation("post-episode", "writing episode summary CSV")
         write_episode_summary_csv(summary_path, list(episode_summary_rows_by_name.values()))
-        finish_console_operation("post-episode", "writing episode summary CSV", operation_started)
-
-        operation_started = start_console_operation("post-episode", "saving processed-file state")
         state_save_processed_files(resume_state_path, processed_files)
-        finish_console_operation("post-episode", "saving processed-file state", operation_started)
-
-        operation_started = start_console_operation("post-episode", "saving review calibration state")
         save_review_calibration_session(output_dir, review_calibration_session)
-        finish_console_operation("post-episode", "saving review calibration state", operation_started)
         processed_audio_seconds += duration_seconds or 0.0
-        operation_started = start_console_operation("post-episode", "releasing Python objects")
         gc.collect()
-        finish_console_operation("post-episode", "releasing Python objects", operation_started)
         if torch.cuda.is_available():
-            operation_started = start_console_operation("post-episode", "releasing CUDA cache")
             torch.cuda.empty_cache()
-            finish_console_operation("post-episode", "releasing CUDA cache", operation_started)
-        print(f"  post-episode complete in {time.perf_counter() - post_episode_started:.1f}s")
 
-    if args.input_file:
-        print("Isolated worker: episode state saved; deferring run-level reports to the parent.")
-        exit_isolated_worker_after_success(args.input_file)
-        return
-
-    operation_started = start_console_operation("batch finalization", "writing episode summary CSV")
     write_episode_summary_csv(summary_path, list(episode_summary_rows_by_name.values()))
-    finish_console_operation("batch finalization", "writing episode summary CSV", operation_started)
-
-    operation_started = start_console_operation("batch finalization", "saving processed-file state")
     state_save_processed_files(resume_state_path, processed_files)
-    finish_console_operation("batch finalization", "saving processed-file state", operation_started)
-
-    operation_started = start_console_operation("batch finalization", "saving review calibration state")
     save_review_calibration_session(output_dir, review_calibration_session)
-    finish_console_operation("batch finalization", "saving review calibration state", operation_started)
-
-    operation_started = start_console_operation("batch finalization", "writing run-level reports")
     write_run_reports(
         output_dir,
         list(episode_summary_rows_by_name.values()),
         elapsed_seconds=time.perf_counter() - batch_started,
         workflow_profile=str(effective_runtime_config.get("workflow_profile") or "podcast"),
     )
-    finish_console_operation("batch finalization", "writing run-level reports", operation_started)
     print_final_review_summary(list(episode_summary_rows_by_name.values()))
     print(f"Wrote folder summary: {summary_path}")
+    exit_isolated_worker_after_success(args.input_file)
 
 
 def main():
     """CLI entry point used by the compatibility wrapper and package console script."""
 
     args = parse_args()
-
-    if args.partition_manager:
-        project_root = args.project_root or str(Path(__file__).resolve().parents[2])
-        partition_manager(project_root)
-        return
-
-    apply_partition_to_args(args)
-    if getattr(args, "partition_context", None) is not None:
-        context = args.partition_context
-        print(
-            f"Processing space: {context.record.display_name} "
-            f"({context.record.partition_id})"
-        )
 
     if args.provider_preflight or args.download_provider_models:
         run_provider_artifact_mode(args)
@@ -7160,29 +6049,10 @@ def main():
     audio_files = discover_audio_files(input_dir, args.input_file)
     if not audio_files:
         raise RuntimeError(f"No supported audio files found in {input_dir}")
-    partition_registry = None
-    partition_run_id = ""
-    partition_run_owned = False
-    partition_context = getattr(args, "partition_context", None)
-    if partition_context is not None:
-        partition_registry = PartitionRegistry(partition_context.project_root)
-        scan_result = partition_registry.scan(partition_context.partition_id)
-        print(
-            "Processing-space intake: "
-            + ", ".join(f"{key}={value}" for key, value in sorted(scan_result["counts"].items()))
-        )
-        partition_run_id = str(getattr(args, "partition_run_id", "") or "")
-        if not partition_run_id:
-            partition_run_id = partition_registry.start_run(partition_context.partition_id)
-            partition_run_owned = True
-        args.partition_registry = partition_registry
-        args.partition_run_id = partition_run_id
     disk_space_preflight(output_dir, audio_files)
     durations = audio_duration_map(audio_files)
     if args.benchmark_only:
         print_benchmark_plan(args, audio_files, durations)
-        if partition_registry is not None and partition_run_id and partition_run_owned:
-            partition_registry.finish_run(partition_run_id, status="completed")
         return
 
     effective_runtime_config = runtime_config_payload(args)
@@ -7206,18 +6076,10 @@ def main():
             "Set HF_TOKEN or pass --hf-token."
         )
 
-    try:
-        if args.isolate_files and args.input_file is None:
-            run_isolated_batch(args, input_dir, output_dir, audio_files)
-        else:
-            process_audio_batch(args, input_dir, output_dir, audio_files)
-    except Exception as exc:
-        if partition_registry is not None and partition_run_id and partition_run_owned:
-            partition_registry.finish_run(partition_run_id, status="failed", error=str(exc))
-        raise
+    if args.isolate_files and args.input_file is None:
+        run_isolated_batch(args, input_dir, output_dir, audio_files)
     else:
-        if partition_registry is not None and partition_run_id and partition_run_owned:
-            partition_registry.finish_run(partition_run_id, status="completed")
+        process_audio_batch(args, input_dir, output_dir, audio_files)
 
 
 if __name__ == "__main__":

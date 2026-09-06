@@ -1,0 +1,109 @@
+{
+  "max_output_tokens": 1400,
+  "repetitions": 3,
+  "local": {
+    "mode": "none",
+    "execution": "vllm_http",
+    "endpoint": "http://127.0.0.1:8001",
+    "model": "RishabhSinha/Qwen3.5-9B-NVFP4",
+    "warmup": {
+      "warmup": true,
+      "elapsed_seconds": 69.703,
+      "json_valid": true,
+      "schema_valid": true,
+      "reasoning_chars": 0,
+      "prompt_tokens": 335,
+      "completion_tokens": 30,
+      "reasoning_tokens": null,
+      "finish_reason": "stop"
+    },
+    "measured": [
+      {
+        "elapsed_seconds": 0.948,
+        "json_valid": true,
+        "schema_valid": true,
+        "reasoning_chars": 0,
+        "prompt_tokens": 335,
+        "completion_tokens": 30,
+        "reasoning_tokens": null,
+        "finish_reason": "stop"
+      },
+      {
+        "elapsed_seconds": 0.999,
+        "json_valid": true,
+        "schema_valid": true,
+        "reasoning_chars": 0,
+        "prompt_tokens": 335,
+        "completion_tokens": 30,
+        "reasoning_tokens": null,
+        "finish_reason": "stop"
+      },
+      {
+        "elapsed_seconds": 0.973,
+        "json_valid": true,
+        "schema_valid": true,
+        "reasoning_chars": 0,
+        "prompt_tokens": 335,
+        "completion_tokens": 30,
+        "reasoning_tokens": null,
+        "finish_reason": "stop"
+      }
+    ],
+    "mean_seconds": 0.973,
+    "min_seconds": 0.948,
+    "max_seconds": 0.999
+  },
+  "remote": {
+    "mode": "none",
+    "execution": "vllm_http",
+    "endpoint": "http://192.168.1.230:8000",
+    "model": "Inferact/Qwen3.8-27B-NVFP4",
+    "warmup": {
+      "warmup": true,
+      "elapsed_seconds": 0.807,
+      "json_valid": true,
+      "schema_valid": true,
+      "reasoning_chars": 0,
+      "prompt_tokens": 335,
+      "completion_tokens": 30,
+      "reasoning_tokens": null,
+      "finish_reason": "stop"
+    },
+    "measured": [
+      {
+        "elapsed_seconds": 0.816,
+        "json_valid": true,
+        "schema_valid": true,
+        "reasoning_chars": 0,
+        "prompt_tokens": 335,
+        "completion_tokens": 30,
+        "reasoning_tokens": null,
+        "finish_reason": "stop"
+      },
+      {
+        "elapsed_seconds": 0.813,
+        "json_valid": true,
+        "schema_valid": true,
+        "reasoning_chars": 0,
+        "prompt_tokens": 335,
+        "completion_tokens": 30,
+        "reasoning_tokens": null,
+        "finish_reason": "stop"
+      },
+      {
+        "elapsed_seconds": 0.817,
+        "json_valid": true,
+        "schema_valid": true,
+        "reasoning_chars": 0,
+        "prompt_tokens": 335,
+        "completion_tokens": 30,
+        "reasoning_tokens": null,
+        "finish_reason": "stop"
+      }
+    ],
+    "mean_seconds": 0.815,
+    "min_seconds": 0.813,
+    "max_seconds": 0.817
+  },
+  "remote_to_local_speedup": 0.84
+}

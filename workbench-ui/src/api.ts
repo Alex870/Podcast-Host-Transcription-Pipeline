@@ -1,4 +1,4 @@
-import type { EpisodeBundle, LearnedRule, SessionInfo, TeachMeProposal } from "./types";
+import type { EpisodeBundle, LearnedRule, PartitionRecord, SessionInfo, TeachMeProposal } from "./types";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -19,10 +19,64 @@ export function getSession() {
   return request<SessionInfo>("/api/session");
 }
 
-export function openSession(projectRoot: string, outputDir: string) {
-  return request<{ status: string; projectRoot: string; outputDir: string }>("/api/session/open", {
+export function openSession(projectRoot: string, outputDir: string, partitionId?: string) {
+  return request<{ status: string; projectRoot: string; outputDir: string; partitionId?: string | null }>("/api/session/open", {
     method: "POST",
-    body: JSON.stringify({ projectRoot, outputDir }),
+    body: JSON.stringify({ projectRoot, outputDir, partitionId: partitionId || null }),
+  });
+}
+
+export function listPartitions(projectRoot: string) {
+  return request<{ partitions: PartitionRecord[]; projectRoot: string; contextTypes: string[] }>(
+    `/api/partitions?projectRoot=${encodeURIComponent(projectRoot)}&include_archived=true`,
+  );
+}
+
+export function createPartition(payload: {
+  projectRoot: string;
+  displayName: string;
+  contextType: string;
+  workflowProfile?: string;
+  intakeDir?: string;
+  outputDir?: string;
+}) {
+  return request<{ status: string; partition: PartitionRecord }>("/api/partitions", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getPartition(partitionId: string) {
+  return request<{ partition: PartitionRecord; summary: Record<string, unknown>; effectiveConfig: Record<string, unknown> }>(
+    `/api/partitions/${encodeURIComponent(partitionId)}`,
+  );
+}
+
+export function scanPartition(partitionId: string) {
+  return request<{ counts: Record<string, number>; files: Array<Record<string, unknown>> }>(
+    `/api/partitions/${encodeURIComponent(partitionId)}/scan`,
+    { method: "POST" },
+  );
+}
+
+export function archivePartition(partitionId: string) {
+  return request<{ status: string; partition: PartitionRecord }>(
+    `/api/partitions/${encodeURIComponent(partitionId)}/archive`,
+    { method: "POST" },
+  );
+}
+
+export function validatePartition(partitionId: string) {
+  return request<{ valid: boolean; archived: boolean; missingPaths: string[]; summary: Record<string, unknown> }>(
+    `/api/partitions/${encodeURIComponent(partitionId)}/validate`,
+    { method: "POST" },
+  );
+}
+
+export function updatePartition(partitionId: string, payload: Record<string, unknown>) {
+  return request<{ status: string; partition: PartitionRecord }>(`/api/partitions/${encodeURIComponent(partitionId)}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
   });
 }
 

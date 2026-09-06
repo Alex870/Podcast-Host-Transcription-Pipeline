@@ -97,6 +97,8 @@ Then edit `podcast_transcribe_config.json` for your machine. A good first baseli
 }
 ```
 
+You do not need to edit JSON to create additional processing spaces. Start `Run Podcast Transcribe.ps1`, choose `10. Manage processing spaces`, and create a space for each podcast, meeting context, or interview collection. The wizard creates separate intake/output/state folders and stores the space configuration in `config/partitions.sqlite3`. Drop recordings into the selected space's intake folder and run that space explicitly with the launcher or workbench.
+
 ## 6. Set Up `preferred_terms.txt` and `preferred_replacements.json`
 
 These files are worth setting up early because they improve consistency across large runs.
@@ -282,7 +284,7 @@ Important files:
 - `_review_run_report.json`
 - `_speaker_workflow_report.json`
 - `_workbench/` for semantic scan cache files
-- `_processing_artifacts/` for resume/debug artifacts and the fingerprinted `speaker_audio_16k_mono.wav` cache used for repeated speaker-span reads
+- `_processing_artifacts/` for reusable resume/debug artifacts; the fingerprinted `speaker_audio_16k_mono.wav` cache is created only while processing and removed after successful completion
 
 ## 15. If You Are Migrating from an Older Working Directory
 

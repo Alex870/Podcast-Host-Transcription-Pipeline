@@ -170,6 +170,51 @@ def clear_debug_artifacts(output_dir: Path, audio_path: Path):
             shutil.rmtree(child)
 
 
+def clear_transient_artifacts(output_dir: Path, audio_path: Path) -> Dict[str, List[str]]:
+    """Remove disposable per-episode runtime artifacts after successful processing.
+
+    Stage JSON artifacts remain available when ``resume_intermediates`` is enabled,
+    but generated audio caches and progress/checkpoint files are not authoritative
+    and should not accumulate after an episode has completed. Cleanup is best effort
+    so a locked diagnostic file cannot turn an otherwise successful episode into a
+    failed run.
+    """
+
+    artifact_dir = output_dir / ARTIFACT_DIRNAME / audio_path.stem
+    checkpoint_dir = output_dir / CHECKPOINT_DIRNAME
+    candidates = [
+        artifact_dir / "speaker_audio_16k_mono.wav",
+        artifact_dir / "speaker_audio_16k_mono.json",
+        artifact_dir / "review_progress.json",
+        checkpoint_dir / f"{audio_path.stem}_speaker_telemetry.json",
+    ]
+    if artifact_dir.exists():
+        candidates.extend(sorted(artifact_dir.glob(".*.tmp")))
+
+    result: Dict[str, List[str]] = {"removed": [], "failed": []}
+
+    def remove_candidate(path: Path):
+        try:
+            if not path.exists() and not path.is_symlink():
+                return
+            path.unlink()
+            result["removed"].append(str(path))
+        except OSError:
+            result["failed"].append(str(path))
+
+    for candidate in candidates:
+        remove_candidate(candidate)
+
+    for directory in (artifact_dir, checkpoint_dir):
+        try:
+            if directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+        except OSError:
+            pass
+
+    return result
+
+
 def load_processed_files(path: Path) -> Dict[str, Dict[str, object]]:
     if not path.exists():
         return {}

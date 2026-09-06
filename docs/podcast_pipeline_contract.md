@@ -40,6 +40,18 @@ Recommended episode date fields:
 
 The executable contract for this repository lives in `src/podcast_transcribe/contract.py`. It defines the current transcript schema version and required fields and is used before transcript JSON outputs are written.
 
+### Processing-space identity
+
+When a transcript is produced from a managed processing space, `metadata` and the episode manifest include additive partition identity:
+
+- `partition_id`: stable processing-space identifier;
+- `partition_display_name`: operator-facing name;
+- `context_type`: `podcast`, `meeting`, or `custom`;
+- `workflow_profile`: the selected processing behavior;
+- `partition_config_fingerprint`: identity of the partition-scoped settings.
+
+Podcast-RAG should carry `partition_id` as its corpus identity, and later corpus-release consumers should preserve it alongside their existing release IDs. Legacy path-based transcripts may omit these fields and remain valid.
+
 ### Episode contract v2
 
 `episode-contract-v2` is the bundle-level processing contract layered additively over the transcript schema. Native new outputs and upgraded legacy outputs record:

@@ -33,6 +33,12 @@ flowchart TD
 
 Human changes flow through `correction-manifest-v2`. The workbench writes corrected siblings and a compatibility CSV, then emits downstream notifications containing the correction-set ID and affected source spans. Podcast-RAG can plan selective document deltas; RAGScope can route stale judgments back to adjudication.
 
+## Processing-Space Boundary
+
+The project-local SQLite registry at `config/partitions.sqlite3` is the operator-managed boundary between independent intake contexts. A partition resolves to one intake directory, output directory, state directory, glossary/correction scope, speaker-reference scope, and downstream corpus identity. The CLI still accepts direct source/output paths for compatibility, while `--partition <id>` resolves a managed `PartitionContext` before discovery and processing.
+
+Partition metadata is additive in runtime configuration, transcript metadata, and episode manifests. Stage caches remain under the selected output directory, so cache reuse cannot cross partitions accidentally. The registry separately tracks intake status and processing runs, allowing the existing fingerprinted stage state to remain the authority for recomputation while the partition registry provides operator-facing status.
+
 Speaker attribution writes embedding evidence while the model is already loaded. The workbench clusters only compatible evidence vectors across episodes, so reusable diarization labels never become accidental identities. `speakers.json` schema v2 retains explicit promotion, role, merge/split, and rollback history.
 
 The private evaluation pack is configured separately from the repository. Workbench queues and the guided campaign operate on that path, while only aggregate benchmark results and synthetic contract fixtures are suitable for Git.
@@ -113,9 +119,9 @@ The complementary invalidation view is:
 
 Legacy stage artifacts without fingerprints remain readable only for the established baseline assumptions. Newly written artifacts carry strict fingerprints. Speaker attribution persists labels and evidence, not embedding tensors; incompatible embedding families therefore cannot be mixed accidentally.
 
-When `resume_intermediates` is enabled, successful runs retain the reusable stage artifacts. Disabling resume allows normal cleanup of those artifacts.
+When `resume_intermediates` is enabled, successful runs retain the reusable stage JSON artifacts. Disposable audio caches, review progress, speaker telemetry checkpoints, and atomic-write leftovers are removed after successful completion. Disabling resume allows normal cleanup of the remaining stage artifacts.
 
-Speaker matching may materialize compressed input as a mono 16 kHz PCM WAV cache in the same episode directory. The cache is fingerprinted against the source audio, used only for repeated speaker-span reads, and does not replace the original source used by transcription or diarization.
+Speaker matching may materialize compressed input as a mono 16 kHz PCM WAV cache in the same episode directory. The cache is fingerprinted against the source audio, used only for repeated speaker-span reads, and does not replace the original source used by transcription or diarization. It is deleted after successful episode finalization; an interrupted or failed run may leave it for diagnosis or restart.
 
 ## Alignment
 

@@ -31,3 +31,6 @@ speech-shadow-runs/
 workbench-ui/node_modules/
 workbench-ui/dist/
 workbench-ui/*.tsbuildinfo
+
+# Local archive for documentation that is no longer part of the active set.
+docs/depreciated/

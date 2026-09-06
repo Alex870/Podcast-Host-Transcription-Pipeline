@@ -1,0 +1,91 @@
+{
+  "endpoint": "http://192.168.1.230:8000",
+  "model": "Inferact/Qwen3.8-27B-NVFP4",
+  "model_visible_at_v1_models": true,
+  "visible_model_ids": [
+    "Inferact/Qwen3.8-27B-NVFP4"
+  ],
+  "max_output_tokens": 1400,
+  "results": [
+    {
+      "mode": "legacy_no_think_prompt",
+      "elapsed_seconds": 5.081,
+      "content_chars": 84,
+      "reasoning_chars": 1209,
+      "finish_reason": "stop",
+      "json_valid": true,
+      "schema_valid": true,
+      "parse_source": "content",
+      "reviewed_segment_count": 0,
+      "corrected_segment_count": 0,
+      "prompt_tokens": 371,
+      "completion_tokens": 298,
+      "reasoning_tokens": 267,
+      "error": ""
+    },
+    {
+      "mode": "none",
+      "elapsed_seconds": 0.826,
+      "content_chars": 84,
+      "reasoning_chars": 0,
+      "finish_reason": "stop",
+      "json_valid": true,
+      "schema_valid": true,
+      "parse_source": "content",
+      "reviewed_segment_count": 0,
+      "corrected_segment_count": 0,
+      "prompt_tokens": 335,
+      "completion_tokens": 30,
+      "reasoning_tokens": 0,
+      "error": ""
+    },
+    {
+      "mode": "low",
+      "elapsed_seconds": 4.696,
+      "content_chars": 181,
+      "reasoning_chars": 1109,
+      "finish_reason": "stop",
+      "json_valid": true,
+      "schema_valid": true,
+      "parse_source": "content",
+      "reviewed_segment_count": 0,
+      "corrected_segment_count": 0,
+      "prompt_tokens": 356,
+      "completion_tokens": 273,
+      "reasoning_tokens": 233,
+      "error": ""
+    },
+    {
+      "mode": "medium",
+      "elapsed_seconds": 4.96,
+      "content_chars": 219,
+      "reasoning_chars": 1140,
+      "finish_reason": "stop",
+      "json_valid": true,
+      "schema_valid": true,
+      "parse_source": "content",
+      "reviewed_segment_count": 0,
+      "corrected_segment_count": 0,
+      "prompt_tokens": 330,
+      "completion_tokens": 290,
+      "reasoning_tokens": 242,
+      "error": ""
+    },
+    {
+      "mode": "xhigh",
+      "elapsed_seconds": 5.756,
+      "content_chars": 173,
+      "reasoning_chars": 1395,
+      "finish_reason": "stop",
+      "json_valid": true,
+      "schema_valid": true,
+      "parse_source": "content",
+      "reviewed_segment_count": 0,
+      "corrected_segment_count": 0,
+      "prompt_tokens": 368,
+      "completion_tokens": 340,
+      "reasoning_tokens": 290,
+      "error": ""
+    }
+  ]
+}

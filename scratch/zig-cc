@@ -1,0 +1,10 @@
+#!/bin/sh
+args=""
+for arg in "$@"; do
+    if [ "$arg" = "-l:libcuda.so.1" ]; then
+        args="$args /usr/lib/wsl/lib/libcuda.so.1"
+    else
+        args="$args \"$arg\""
+    fi
+done
+eval "exec /home/alex/qwen35-vllm-env/lib/python3.12/site-packages/ziglang/zig cc$args"

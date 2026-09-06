@@ -50,6 +50,7 @@ from podcast_transcribe.speaker_workflow import (
     build_cross_episode_speaker_view,
     file_revision,
 )
+from podcast_transcribe.partitions import PARTITION_REGISTRY_RELATIVE_PATH, PartitionRegistry
 
 
 WORKBENCH_DIRNAME = "_workbench"
@@ -446,6 +447,27 @@ def load_project_config(project_root: Path) -> Dict[str, object]:
 
 def resolve_workbench_paths(project_root: Path, output_dir: Path) -> Dict[str, Path]:
     config = load_project_config(project_root)
+    partition = None
+    registry_path = project_root / PARTITION_REGISTRY_RELATIVE_PATH
+    if registry_path.exists():
+        try:
+            registry = PartitionRegistry(project_root)
+            output_key = os.path.normcase(str(output_dir.resolve()))
+            partition = next(
+                (
+                    item
+                    for item in registry.list(include_archived=True)
+                    if os.path.normcase(str(item.output_dir.resolve())) == output_key
+                ),
+                None,
+            )
+        except Exception:
+            partition = None
+    if partition is not None:
+        config = {**config, **partition.config_overrides}
+        config["corrections_dir"] = str(partition.corrections_dir or "")
+        if partition.speaker_reference_dir:
+            config["known_speakers_dir"] = str(partition.speaker_reference_dir)
     corrections_dir = _resolve_under_root(
         project_root,
         str(config.get("corrections_dir") or ""),

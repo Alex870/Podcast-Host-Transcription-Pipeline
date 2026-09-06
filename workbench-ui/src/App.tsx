@@ -9,6 +9,7 @@ import {
   backfillReviewRule,
   disableReviewRule,
   getSession,
+  getPartition,
   initializeEvaluationCampaign,
   listEpisodes,
   listEpisodeCorrections,
@@ -19,7 +20,13 @@ import {
   loadEvaluationQueues,
   loadSpeakerIdentities,
   loadSpeakerWorkflow,
+  listPartitions,
   openSession,
+  createPartition,
+  scanPartition,
+  archivePartition,
+  updatePartition,
+  validatePartition,
   mergeSpeakerIdentities,
   previewPreferredTerm,
   previewReplacement,
@@ -35,10 +42,11 @@ import {
   speakerEvidenceAudioUrl,
   splitSpeakerIdentity,
 } from "./api";
-import type { EpisodeBundle, Finding, LearnedRule, TeachMeProposal, TranscriptSegment } from "./types";
+import type { EpisodeBundle, Finding, LearnedRule, PartitionRecord, TeachMeProposal, TranscriptSegment } from "./types";
 
 const LOCAL_STORAGE_PROJECT_KEY = "podcast-workbench-project-root";
 const LOCAL_STORAGE_OUTPUT_KEY = "podcast-workbench-output-dir";
+const LOCAL_STORAGE_PARTITION_KEY = "podcast-workbench-partition-id";
 const LOCAL_STORAGE_VIEW_KEY = "podcast-workbench-view-mode";
 
 function formatTimestamp(value: number | undefined) {
@@ -72,6 +80,23 @@ export default function App() {
   const queryClient = useQueryClient();
   const [projectRoot, setProjectRoot] = useState(localStorage.getItem(LOCAL_STORAGE_PROJECT_KEY) ?? "");
   const [outputDir, setOutputDir] = useState(localStorage.getItem(LOCAL_STORAGE_OUTPUT_KEY) ?? "");
+  const [selectedPartitionId, setSelectedPartitionId] = useState(localStorage.getItem(LOCAL_STORAGE_PARTITION_KEY) ?? "");
+  const [newPartitionName, setNewPartitionName] = useState("");
+  const [newPartitionContext, setNewPartitionContext] = useState("podcast");
+  const [newPartitionIntake, setNewPartitionIntake] = useState("");
+  const [newPartitionOutput, setNewPartitionOutput] = useState("");
+  const [partitionIntakeForEdit, setPartitionIntakeForEdit] = useState("");
+  const [partitionOutputForEdit, setPartitionOutputForEdit] = useState("");
+  const [partitionSpeakerReferences, setPartitionSpeakerReferences] = useState("");
+  const [partitionCorrections, setPartitionCorrections] = useState("");
+  const [partitionReviewBackend, setPartitionReviewBackend] = useState("");
+  const [partitionReviewModel, setPartitionReviewModel] = useState("");
+  const [partitionReviewReasoning, setPartitionReviewReasoning] = useState("");
+  const [partitionPreferredTerms, setPartitionPreferredTerms] = useState("");
+  const [partitionReplacementMap, setPartitionReplacementMap] = useState("");
+  const [partitionCorpusId, setPartitionCorpusId] = useState("");
+  const [partitionDownstreamProject, setPartitionDownstreamProject] = useState("");
+  const [partitionValidationMessage, setPartitionValidationMessage] = useState("");
   const [selectedEpisodeId, setSelectedEpisodeId] = useState("");
   const [viewMode, setViewMode] = useState<"cleaned" | "compare" | "changed" | "speaker">(
     (localStorage.getItem(LOCAL_STORAGE_VIEW_KEY) as "cleaned" | "compare" | "changed" | "speaker") || "compare",
@@ -104,6 +129,23 @@ export default function App() {
     queryFn: getSession,
   });
 
+  const partitionsQuery = useQuery({
+    queryKey: ["partitions", projectRoot],
+    queryFn: () => listPartitions(projectRoot),
+    enabled: Boolean(projectRoot),
+  });
+
+  const selectedPartition = useMemo(
+    () => partitionsQuery.data?.partitions.find((partition) => partition.partition_id === selectedPartitionId),
+    [partitionsQuery.data, selectedPartitionId],
+  );
+
+  const partitionDetailQuery = useQuery({
+    queryKey: ["partition", selectedPartitionId],
+    queryFn: () => getPartition(selectedPartitionId),
+    enabled: Boolean(selectedPartitionId) && !selectedPartition?.archived,
+  });
+
   useEffect(() => {
     if (!sessionQuery.data?.sessionOpen) {
       return;
@@ -116,20 +158,145 @@ export default function App() {
       setOutputDir(sessionQuery.data.outputDir);
       localStorage.setItem(LOCAL_STORAGE_OUTPUT_KEY, sessionQuery.data.outputDir);
     }
+    if (sessionQuery.data.partitionId) {
+      setSelectedPartitionId(sessionQuery.data.partitionId);
+      localStorage.setItem(LOCAL_STORAGE_PARTITION_KEY, sessionQuery.data.partitionId);
+    }
     setStatusMessage((current) => current || "Workbench session opened from launcher defaults.");
   }, [sessionQuery.data]);
 
   const openSessionMutation = useMutation({
-    mutationFn: () => openSession(projectRoot, outputDir),
+    mutationFn: () => openSession(
+      projectRoot,
+      selectedPartitionId
+        ? (partitionsQuery.data?.partitions.find((partition) => partition.partition_id === selectedPartitionId)?.output_dir ?? outputDir)
+        : outputDir,
+      selectedPartitionId || undefined,
+    ),
     onSuccess: async () => {
       localStorage.setItem(LOCAL_STORAGE_PROJECT_KEY, projectRoot);
       localStorage.setItem(LOCAL_STORAGE_OUTPUT_KEY, outputDir);
+      if (selectedPartitionId) {
+        localStorage.setItem(LOCAL_STORAGE_PARTITION_KEY, selectedPartitionId);
+      }
       await queryClient.invalidateQueries({ queryKey: ["session"] });
       await queryClient.invalidateQueries({ queryKey: ["episodes"] });
       setStatusMessage("Workbench session opened.");
     },
     onError: (error: Error) => setStatusMessage(error.message),
   });
+
+  const createPartitionMutation = useMutation({
+    mutationFn: () => createPartition({
+      projectRoot,
+      displayName: newPartitionName,
+      contextType: newPartitionContext,
+      intakeDir: newPartitionIntake || undefined,
+      outputDir: newPartitionOutput || undefined,
+    }),
+    onSuccess: async (payload) => {
+      setNewPartitionName("");
+      setNewPartitionIntake("");
+      setNewPartitionOutput("");
+      setSelectedPartitionId(payload.partition.partition_id);
+      await queryClient.invalidateQueries({ queryKey: ["partitions", projectRoot] });
+      setStatusMessage(`Created processing space: ${payload.partition.display_name}`);
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const scanPartitionMutation = useMutation({
+    mutationFn: () => scanPartition(selectedPartitionId),
+    onSuccess: async (payload) => {
+      await queryClient.invalidateQueries({ queryKey: ["partitions", projectRoot] });
+      setStatusMessage(`Scanned intake: ${Object.entries(payload.counts).map(([key, value]) => `${key}=${value}`).join(", ") || "no audio files"}.`);
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const archivePartitionMutation = useMutation({
+    mutationFn: () => archivePartition(selectedPartitionId),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["partitions", projectRoot] });
+      setSelectedPartitionId("");
+      setStatusMessage("Processing space archived. Existing data was not moved or deleted.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const validatePartitionMutation = useMutation({
+    mutationFn: () => validatePartition(selectedPartitionId),
+    onSuccess: (payload) => {
+      setPartitionValidationMessage(payload.valid ? "Space is valid." : `Missing paths: ${payload.missingPaths.join(", ")}`);
+      setStatusMessage(payload.valid ? "Processing-space validation passed." : "Processing-space validation found missing paths.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const reactivatePartitionMutation = useMutation({
+    mutationFn: () => updatePartition(selectedPartitionId, { archived: false }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["partitions", projectRoot] });
+      setStatusMessage("Processing space reactivated.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  const updatePartitionMutation = useMutation({
+    mutationFn: () => updatePartition(selectedPartitionId, {
+      intakeDir: partitionIntakeForEdit || undefined,
+      outputDir: partitionOutputForEdit || undefined,
+      speakerReferenceDir: partitionSpeakerReferences || undefined,
+      correctionsDir: partitionCorrections || undefined,
+      configOverrides: {
+        ...(selectedPartition?.config_overrides ?? {}),
+        backend: partitionReviewBackend || undefined,
+        review_model_name: partitionReviewModel || undefined,
+        review_reasoning_effort: partitionReviewReasoning || undefined,
+        preferred_terms_file: partitionPreferredTerms || undefined,
+        replacement_map_json: partitionReplacementMap || undefined,
+      },
+      downstreamConfig: {
+        ...(selectedPartition?.downstream_config ?? {}),
+        corpus_id: partitionCorpusId || undefined,
+        project: partitionDownstreamProject || undefined,
+      },
+    }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["partitions", projectRoot] });
+      setStatusMessage("Processing-space settings saved.");
+    },
+    onError: (error: Error) => setStatusMessage(error.message),
+  });
+
+  useEffect(() => {
+    if (selectedPartitionId || !partitionsQuery.data?.partitions?.length) {
+      return;
+    }
+    const first = partitionsQuery.data.partitions.find((partition) => !partition.archived);
+    if (first) {
+      setSelectedPartitionId(first.partition_id);
+    }
+  }, [partitionsQuery.data, selectedPartitionId]);
+
+  useEffect(() => {
+    if (!selectedPartition) {
+      return;
+    }
+    setPartitionIntakeForEdit(selectedPartition.intake_dir);
+    setPartitionOutputForEdit(selectedPartition.output_dir);
+    setPartitionSpeakerReferences(selectedPartition.speaker_reference_dir ?? "");
+    setPartitionCorrections(selectedPartition.corrections_dir ?? "");
+    const overrides = selectedPartition.config_overrides ?? {};
+    setPartitionReviewBackend(String(overrides.backend ?? ""));
+    setPartitionReviewModel(String(overrides.review_model_name ?? ""));
+    setPartitionReviewReasoning(String(overrides.review_reasoning_effort ?? ""));
+    setPartitionPreferredTerms(String(overrides.preferred_terms_file ?? ""));
+    setPartitionReplacementMap(String(overrides.replacement_map_json ?? ""));
+    const downstream = selectedPartition.downstream_config ?? {};
+    setPartitionCorpusId(String(downstream.corpus_id ?? ""));
+    setPartitionDownstreamProject(String(downstream.project ?? ""));
+  }, [selectedPartition]);
 
   const episodesQuery = useQuery({
     queryKey: ["episodes"],
@@ -515,13 +682,130 @@ export default function App() {
             <input value={projectRoot} onChange={(event) => setProjectRoot(event.target.value)} placeholder="C:\\path\\to\\podcast-host-transcription-pipeline" />
           </label>
           <label>
-            Output folder
-            <input value={outputDir} onChange={(event) => setOutputDir(event.target.value)} placeholder="C:\\path\\to\\output" />
+            Processing space
+            <select value={selectedPartitionId} onChange={(event) => setSelectedPartitionId(event.target.value)}>
+              <option value="">Legacy output folder</option>
+              {(partitionsQuery.data?.partitions ?? []).map((partition: PartitionRecord) => (
+                <option key={partition.partition_id} value={partition.partition_id}>
+                  {partition.display_name}{partition.archived ? " (archived)" : ""}
+                </option>
+              ))}
+            </select>
           </label>
-          <button onClick={() => openSessionMutation.mutate()} disabled={openSessionMutation.isPending}>
+          <label>
+            Output folder
+            <input value={selectedPartitionId ? (partitionsQuery.data?.partitions.find((partition) => partition.partition_id === selectedPartitionId)?.output_dir ?? outputDir) : outputDir} onChange={(event) => setOutputDir(event.target.value)} placeholder="C:\\path\\to\\output" disabled={Boolean(selectedPartitionId)} />
+          </label>
+          <button onClick={() => openSessionMutation.mutate()} disabled={openSessionMutation.isPending || Boolean(selectedPartition?.archived)}>
             Open session
           </button>
+          <button onClick={() => scanPartitionMutation.mutate()} disabled={!selectedPartitionId || Boolean(selectedPartition?.archived) || !sessionQuery.data?.sessionOpen || scanPartitionMutation.isPending}>
+            Scan intake
+          </button>
         </div>
+        <div className="field-row">
+          <label>
+            New space name
+            <input value={newPartitionName} onChange={(event) => setNewPartitionName(event.target.value)} placeholder="Work meetings" />
+          </label>
+          <label>
+            Context
+            <select value={newPartitionContext} onChange={(event) => setNewPartitionContext(event.target.value)}>
+              <option value="podcast">Podcast</option>
+              <option value="meeting">Work meeting</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+          <label>
+            Intake folder (optional)
+            <input value={newPartitionIntake} onChange={(event) => setNewPartitionIntake(event.target.value)} placeholder="Managed default" />
+          </label>
+          <label>
+            Output folder (optional)
+            <input value={newPartitionOutput} onChange={(event) => setNewPartitionOutput(event.target.value)} placeholder="Managed default" />
+          </label>
+          <button onClick={() => createPartitionMutation.mutate()} disabled={!projectRoot || !newPartitionName.trim() || createPartitionMutation.isPending}>
+            Create space
+          </button>
+          <button onClick={() => validatePartitionMutation.mutate()} disabled={!selectedPartitionId || validatePartitionMutation.isPending}>
+            Validate selected
+          </button>
+          {selectedPartition?.archived ? (
+            <button onClick={() => reactivatePartitionMutation.mutate()} disabled={reactivatePartitionMutation.isPending}>
+              Reactivate selected
+            </button>
+          ) : null}
+          <button onClick={() => archivePartitionMutation.mutate()} disabled={!selectedPartitionId || Boolean(selectedPartition?.archived) || archivePartitionMutation.isPending}>
+            Archive selected
+          </button>
+        </div>
+        {selectedPartition ? (
+          <div className="field-row">
+            <label>
+              Selected intake
+              <input value={partitionIntakeForEdit} onChange={(event) => setPartitionIntakeForEdit(event.target.value)} />
+            </label>
+            <label>
+              Selected output
+              <input value={partitionOutputForEdit} onChange={(event) => setPartitionOutputForEdit(event.target.value)} />
+            </label>
+            <label>
+              Speaker references
+              <input value={partitionSpeakerReferences} onChange={(event) => setPartitionSpeakerReferences(event.target.value)} placeholder="Optional" />
+            </label>
+            <label>
+              Corrections folder
+              <input value={partitionCorrections} onChange={(event) => setPartitionCorrections(event.target.value)} />
+            </label>
+            <label>
+              Review backend
+              <input value={partitionReviewBackend} onChange={(event) => setPartitionReviewBackend(event.target.value)} placeholder="Inherited" />
+            </label>
+            <label>
+              Review model
+              <input value={partitionReviewModel} onChange={(event) => setPartitionReviewModel(event.target.value)} placeholder="Inherited" />
+            </label>
+            <label>
+              Reasoning effort
+              <select value={partitionReviewReasoning} onChange={(event) => setPartitionReviewReasoning(event.target.value)}>
+                <option value="">Inherited</option>
+                <option value="none">None</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="xhigh">Xhigh</option>
+              </select>
+            </label>
+            <label>
+              Preferred terms file
+              <input value={partitionPreferredTerms} onChange={(event) => setPartitionPreferredTerms(event.target.value)} placeholder="Inherited" />
+            </label>
+            <label>
+              Replacement map
+              <input value={partitionReplacementMap} onChange={(event) => setPartitionReplacementMap(event.target.value)} placeholder="Inherited" />
+            </label>
+            <label>
+              Corpus ID
+              <input value={partitionCorpusId} onChange={(event) => setPartitionCorpusId(event.target.value)} placeholder="Partition default" />
+            </label>
+            <label>
+              Downstream project
+              <input value={partitionDownstreamProject} onChange={(event) => setPartitionDownstreamProject(event.target.value)} placeholder="Optional" />
+            </label>
+            <button onClick={() => updatePartitionMutation.mutate()} disabled={updatePartitionMutation.isPending}>
+              Save selected settings
+            </button>
+            <span className="status-line">
+              Status: {Object.entries(selectedPartition.status_counts ?? {}).map(([key, value]) => `${key}=${value}`).join(", ") || "not scanned"}
+              {partitionValidationMessage ? ` — ${partitionValidationMessage}` : ""}
+            </span>
+            {partitionDetailQuery.data?.effectiveConfig ? (
+              <details>
+                <summary>Effective inherited settings</summary>
+                <pre>{JSON.stringify(partitionDetailQuery.data.effectiveConfig, null, 2)}</pre>
+              </details>
+            ) : null}
+          </div>
+        ) : null}
         <div className="status-line">{statusMessage || (sessionQuery.data?.sessionOpen ? "Session ready." : "Open a project root and output folder to begin.")}</div>
       </section>
 

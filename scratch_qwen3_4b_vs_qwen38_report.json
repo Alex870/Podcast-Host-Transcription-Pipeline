@@ -1,0 +1,109 @@
+{
+  "max_output_tokens": 1400,
+  "repetitions": 3,
+  "local": {
+    "mode": "none",
+    "execution": "vllm_http",
+    "endpoint": "http://127.0.0.1:8001",
+    "model": "Qwen/Qwen3-4B-Instruct-2507",
+    "warmup": {
+      "warmup": true,
+      "elapsed_seconds": 15.295,
+      "json_valid": true,
+      "schema_valid": true,
+      "reasoning_chars": 0,
+      "prompt_tokens": 331,
+      "completion_tokens": 26,
+      "reasoning_tokens": null,
+      "finish_reason": "stop"
+    },
+    "measured": [
+      {
+        "elapsed_seconds": 0.434,
+        "json_valid": true,
+        "schema_valid": true,
+        "reasoning_chars": 0,
+        "prompt_tokens": 331,
+        "completion_tokens": 26,
+        "reasoning_tokens": null,
+        "finish_reason": "stop"
+      },
+      {
+        "elapsed_seconds": 0.454,
+        "json_valid": true,
+        "schema_valid": true,
+        "reasoning_chars": 0,
+        "prompt_tokens": 331,
+        "completion_tokens": 26,
+        "reasoning_tokens": null,
+        "finish_reason": "stop"
+      },
+      {
+        "elapsed_seconds": 0.432,
+        "json_valid": true,
+        "schema_valid": true,
+        "reasoning_chars": 0,
+        "prompt_tokens": 331,
+        "completion_tokens": 26,
+        "reasoning_tokens": null,
+        "finish_reason": "stop"
+      }
+    ],
+    "mean_seconds": 0.44,
+    "min_seconds": 0.432,
+    "max_seconds": 0.454
+  },
+  "remote": {
+    "mode": "none",
+    "execution": "vllm_http",
+    "endpoint": "http://192.168.1.230:8000",
+    "model": "Inferact/Qwen3.8-27B-NVFP4",
+    "warmup": {
+      "warmup": true,
+      "elapsed_seconds": 1.545,
+      "json_valid": true,
+      "schema_valid": true,
+      "reasoning_chars": 0,
+      "prompt_tokens": 335,
+      "completion_tokens": 30,
+      "reasoning_tokens": null,
+      "finish_reason": "stop"
+    },
+    "measured": [
+      {
+        "elapsed_seconds": 1.586,
+        "json_valid": true,
+        "schema_valid": true,
+        "reasoning_chars": 0,
+        "prompt_tokens": 335,
+        "completion_tokens": 30,
+        "reasoning_tokens": null,
+        "finish_reason": "stop"
+      },
+      {
+        "elapsed_seconds": 1.591,
+        "json_valid": true,
+        "schema_valid": true,
+        "reasoning_chars": 0,
+        "prompt_tokens": 335,
+        "completion_tokens": 30,
+        "reasoning_tokens": null,
+        "finish_reason": "stop"
+      },
+      {
+        "elapsed_seconds": 1.575,
+        "json_valid": true,
+        "schema_valid": true,
+        "reasoning_chars": 0,
+        "prompt_tokens": 335,
+        "completion_tokens": 30,
+        "reasoning_tokens": null,
+        "finish_reason": "stop"
+      }
+    ],
+    "mean_seconds": 1.584,
+    "min_seconds": 1.575,
+    "max_seconds": 1.591
+  },
+  "remote_to_local_speedup": 3.6
+}

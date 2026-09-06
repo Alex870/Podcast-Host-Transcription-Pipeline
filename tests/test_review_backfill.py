@@ -301,6 +301,12 @@ class ReviewBackfillTests(unittest.TestCase):
                 replacement_map_json=None,
                 workflow_profile="podcast",
             )
+            artifact_dir = root / "output" / "_processing_artifacts" / audio_path.stem
+            checkpoint_dir = root / "output" / "_processing_checkpoints"
+            artifact_dir.mkdir(parents=True)
+            checkpoint_dir.mkdir(parents=True)
+            (artifact_dir / "speaker_audio_16k_mono.wav").write_bytes(b"wav")
+            (checkpoint_dir / "episode_speaker_telemetry.json").write_text("{}", encoding="utf-8")
             with patch.object(cli_module, "classify_episode_processing_state", return_value={"state": "complete"}), patch.object(
                 cli_module, "audio_duration_map", return_value={}
             ), patch.object(cli_module, "exit_isolated_worker_after_success", return_value=True) as exit_mock, patch.object(
@@ -310,6 +316,8 @@ class ReviewBackfillTests(unittest.TestCase):
 
             reports_mock.assert_not_called()
             exit_mock.assert_called_once_with(str(audio_path))
+            self.assertFalse((artifact_dir / "speaker_audio_16k_mono.wav").exists())
+            self.assertFalse((checkpoint_dir / "episode_speaker_telemetry.json").exists())
 
     def test_ffprobe_resolution_rejects_conda_binary_when_no_external_build_is_configured(self):
         with tempfile.TemporaryDirectory() as tmp:

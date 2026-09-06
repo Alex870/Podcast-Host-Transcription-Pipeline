@@ -21,6 +21,7 @@ The menu options are:
 7. `Configure external review LLM`
 8. `Download pinned transcription models`
 9. `Transcribe committee meeting (anonymous speakers)`
+10. `Manage processing spaces`
 
 The interactive launcher returns to this menu after every completed action and after handled action errors. Select `Q` to close it. Passing an explicit action on the command line remains a one-shot operation for scripts and automation.
 
@@ -76,6 +77,8 @@ The normal operator flow is:
 2. verify `podcast_transcribe_config.json`
 3. run the bootstrap and choose option `2`
 4. review outputs in the output directory
+
+For separate podcasts, meetings, or other contexts, use option `10` to create or adopt a processing space. Each space has its own intake folder, output folder, registry state boundary, corrections, and speaker references; glossary settings can be overridden per space. Run a space explicitly after placing new audio in its intake folder; the pipeline does not watch folders in the background.
 
 Tier 1 baseline processing includes:
 
@@ -313,9 +316,9 @@ Speaker matching reports audio-read and embedding telemetry. For compressed audi
 <output>\_processing_artifacts\<episode>\speaker_audio_16k_mono.wav
 ```
 
-The cache is fingerprinted against the source audio and is reused only when it still matches. It is an intermediate artifact, not a replacement for the original input. With `resume_intermediates = true`, it remains available for later runs; when resume cleanup is disabled, the episode's intermediate artifact directory is removed after successful processing.
+The cache is fingerprinted against the source audio and is reused only when it still matches. It is an intermediate artifact, not a replacement for the original input. It is removed after successful processing even when `resume_intermediates = true`; reusable JSON stage artifacts may remain for selective restart. A failed or interrupted run may retain the cache until the next successful completion or manual removal.
 
-After `writing complete`, episode finalization builds the summary, writes and hashes the output manifest, clears the processing checkpoint, and removes debug or stage artifacts according to the retention settings. The subsequent post-episode steps save summary/state files and release memory. Finally, batch finalization writes `_batch_report.md`, `_review_run_report.*`, and `_speaker_workflow_report.*`. In isolated mode, child workers defer those run-level reports to the parent so the output library is not rescanned after every episode.
+After `writing complete`, episode finalization builds the summary, writes and hashes the output manifest, clears the processing checkpoint, removes disposable audio/progress/telemetry artifacts, and removes debug or stage artifacts according to the retention settings. The subsequent post-episode steps save summary/state files and release memory. Finally, batch finalization writes `_batch_report.md`, `_review_run_report.*`, and `_speaker_workflow_report.*`. In isolated mode, child workers defer those run-level reports to the parent so the output library is not rescanned after every episode.
 
 ## Preferred-Term Protection
 

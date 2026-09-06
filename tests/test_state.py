@@ -7,6 +7,7 @@ from unittest.mock import patch
 from podcast_transcribe.state import (
     audio_file_fingerprint,
     clear_stage_artifacts,
+    clear_transient_artifacts,
     expected_output_paths,
     is_file_already_processed,
     load_processed_files,
@@ -97,6 +98,32 @@ class ResumeStateTests(unittest.TestCase):
             clear_stage_artifacts(root, audio)
 
             self.assertIsNone(load_stage_artifact(root, audio, "diarization"))
+
+    def test_clear_transient_artifacts_removes_runtime_caches_but_preserves_stage_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "episode.mp3"
+            audio.write_bytes(b"abc")
+            artifact_dir = root / "_processing_artifacts" / audio.stem
+            checkpoint_dir = root / "_processing_checkpoints"
+            artifact_dir.mkdir(parents=True)
+            checkpoint_dir.mkdir(parents=True)
+            (artifact_dir / "transcription.json").write_text("{}", encoding="utf-8")
+            (artifact_dir / "speaker_audio_16k_mono.wav").write_bytes(b"wav")
+            (artifact_dir / "speaker_audio_16k_mono.json").write_text("{}", encoding="utf-8")
+            (artifact_dir / "review_progress.json").write_text("{}", encoding="utf-8")
+            (artifact_dir / ".speaker_audio_16k_mono.wav.123.tmp").write_bytes(b"tmp")
+            (checkpoint_dir / "episode_speaker_telemetry.json").write_text("{}", encoding="utf-8")
+
+            result = clear_transient_artifacts(root, audio)
+
+            self.assertEqual(len(result["failed"]), 0)
+            self.assertFalse((artifact_dir / "speaker_audio_16k_mono.wav").exists())
+            self.assertFalse((artifact_dir / "speaker_audio_16k_mono.json").exists())
+            self.assertFalse((artifact_dir / "review_progress.json").exists())
+            self.assertFalse((artifact_dir / ".speaker_audio_16k_mono.wav.123.tmp").exists())
+            self.assertFalse((checkpoint_dir / "episode_speaker_telemetry.json").exists())
+            self.assertTrue((artifact_dir / "transcription.json").exists())
 
     def test_stage_artifact_rejects_changed_dependency_chain(self):
         with tempfile.TemporaryDirectory() as tmp:

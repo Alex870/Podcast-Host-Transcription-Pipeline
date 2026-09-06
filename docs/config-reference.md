@@ -1,8 +1,24 @@
 # Config Reference
 
-This document is the authoritative reference for `podcast_transcribe_config.json`.
+This document is the authoritative reference for global `podcast_transcribe_config.json` settings. Operators should manage processing-space settings through launcher option `10` or the browser workbench; the application stores those partition records in `config/partitions.sqlite3`.
 
 All keys are optional unless otherwise noted. Relative paths are resolved from the repository root unless a script or CLI override provides a different explicit path.
+
+## Processing spaces
+
+A processing space is an independently processed corpus boundary. Create one with launcher option `10` or in the workbench. New managed spaces use this layout:
+
+```text
+partitions/<slug>/intake
+partitions/<slug>/output
+partitions/<slug>/state
+partitions/<slug>/speaker-references
+partitions/<slug>/corrections
+```
+
+The registry records a stable partition ID, context type, workflow profile, paths, partition overrides, downstream settings, archive state, intake status, and configuration fingerprint. Existing `source`/`output` folders can be adopted without moving data. The legacy JSON remains a compatibility fallback; it is not required for creating or editing spaces.
+
+When invoked as `podcast-transcribe-host --partition <partition-id>`, partition paths and overrides are resolved before processing. Partition overrides take precedence over global defaults. A partition's HF token is never stored in the registry.
 
 ## Input and Output Paths
 
@@ -432,7 +448,7 @@ An explicit `false` overrides stages implied by the selected runtime profile.
 
 When `true`, writes prompt/response debug artifacts for staged review.
 
-Review progress checkpoints and speaker telemetry are stored under the episode's `_processing_artifacts` directory while processing. Successful runs clear the processing checkpoint; debug and stage-artifact retention is controlled by `archive_debug_artifacts` and `resume_intermediates`.
+Review progress checkpoints and speaker telemetry are stored under the episode's `_processing_artifacts` and `_processing_checkpoints` directories while processing. Successful runs remove those progress files and disposable audio caches; debug and reusable stage-artifact retention is controlled by `archive_debug_artifacts` and `resume_intermediates`.
 
 ### `review_auto_calibrate`
 
@@ -539,7 +555,7 @@ Optional ordered explicit format list that overrides the preset behavior for dis
 
 Allows reuse of `_processing_artifacts` when a prior run completed expensive intermediate stages.
 
-For compressed audio, the directory can also contain a fingerprinted `speaker_audio_16k_mono.wav` cache used to make repeated speaker-span reads seek-friendly. It is reused when the source fingerprint and cache metadata match.
+For compressed audio, the directory can also contain a fingerprinted `speaker_audio_16k_mono.wav` cache used to make repeated speaker-span reads seek-friendly. It is reused when the source fingerprint and cache metadata match, then removed after successful processing. A failed or interrupted run may retain it until the next successful completion or manual removal.
 
 ### `archive_debug_artifacts`
 

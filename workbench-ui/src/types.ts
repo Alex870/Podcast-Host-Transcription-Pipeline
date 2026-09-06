@@ -67,6 +67,28 @@ export type SessionInfo = {
   sessionOpen: boolean;
   projectRoot?: string;
   outputDir?: string;
+  partitionId?: string | null;
+  partition?: PartitionRecord | null;
+};
+
+export type PartitionRecord = {
+  partition_id: string;
+  display_name: string;
+  slug: string;
+  context_type: string;
+  workflow_profile: string;
+  intake_dir: string;
+  output_dir: string;
+  state_dir: string;
+  speaker_reference_dir?: string | null;
+  corrections_dir?: string | null;
+  config_overrides?: Record<string, unknown>;
+  downstream_config?: Record<string, unknown>;
+  archived: boolean;
+  created_at: string;
+  updated_at: string;
+  config_fingerprint: string;
+  status_counts?: Record<string, number>;
 };
 
 export type LearnedRule = {
